@@ -132,7 +132,7 @@ async fn exile_wallet(Path(name): Path<String>) -> (StatusCode, Json<Value>) {
 #[tokio::main]
 async fn main() {
     let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
         .allow_headers(tower_http::cors::Any);
 
@@ -143,7 +143,8 @@ async fn main() {
         .route("/wallets/:name/exile", post(exile_wallet))
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .unwrap();
 
