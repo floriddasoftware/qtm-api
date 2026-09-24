@@ -137,6 +137,7 @@ async fn main() {
         .allow_headers(tower_http::cors::Any);
 
     let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
         .route("/wallets", post(create_wallet))
         .route("/wallets/:name", get(open_wallet))
         .route("/wallets/:name/transit", post(transit_wallet))
