@@ -7,7 +7,6 @@ use axum::{
 use qp_hd::commands;
 use qp_hd::qp44::TotalMass;
 use qtm_graph::graph::{Direction, Scale};
-use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -92,7 +91,10 @@ fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
     )
 }
 
-fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+fn error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ApiError>) {
     (
         status,
         Json(ApiError {
@@ -121,13 +123,11 @@ fn valid_substrate_name(name: &str) -> bool {
         && name.len() <= MAX_SUBSTRATE_NAME_LENGTH
         && name != "."
         && name != ".."
-        && name
-            .bytes()
-            .all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || byte == b'-'
-                    || byte == b'_'
-            })
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte == b'-'
+                || byte == b'_'
+        })
 }
 
 fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
@@ -159,12 +159,10 @@ fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
         );
     }
 
-    parsed
-        .try_into()
-        .map_err(|_| {
-            "indices must contain exactly 12 comma-separated integers"
-                .to_string()
-        })
+    parsed.try_into().map_err(|_| {
+        "indices must contain exactly 12 comma-separated integers"
+            .to_string()
+    })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -198,29 +196,35 @@ fn substrate_json(name: &str) -> ApiResult<SubstrateResponse> {
 fn event_response<E: commands::HeritageEvent>(
     name: &str,
     event: &E,
-) -> EventResponse {
-    let heritage = event.heritage();
-    let transition = &heritage.transition;
+) -> (Direction, EventResponse) {
+    let direction = Direction::from_heritage(
+        event.heritage().to_owned(),
+        Scale::Global,
+    );
+
+    let event_map = direction.event();
     let qtm = event.qtm();
 
-    EventResponse {
+    let response = EventResponse {
         namespace: commands::substrate_root()
             .join(name)
             .join("events")
             .display()
             .to_string(),
-        dimension: heritage.state.dimension().to_string(),
-        structural_value: heritage.state.structural_value().to_string(),
-        activations: heritage.state.activations().to_string(),
-        retained_mass: heritage.state.retained_mass().to_string(),
-        tau: transition.tau.to_string(),
-        delta: transition.delta.to_string(),
-        gross_work: transition.gross_work.to_string(),
-        net_work: transition.net_work.to_string(),
+        dimension: event_map.dimension().to_string(),
+        structural_value: event_map.structural_value().to_string(),
+        activations: event_map.activations().to_string(),
+        retained_mass: event_map.retained_mass().to_string(),
+        tau: event_map.tau().to_string(),
+        delta: event_map.delta().to_string(),
+        gross_work: event_map.gross_work().to_string(),
+        net_work: event_map.net_work().to_string(),
         commitment: hex_encode(&qtm.commitment),
         coordinate: hex_encode(&qtm.coordinate),
         sigma: qtm.sigma.to_string(),
-    }
+    };
+
+    (direction, response)
 }
 
 fn ensure_existing_substrate(name: &str) -> ApiResult<PathBuf> {
@@ -259,9 +263,8 @@ async fn create_wallet(
         ));
     }
 
-    let indices = parse_indices(&body.indices).map_err(|message| {
-        error(StatusCode::BAD_REQUEST, message)
-    })?;
+    let indices = parse_indices(&body.indices)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
 
     if body.entropy.trim().is_empty() {
         return Err(error(
@@ -342,7 +345,9 @@ async fn transit_wallet(
         body.activation,
     );
 
-    Ok(Json(event_response(&name, &event)))
+    let (_, response) = event_response(&name, &event);
+
+    Ok(Json(response))
 }
 
 async fn exile_wallet(
@@ -357,7 +362,9 @@ async fn exile_wallet(
 
     let event = commands::qtm_exile(&name);
 
-    Ok(Json(event_response(&name, &event)))
+    let (_, response) = event_response(&name, &event);
+
+    Ok(Json(response))
 }
 
 #[tokio::main]
