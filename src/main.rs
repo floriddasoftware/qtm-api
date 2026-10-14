@@ -5,8 +5,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use qp_hd::commands;
-use qp_hd::qp44::TotalMass;
+use qp_hd::{
+    commands,
+    pathsregistry::{CoinType, PathsRegistry},
+    qp44::TotalMass,
+};
 use qtm_graph::graph::{Direction, Scale};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,6 +40,42 @@ struct CreateRequest {
 
 #[derive(Deserialize)]
 struct TransitRequest {
+    #[serde(default)]
+    activation: u64,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    purpose: Option<u64>,
+    #[serde(default)]
+    coin: Option<u64>,
+    #[serde(default)]
+    account: Option<u64>,
+    #[serde(default)]
+    change: Option<u64>,
+    #[serde(default)]
+    external: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct NetworkListResponse {
+    networks: Vec<NetworkOption>,
+}
+
+#[derive(Serialize)]
+struct NetworkOption {
+    id: String,
+    name: String,
+    coin: u64,
+    purpose: u64,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct TransitSelection {
+    network: Option<String>,
+    path: Option<String>,
     activation: u64,
     purpose: u64,
     coin: u64,
@@ -72,6 +111,8 @@ struct SubstrateEntry {
 #[derive(Serialize)]
 struct DirectionResponse {
     event: EventMapResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection: Option<TransitSelection>,
 }
 
 #[derive(Serialize)]
@@ -265,6 +306,63 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
     Ok(SubstrateListResponse { substrates })
 }
 
+fn network_option(
+    id: &str,
+    name: &str,
+    coin: CoinType,
+    purpose: u64,
+    path: &str,
+) -> NetworkOption {
+    NetworkOption {
+        id: id.to_string(),
+        name: name.to_string(),
+        coin: coin.retained_mass() as u64,
+        purpose,
+        path: path.to_string(),
+    }
+}
+
+fn registered_networks() -> NetworkListResponse {
+    let mut networks = Vec::new();
+
+    for coin in CoinType::all() {
+        let id = match coin {
+            CoinType::Bitcoin => "bitcoin-legacy",
+            CoinType::Ethereum => "ethereum",
+            CoinType::Solana => "solana",
+            CoinType::Tron => "tron",
+        };
+
+        networks.push(network_option(
+            id,
+            coin.name(),
+            *coin,
+            44,
+            PathsRegistry::get_path(*coin),
+        ));
+    }
+
+    // Native SegWit is an additional Bitcoin preset.
+    // PathsRegistry currently returns the BIP-44 path for Bitcoin.
+    networks.push(network_option(
+        "bitcoin-native-segwit",
+        "Bitcoin · Native SegWit (BIP 84)",
+        CoinType::Bitcoin,
+        84,
+        "m/84'/0'/0'/0/0",
+    ));
+
+    networks.sort_by(|a, b| a.id.cmp(&b.id));
+    NetworkListResponse { networks }
+}
+
+fn selected_network(id: &str) -> Option<NetworkOption> {
+    registered_networks()
+        .networks
+        .into_iter()
+        .find(|network| network.id == id)
+}
+
 fn scale_name(scale: Scale) -> &'static str {
     match scale {
         Scale::Minimal => "Minimal",
@@ -283,7 +381,10 @@ fn serialize_runtime(runtime: SystemTime) -> RuntimeResponse {
     }
 }
 
-fn direction_response(direction: Direction) -> DirectionResponse {
+fn direction_response(
+    direction: Direction,
+    selection: Option<TransitSelection>,
+) -> DirectionResponse {
     let event = direction.into_event();
 
     let activation = event.activation;
@@ -317,6 +418,7 @@ fn direction_response(direction: Direction) -> DirectionResponse {
                 },
             },
         },
+        selection,
     }
 }
 
@@ -346,6 +448,10 @@ async fn health() -> &'static str {
 
 async fn preflight() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn list_networks() -> Json<NetworkListResponse> {
+    Json(registered_networks())
 }
 
 async fn list_wallets() -> ApiResult<Json<SubstrateListResponse>> {
@@ -443,19 +549,68 @@ async fn transit_wallet(
 
     ensure_existing_substrate(&name)?;
 
+    let preset = match body.network.as_deref() {
+        Some(id) => Some(selected_network(id).ok_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported network: {id}"),
+            )
+        })?),
+        None => None,
+    };
+
+    let purpose = body
+        .purpose
+        .or_else(|| preset.as_ref().map(|network| network.purpose))
+        .unwrap_or(44);
+
+    let coin = body
+        .coin
+        .or_else(|| preset.as_ref().map(|network| network.coin))
+        .unwrap_or(0);
+
+    let account = body.account.unwrap_or(0);
+    let change = body.change.unwrap_or(0);
+    let external = body.external.unwrap_or(0);
+
+    let path = match body.path {
+        Some(path) => {
+            let path = path.trim();
+            if path.is_empty() {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "path must not be empty",
+                ));
+            }
+            Some(path.to_string())
+        }
+        None => preset.as_ref().map(|network| network.path.clone()),
+    };
+
+    let selection = TransitSelection {
+        network: body.network.clone(),
+        path,
+        activation: body.activation,
+        purpose,
+        coin,
+        account,
+        change,
+        external,
+    };
+
     let payload = TotalMass::new(
-        body.purpose as u128,
-        body.coin as u128,
-        body.account as u128,
-        body.change as u128,
-        body.external as u128,
+        purpose as u128,
+        coin as u128,
+        account as u128,
+        change as u128,
+        external as u128,
     )
     .memorize();
 
     let event = commands::qtm_transit(&name, payload, body.activation);
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    Ok(Json(direction_response(direction)))
+    Ok(Json(direction_response(direction, Some(selection))))
 }
 
 async fn exile_wallet(
@@ -471,7 +626,7 @@ async fn exile_wallet(
     let event = commands::qtm_exile(&name);
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    Ok(Json(direction_response(direction)))
+    Ok(Json(direction_response(direction, None)))
 }
 
 #[tokio::main]
@@ -488,6 +643,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health).options(preflight))
+        .route("/networks", get(list_networks).options(preflight))
         .route(
             "/wallets",
             get(list_wallets)
