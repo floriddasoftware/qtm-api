@@ -384,7 +384,10 @@ async fn transit_wallet(
         body.activation,
     );
     let qtm = event.qtm;
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
     Ok(Json(direction_response(
         &name,
         &direction,
@@ -404,7 +407,10 @@ async fn exile_wallet(
     ensure_existing_substrate(&name)?;
     let event = commands::qtm_exile(&name);
     let qtm = event.qtm;
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
     Ok(Json(direction_response(
         &name,
         &direction,
