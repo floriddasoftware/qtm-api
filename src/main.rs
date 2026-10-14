@@ -6,7 +6,7 @@ use axum::{
 };
 use qp_hd::commands;
 use qp_hd::qp44::TotalMass;
-use qtm_graph::graph::{Direction, Scale};
+use qtm_graph::graph::{Depth, Direction, Scale};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -56,7 +56,21 @@ struct SubstrateResponse {
 }
 
 #[derive(Serialize)]
-struct EventResponse {
+struct DepthObjectResponse {
+    position: usize,
+    identifier: String,
+    mass: String,
+    from: String,
+}
+
+#[derive(Serialize)]
+struct DepthResponse {
+    path: String,
+    objects: Vec<DepthObjectResponse>,
+}
+
+#[derive(Serialize)]
+struct DirectionResponse {
     namespace: String,
     dimension: String,
     structural_value: String,
@@ -66,9 +80,13 @@ struct EventResponse {
     delta: String,
     gross_work: String,
     net_work: String,
+    mirror_bytes: String,
+    activation: String,
     commitment: String,
     coordinate: String,
     sigma: String,
+    network: String,
+    depth: DepthResponse,
 }
 
 static SUBSTRATE_REGISTRY: OnceLock<
@@ -76,9 +94,8 @@ static SUBSTRATE_REGISTRY: OnceLock<
 > = OnceLock::new();
 
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
-    let registry = SUBSTRATE_REGISTRY.get_or_init(|| {
-        Mutex::new(HashMap::new())
-    });
+    let registry =
+        SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
 
     let mut registry = registry
         .lock()
@@ -124,9 +141,7 @@ fn valid_substrate_name(name: &str) -> bool {
         && name != "."
         && name != ".."
         && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || byte == b'-'
-                || byte == b'_'
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
         })
 }
 
@@ -134,18 +149,13 @@ fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
     let parsed = raw
         .split(',')
         .map(|part| {
-            let value = part
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| {
-                    "indices must contain exactly 12 integers from 0 to 2047"
-                        .to_string()
-                })?;
+            let value = part.trim().parse::<u16>().map_err(|_| {
+                "indices must contain exactly 12 integers from 0 to 2047"
+                    .to_string()
+            })?;
 
             if value >= DOMAIN_SIZE {
-                return Err(
-                    "each index must be in the range 0..2048".to_string(),
-                );
+                return Err("each index must be in the range 0..2048".to_string());
             }
 
             Ok(value)
@@ -160,8 +170,7 @@ fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
     }
 
     parsed.try_into().map_err(|_| {
-        "indices must contain exactly 12 comma-separated integers"
-            .to_string()
+        "indices must contain exactly 12 comma-separated integers".to_string()
     })
 }
 
@@ -193,46 +202,65 @@ fn substrate_json(name: &str) -> ApiResult<SubstrateResponse> {
     })
 }
 
-fn event_response<E: commands::HeritageEvent>(
+fn serialize_depth(depth: &Depth) -> DepthResponse {
+    let objects = depth
+        .objects()
+        .map(|(position, identifier, retain)| DepthObjectResponse {
+            position,
+            identifier: identifier.to_string(),
+            mass: retain.mass.to_string(),
+            from: retain.from.to_string(),
+        })
+        .collect();
+
+    DepthResponse {
+        path: depth.path().to_string(),
+        objects,
+    }
+}
+
+fn direction_response(
     name: &str,
-    event: &E,
-) -> (Direction, EventResponse) {
-    let direction = Direction::from_heritage(
-        event.heritage().to_owned(),
-        Scale::Global,
-    );
+    direction: &Direction,
+    commitment: &[u8; 32],
+    coordinate: &[u8; 32],
+    sigma: u128,
+    network: u128,
+) -> DirectionResponse {
+    let event = &direction.event;
+    let heritage = &event.heritage;
 
-    let event_map = direction.event();
-    let qtm = event.qtm();
+    let events_path = commands::substrate_root()
+        .join(name)
+        .join("events");
 
-    let response = EventResponse {
-        namespace: commands::substrate_root()
-            .join(name)
-            .join("events")
-            .display()
-            .to_string(),
-        dimension: event_map.dimension().to_string(),
-        structural_value: event_map.structural_value().to_string(),
-        activations: event_map.activations().to_string(),
-        retained_mass: event_map.retained_mass().to_string(),
-        tau: event_map.tau().to_string(),
-        delta: event_map.delta().to_string(),
-        gross_work: event_map.gross_work().to_string(),
-        net_work: event_map.net_work().to_string(),
-        commitment: hex_encode(&qtm.commitment),
-        coordinate: hex_encode(&qtm.coordinate),
-        sigma: qtm.sigma.to_string(),
-    };
+    let mut depth = Depth::new(events_path.display().to_string());
 
-    (direction, response)
+    depth.insert("quantperm", 0, direction.retain());
+
+    DirectionResponse {
+        namespace: events_path.display().to_string(),
+        dimension: heritage.state.dimension().to_string(),
+        structural_value: heritage.state.structural_value().to_string(),
+        activations: heritage.state.activations().to_string(),
+        retained_mass: heritage.state.retained_mass().to_string(),
+        tau: heritage.transition.tau.to_string(),
+        delta: heritage.transition.delta.to_string(),
+        gross_work: heritage.transition.gross_work.to_string(),
+        net_work: heritage.transition.net_work.to_string(),
+        mirror_bytes: hex_encode(&heritage.transition.mirror_bytes),
+        activation: event.activation().to_string(),
+        commitment: hex_encode(commitment),
+        coordinate: hex_encode(coordinate),
+        sigma: sigma.to_string(),
+        network: network.to_string(),
+        depth: serialize_depth(&depth),
+    }
 }
 
 fn ensure_existing_substrate(name: &str) -> ApiResult<PathBuf> {
     if !valid_substrate_name(name) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "invalid substrate name",
-        ));
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
     }
 
     let path = commands::substrate_root().join(name);
@@ -263,8 +291,10 @@ async fn create_wallet(
         ));
     }
 
-    let indices = parse_indices(&body.indices)
-        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+    let indices =
+        parse_indices(&body.indices).map_err(|message| {
+            error(StatusCode::BAD_REQUEST, message)
+        })?;
 
     if body.entropy.trim().is_empty() {
         return Err(error(
@@ -322,7 +352,7 @@ async fn open_wallet(
 async fn transit_wallet(
     Path(name): Path<String>,
     Json(body): Json<TransitRequest>,
-) -> ApiResult<Json<EventResponse>> {
+) -> ApiResult<Json<DirectionResponse>> {
     let lock = substrate_lock(&name);
     let _guard = lock
         .lock()
@@ -345,14 +375,22 @@ async fn transit_wallet(
         body.activation,
     );
 
-    let (_, response) = event_response(&name, &event);
+    let qtm = event.qtm;
+    let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    Ok(Json(response))
+    Ok(Json(direction_response(
+        &name,
+        &direction,
+        &qtm.commitment,
+        &qtm.coordinate,
+        qtm.sigma,
+        qtm.net_work,
+    )))
 }
 
 async fn exile_wallet(
     Path(name): Path<String>,
-) -> ApiResult<Json<EventResponse>> {
+) -> ApiResult<Json<DirectionResponse>> {
     let lock = substrate_lock(&name);
     let _guard = lock
         .lock()
@@ -362,9 +400,17 @@ async fn exile_wallet(
 
     let event = commands::qtm_exile(&name);
 
-    let (_, response) = event_response(&name, &event);
+    let qtm = event.qtm;
+    let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    Ok(Json(response))
+    Ok(Json(direction_response(
+        &name,
+        &direction,
+        &qtm.commitment,
+        &qtm.coordinate,
+        qtm.sigma,
+        qtm.net_work,
+    )))
 }
 
 #[tokio::main]
@@ -382,8 +428,8 @@ async fn main() {
         .route("/wallets/:name/exile", post(exile_wallet))
         .layer(cors);
 
-    let port = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string());
+    let port =
+        std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 
     let address = format!("0.0.0.0:{port}");
 
