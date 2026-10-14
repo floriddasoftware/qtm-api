@@ -2,7 +2,7 @@
 use axum::{
     extract::Path,
     http::{Method, StatusCode},
-    routing::get,
+    routing::{get, head, post},
     Json, Router,
 };
 use qp_hd::commands;
@@ -112,7 +112,7 @@ fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
 
     let mut registry = registry
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     Arc::clone(
         registry
@@ -173,7 +173,7 @@ fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
 
             Ok(value)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<u16>, String>>()?;
 
     if parsed.len() != NUM_INDICES {
         return Err(
@@ -218,27 +218,27 @@ fn substrate_json(name: &str) -> ApiResult<SubstrateResponse> {
 fn list_substrates() -> ApiResult<SubstrateListResponse> {
     let root = commands::substrate_root();
 
-    std::fs::create_dir_all(&root).map_err(|error| {
+    std::fs::create_dir_all(&root).map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to access substrate root: {error}"),
+            format!("unable to access substrate root: {io_error}"),
         )
     })?;
 
-    let entries = std::fs::read_dir(&root).map_err(|error| {
+    let entries = std::fs::read_dir(&root).map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to list substrates: {error}"),
+            format!("unable to list substrates: {io_error}"),
         )
     })?;
 
     let mut substrates = Vec::new();
 
     for entry in entries {
-        let entry = entry.map_err(|error| {
+        let entry = entry.map_err(|io_error| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read substrate entry: {error}"),
+                format!("unable to read substrate entry: {io_error}"),
             )
         })?;
 
@@ -248,8 +248,8 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
             continue;
         }
 
-        let name = match entry.file_name().into_string() {
-            Ok(name) if valid_substrate_name(&name) => name,
+        let name: String = match entry.file_name().into_string() {
+            Ok(name) if valid_substrate_name(name.as_str()) => name,
             _ => continue,
         };
 
@@ -362,6 +362,11 @@ async fn list_wallets() -> ApiResult<Json<SubstrateListResponse>> {
     Ok(Json(list_substrates()?))
 }
 
+async fn head_wallets() -> ApiResult<StatusCode> {
+    list_substrates()?;
+    Ok(StatusCode::OK)
+}
+
 async fn create_wallet(
     Json(body): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<SubstrateResponse>)> {
@@ -389,14 +394,14 @@ async fn create_wallet(
     let lock = substrate_lock(name);
     let _guard = lock
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let root = commands::substrate_root();
 
-    std::fs::create_dir_all(&root).map_err(|error| {
+    std::fs::create_dir_all(&root).map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to access substrate root: {error}"),
+            format!("unable to access substrate root: {io_error}"),
         )
     })?;
 
@@ -432,7 +437,7 @@ async fn open_wallet(
     let lock = substrate_lock(&name);
     let _guard = lock
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     ensure_existing_substrate(&name)?;
 
@@ -448,7 +453,7 @@ async fn transit_wallet(
     let lock = substrate_lock(&name);
     let _guard = lock
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     ensure_existing_substrate(&name)?;
 
@@ -462,7 +467,6 @@ async fn transit_wallet(
     .memorize();
 
     let event = commands::qtm_transit(&name, payload, body.activation);
-
     let qtm = event.qtm;
 
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
@@ -483,7 +487,7 @@ async fn exile_wallet(
     let lock = substrate_lock(&name);
     let _guard = lock
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     ensure_existing_substrate(&name)?;
 
@@ -519,15 +523,15 @@ async fn main() {
         .route(
             "/wallets",
             get(list_wallets)
-                .head(list_wallets)
                 .post(create_wallet)
+                .head(head(head_wallets))
                 .options(preflight),
         )
         .route(
             "/wallets/",
             get(list_wallets)
-                .head(list_wallets)
                 .post(create_wallet)
+                .head(head(head_wallets))
                 .options(preflight),
         )
         .route(
@@ -536,11 +540,11 @@ async fn main() {
         )
         .route(
             "/wallets/:name/transit",
-            axum::routing::post(transit_wallet).options(preflight),
+            post(transit_wallet).options(preflight),
         )
         .route(
             "/wallets/:name/exile",
-            axum::routing::post(exile_wallet).options(preflight),
+            post(exile_wallet).options(preflight),
         )
         .layer(cors);
 
