@@ -110,14 +110,11 @@ net_work: String,
 mirror_bytes: String,
 }
 
-static SUBSTRATE_REGISTRY: OnceLock<
-Mutex<HashMap<String, Arc<Mutex<()>>>>,
-
-= OnceLock::new();
+static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+OnceLock::new();
 
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
-let registry =
-SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
 
 let mut registry = registry
     .lock()
@@ -237,7 +234,7 @@ for entry in entries {
     if !path.is_dir() {
         continue;
     }
-    let name: String = match entry.file_name().into_string() {
+    let name = match entry.file_name().into_string() {
         Ok(name) if valid_substrate_name(name.as_str()) => name,
         _ => continue,
     };
@@ -248,9 +245,8 @@ for entry in entries {
         continue;
     }
     let dimension = required_file(&path.join("perm.dimension"))?;
-    let activations =
-        read_trim(&path.join("manifold.activations"))
-            .unwrap_or_else(|| "0".to_string());
+    let activations = read_trim(&path.join("manifold.activations"))
+        .unwrap_or_else(|| "0".to_string());
     substrates.push(SubstrateEntry {
         name,
         dimension,
@@ -296,10 +292,7 @@ DirectionResponse {
         heritage: HeritageResponse {
             state: StateResponse {
                 dimension: heritage.state.dimension().to_string(),
-                structural_value: heritage
-                    .state
-                    .structural_value()
-                    .to_string(),
+                structural_value: heritage.state.structural_value().to_string(),
                 activations: heritage.state.activations().to_string(),
                 retained_mass: heritage.state.retained_mass().to_string(),
             },
@@ -366,9 +359,7 @@ if !valid_substrate_name(name) {
     ));
 }
 let indices =
-    parse_indices(&body.indices).map_err(|message| {
-        error(StatusCode::BAD_REQUEST, message)
-    })?;
+    parse_indices(&body.indices).map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
 if body.entropy.trim().is_empty() {
     return Err(error(
         StatusCode::BAD_REQUEST,
@@ -502,8 +493,7 @@ let app = Router::new()
         post(exile_wallet).options(preflight),
     )
     .layer(cors);
-let port = std::env::var("PORT")
-    .unwrap_or_else(|_| "8080".to_string());
+let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 let address = format!("0.0.0.0:{port}");
 let listener = tokio::net::TcpListener::bind(&address)
     .await
