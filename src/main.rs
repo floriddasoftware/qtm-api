@@ -752,9 +752,13 @@ async fn exile_wallet(
     ensure_existing_substrate(&name)?;
 
     let event = commands::qtm_exile(&name);
+    let qtm = event.qtm;
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    Ok(Json(direction_response(direction, None)))
+    let mut response = direction_response(direction, None);
+    response.qtm = Some(qtm);
+
+    Ok(Json(response))
 }
 
 #[tokio::main]
