@@ -9,6 +9,8 @@ use qp_hd::{
     commands,
     pathsregistry::{CoinType, PathsRegistry},
     qp44::TotalMass,
+    purpose::{BIP39Language, SeedSource},
+    qp44::{QP44, TotalMass, WalletRequest},
 };
 use qtm_graph::graph::{Direction, Scale};
 use serde::{Deserialize, Serialize};
