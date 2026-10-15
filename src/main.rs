@@ -5,13 +5,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+
+
 use qp_hd::{
     commands,
     pathsregistry::{CoinType, PathsRegistry},
+    purpose::{BIP39Handler, BIP39Language},
     qp44::TotalMass,
-    purpose::{BIP39Language, SeedSource},
-    qp44::{QP44, TotalMass, WalletRequest},
 };
+
+
 use qtm_graph::graph::{Direction, Scale};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,8 +39,44 @@ struct ApiError {
 #[derive(Deserialize)]
 struct CreateRequest {
     name: String,
-    indices: String,
-    entropy: String,
+
+    #[serde(default)]
+    indices: Option<String>,
+
+    #[serde(default)]
+    entropy: Option<String>,
+
+    #[serde(default)]
+    seed_source: Option<String>,
+
+    #[serde(default)]
+    phrase: Option<String>,
+
+    #[serde(default)]
+    language: Option<String>,
+
+    #[serde(default)]
+    passphrase: Option<String>,
+}
+
+fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "english" => Ok(BIP39Language::English),
+        "chinese_simplified" | "chinese-simplified" => {
+            Ok(BIP39Language::ChineseSimplified)
+        }
+        "chinese_traditional" | "chinese-traditional" => {
+            Ok(BIP39Language::ChineseTraditional)
+        }
+        "french" => Ok(BIP39Language::French),
+        "italian" => Ok(BIP39Language::Italian),
+        "japanese" => Ok(BIP39Language::Japanese),
+        "korean" => Ok(BIP39Language::Korean),
+        "spanish" => Ok(BIP39Language::Spanish),
+        "czech" => Ok(BIP39Language::Czech),
+        "portuguese" => Ok(BIP39Language::Portuguese),
+        _ => Err("unsupported BIP39 language".to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -477,15 +516,108 @@ async fn create_wallet(
         ));
     }
 
-    let indices =
-        parse_indices(&body.indices).map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+    let (indices, entropy) = match body
+        .seed_source
+        .as_deref()
+        .unwrap_or("persistent")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "persistent" | "custom" => {
+            let raw_indices = body.indices.as_deref().ok_or_else(|| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "indices are required for persistent creation",
+                )
+            })?;
 
-    if body.entropy.trim().is_empty() {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "non-empty entropy is required",
-        ));
-    }
+            let parsed = parse_indices(raw_indices)
+                .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+
+            let entropy = body
+                .entropy
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "non-empty entropy is required",
+                    )
+                })?
+                .to_string();
+
+            (
+                parsed
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                entropy,
+            )
+        }
+
+        "bip39" => {
+            let phrase = body
+                .phrase
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "a BIP39 phrase is required",
+                    )
+                })?;
+
+            let language_name = body.language.as_deref().ok_or_else(|| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "select a BIP39 language in the UI",
+                )
+            })?;
+
+            let language = parse_bip39_language(language_name)
+                .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+
+            let indices = BIP39Handler::mnemonic_indices(phrase, language)
+                .map_err(|e| {
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid BIP39 mnemonic: {e}"),
+                    )
+                })?;
+
+            let entropy = BIP39Handler::mnemonic_entropy(
+                phrase,
+                language,
+                body.passphrase.as_deref(),
+            )
+            .map_err(|e| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unable to derive BIP39 conditioning entropy: {e}"),
+                )
+            })?;
+
+            (
+                indices
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                hex::encode(entropy),
+            )
+        }
+
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "seed_source must be persistent, custom, or bip39",
+            ));
+        }
+    };
 
     let lock = substrate_lock(name);
     let _guard = lock
@@ -510,16 +642,10 @@ async fn create_wallet(
         ));
     }
 
-    let indices = indices
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-
     commands::qtm_create(
         name.to_string(),
         Some(indices),
-        Some(body.entropy.trim().to_string()),
+        Some(entropy),
     );
 
     let response = substrate_json(name)?;
