@@ -12,3 +12,4 @@ tower-http = { version = "0.5", features = ["cors"] }
 rand = "0.8"
 qp-hd = { git = "https://github.com/floriddasoftware/QTM" }
 qtm-graph = { git = "https://github.com/floriddasoftware/Quantum-Economies" }
+hex = "0.4"
