@@ -9,9 +9,10 @@ use axum::{
 
 use qp_hd::{
     commands,
+    economic_gate::QuantumTransaction,
     pathsregistry::{CoinType, PathsRegistry},
     purpose::{BIP39Handler, BIP39Language},
-    qp44::TotalMass,
+    qp44::{Flow, TotalMass},
 };
 
 
@@ -195,6 +196,30 @@ struct StateResponse {
     structural_value: String,
     activations: String,
     retained_mass: String,
+}
+
+#[derive(Deserialize)]
+struct ReceiveRequest {
+    amount: u64,
+    flow: String,
+}
+
+#[derive(Serialize)]
+struct QuantumTransactionResponse {
+    amount: u64,
+    qtm: QtmResponse,
+    constant: String,
+}
+
+#[derive(Serialize)]
+struct QuantumTransactionFrame {
+    quantum_transaction: QuantumTransactionResponse,
+    event: EventMapResponse,
+}
+
+#[derive(Serialize)]
+struct ReceiveResponse {
+    frame: QuantumTransactionFrame,
 }
 
 #[derive(Serialize)]
@@ -755,6 +780,78 @@ async fn transit_wallet(
     Ok(Json(direction_response(direction, Some(selection))))
 }
 
+async fn receive_wallet(
+    Path(name): Path<String>,
+    Json(body): Json<ReceiveRequest>,
+) -> ApiResult<Json<ReceiveResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    ensure_existing_substrate(&name)?;
+
+    if body.amount == 0 {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "amount must be greater than zero",
+        ));
+    }
+
+    let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
+        "receive" => Flow::Receive,
+        "change" => Flow::Change,
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "flow must be receive or change",
+            ));
+        }
+    };
+
+    let transaction = QuantumTransaction::send(
+        &name,
+        body.amount,
+    );
+
+    let transaction_response = QuantumTransactionResponse {
+        amount: transaction.amount,
+        qtm: QtmResponse {
+            commitment: hex::encode(transaction.qtm.commitment),
+            coordinate: hex::encode(transaction.qtm.coordinate),
+            sigma: transaction.qtm.sigma.to_string(),
+            network: transaction.qtm.net_work.to_string(),
+        },
+        constant: match &transaction.constant {
+            qp_hd::PersistedEvent::Transit(_) => "transit".to_string(),
+            qp_hd::PersistedEvent::Exile(_) => "exile".to_string(),
+        },
+    };
+
+    let event = transaction.receive(
+        &name,
+        flow,
+    );
+
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
+
+    let event_response = direction_response(
+        direction,
+        None,
+    )
+    .event;
+
+    Ok(Json(ReceiveResponse {
+        frame: QuantumTransactionFrame {
+            quantum_transaction: transaction_response,
+            event: event_response,
+        },
+    }))
+}
+
 async fn exile_wallet(
     Path(name): Path<String>,
 ) -> ApiResult<Json<DirectionResponse>> {
@@ -819,6 +916,12 @@ async fn main() {
             "/wallets/:name/transit",
             post(transit_wallet).options(preflight),
         )
+        
+        .route(
+    "/wallets/:name/receive",
+    post(receive_wallet).options(preflight),
+)
+        
         .route(
             "/wallets/:name/exile",
             post(exile_wallet).options(preflight),
