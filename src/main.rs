@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+
 use tower_http::cors::CorsLayer;
 
 const DOMAIN_SIZE: u16 = 2048;
@@ -77,6 +78,15 @@ fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
         "portuguese" => Ok(BIP39Language::Portuguese),
         _ => Err("unsupported BIP39 language".to_string()),
     }
+}
+
+
+#[derive(Serialize)]
+struct QtmResponse {
+    commitment: String,
+    coordinate: String,
+    sigma: String,
+    network: String,
 }
 
 #[derive(Deserialize)]
@@ -155,7 +165,7 @@ struct DirectionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     selection: Option<TransitSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    qtm: Option<qp_hd::Qtm>,
+    qtm: Option<QtmResponse>,
 }
 
 
@@ -463,6 +473,7 @@ fn direction_response(
             },
         },
         selection,
+        qtm: None,
     }
 }
 
@@ -756,9 +767,17 @@ async fn exile_wallet(
 
     let event = commands::qtm_exile(&name);
     let qtm = event.qtm;
+
+    let qtm_response = QtmResponse {
+        commitment: hex::encode(qtm.commitment),
+        coordinate: hex::encode(qtm.coordinate),
+        sigma: qtm.sigma.to_string(),
+        network: qtm.net_work.to_string(),
+    };
+
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
     let mut response = direction_response(direction, None);
-    response.qtm = Some(qtm);
+    response.qtm = Some(qtm_response);
 
     Ok(Json(response))
 }
