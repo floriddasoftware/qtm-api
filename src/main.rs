@@ -154,7 +154,10 @@ struct DirectionResponse {
     event: EventMapResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     selection: Option<TransitSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qtm: Option<qp_hd::Qtm>,
 }
+
 
 #[derive(Serialize)]
 struct EventMapResponse {
@@ -754,7 +757,6 @@ async fn exile_wallet(
     let event = commands::qtm_exile(&name);
     let qtm = event.qtm;
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
-
     let mut response = direction_response(direction, None);
     response.qtm = Some(qtm);
 
