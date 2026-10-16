@@ -6,7 +6,6 @@ use axum::{
     Json, Router,
 };
 
-
 use qp_hd::{
     commands,
     economic_gate::QuantumTransaction,
@@ -15,12 +14,13 @@ use qp_hd::{
     qp44::{Flow, TotalMass},
 };
 
-
 use qtm_graph::graph::{
     frame::{Depth, Direction},
     Scale,
 };
+
 use serde::{Deserialize, Serialize};
+
 use std::{
     collections::HashMap,
     path::{Path as FsPath, PathBuf},
@@ -33,6 +33,16 @@ use tower_http::cors::CorsLayer;
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
 const MAX_SUBSTRATE_NAME_LENGTH: usize = 64;
+
+const SUBSTRATE_FILES: [&str; 7] = [
+    "perm.indices",
+    "perm.entropy",
+    "perm.dimension",
+    "qtm.commitment",
+    "qtm.coordinate",
+    "qtm.sigma",
+    "qtm.network",
+];
 
 type ApiResult<T> = Result<T, (StatusCode, Json<ApiError>)>;
 
@@ -83,7 +93,6 @@ fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
         _ => Err("unsupported BIP39 language".to_string()),
     }
 }
-
 
 #[derive(Serialize)]
 struct QtmResponse {
@@ -158,7 +167,6 @@ struct QuantumTransactionResponse {
     constant: String,
 }
 
-
 #[derive(Serialize)]
 struct SubstrateResponse {
     namespace: String,
@@ -201,18 +209,25 @@ struct NetworkOption {
 struct TransitRequest {
     #[serde(default)]
     network: Option<String>,
+
     #[serde(default)]
     purpose: Option<u64>,
+
     #[serde(default)]
     coin: Option<u64>,
+
     #[serde(default)]
     account: Option<u64>,
+
     #[serde(default)]
     change: Option<u64>,
+
     #[serde(default)]
     external: Option<u64>,
+
     #[serde(default)]
     path: Option<String>,
+
     #[serde(default)]
     activation: u64,
 }
@@ -235,21 +250,12 @@ struct ReceiveRequest {
     flow: String,
 }
 
-
-#[derive(Serialize)]
-struct TransitionResponse {
-    tau: String,
-    delta: String,
-    gross_work: String,
-    net_work: String,
-    mirror_bytes: String,
-}
-
 static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     OnceLock::new();
 
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
     let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+
     let mut registry = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -368,12 +374,13 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
         })?;
 
         let path = entry.path();
+
         if !path.is_dir() {
             continue;
         }
 
         let name = match entry.file_name().into_string() {
-            Ok(name) if valid_substrate_name(name.as_str()) => name,
+            Ok(name) if valid_substrate_name(&name) => name,
             _ => continue,
         };
 
@@ -385,6 +392,7 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
         }
 
         let dimension = required_file(&path.join("perm.dimension"))?;
+
         let activations = read_trim(&path.join("manifold.activations"))
             .unwrap_or_else(|| "0".to_string());
 
@@ -396,6 +404,7 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
     }
 
     substrates.sort_by(|a, b| a.name.cmp(&b.name));
+
     Ok(SubstrateListResponse { substrates })
 }
 
@@ -435,8 +444,6 @@ fn registered_networks() -> NetworkListResponse {
         ));
     }
 
-    // Native SegWit is an additional Bitcoin preset.
-    // PathsRegistry currently returns the BIP-44 path for Bitcoin.
     networks.push(network_option(
         "bitcoin-native-segwit",
         "Bitcoin · Native SegWit (BIP 84)",
@@ -446,6 +453,7 @@ fn registered_networks() -> NetworkListResponse {
     ));
 
     networks.sort_by(|a, b| a.id.cmp(&b.id));
+
     NetworkListResponse { networks }
 }
 
@@ -488,13 +496,11 @@ fn depth_response(depth: &Depth) -> DepthResponse {
         path: depth.path().to_string(),
         objects: depth
             .objects()
-            .map(|(position, identifier, retain)| {
-                DepthObjectResponse {
-                    position,
-                    identifier: identifier.to_string(),
-                    mass: retain.mass.to_string(),
-                    from: retain.from.to_string(),
-                }
+            .map(|(position, identifier, retain)| DepthObjectResponse {
+                position,
+                identifier: identifier.to_string(),
+                mass: retain.mass.to_string(),
+                from: retain.from.to_string(),
             })
             .collect(),
     }
@@ -543,6 +549,20 @@ fn ensure_existing_substrate(name: &str) -> ApiResult<PathBuf> {
             StatusCode::NOT_FOUND,
             format!("substrate does not exist: {name}"),
         ));
+    }
+
+    for filename in SUBSTRATE_FILES {
+        let file = path.join(filename);
+
+        if !file.is_file() {
+            return Err(error(
+                StatusCode::CONFLICT,
+                format!(
+                    "substrate state is incomplete: missing {}",
+                    file.display()
+                ),
+            ));
+        }
     }
 
     Ok(path)
@@ -707,13 +727,10 @@ async fn create_wallet(
         ));
     }
 
-    commands::qtm_create(
-        name.to_string(),
-        Some(indices),
-        Some(entropy),
-    );
+    commands::qtm_create(name.to_string(), Some(indices), Some(entropy));
 
     let response = substrate_json(name)?;
+
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -726,11 +743,11 @@ async fn open_wallet(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     ensure_existing_substrate(&name)?;
+
     commands::qtm_open(name.clone());
 
     Ok(Json(substrate_json(&name)?))
 }
-
 
 async fn transit_wallet(
     Path(name): Path<String>,
@@ -879,13 +896,6 @@ async fn receive_wallet(
 
     let event = transaction.receive(&name, flow);
 
-    let qtm = QtmResponse {
-        commitment: hex::encode(event.qtm.commitment),
-        coordinate: hex::encode(event.qtm.coordinate),
-        sigma: event.qtm.sigma.to_string(),
-        network: event.qtm.net_work.to_string(),
-    };
-
     let direction = Direction::from_heritage(
         event.heritage,
         Scale::Local,
@@ -895,8 +905,6 @@ async fn receive_wallet(
         direction,
         &event.depth,
     );
-
-    let _ = qtm;
 
     Ok(Json(ReceiveResponse {
         frame: QuantumTransactionFrame {
@@ -937,7 +945,6 @@ async fn exile_wallet(
         &event.depth,
     )))
 }
-
 
 #[tokio::main]
 async fn main() {
