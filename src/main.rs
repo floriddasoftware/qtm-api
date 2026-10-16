@@ -16,7 +16,10 @@ use qp_hd::{
 };
 
 
-use qtm_graph::graph::{Direction, Scale};
+use qtm_graph::graph::{
+    frame::{Depth, Direction},
+    Scale,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -90,92 +93,45 @@ struct QtmResponse {
     network: String,
 }
 
-#[derive(Deserialize)]
-struct TransitRequest {
-    #[serde(default)]
-    activation: u64,
-    #[serde(default)]
-    network: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    purpose: Option<u64>,
-    #[serde(default)]
-    coin: Option<u64>,
-    #[serde(default)]
-    account: Option<u64>,
-    #[serde(default)]
-    change: Option<u64>,
-    #[serde(default)]
-    external: Option<u64>,
-}
-
 #[derive(Serialize)]
-struct NetworkListResponse {
-    networks: Vec<NetworkOption>,
-}
-
-#[derive(Serialize)]
-struct NetworkOption {
-    id: String,
-    name: String,
-    coin: u64,
-    purpose: u64,
-    path: String,
-}
-
-#[derive(Serialize)]
-struct TransitSelection {
-    network: Option<String>,
-    path: Option<String>,
-    activation: u64,
-    purpose: u64,
-    coin: u64,
-    account: u64,
-    change: u64,
-    external: u64,
-}
-
-#[derive(Serialize)]
-struct SubstrateResponse {
-    namespace: String,
-    indices: String,
-    entropy: String,
-    dimension: String,
-    commitment: String,
-    coordinate: String,
-    sigma: String,
-    network: String,
-}
-
-#[derive(Serialize)]
-struct SubstrateListResponse {
-    substrates: Vec<SubstrateEntry>,
-}
-
-#[derive(Serialize)]
-struct SubstrateEntry {
-    name: String,
-    dimension: String,
-    activations: String,
+struct QtmFrameResponse {
+    identifier: String,
+    qtm: QtmResponse,
 }
 
 #[derive(Serialize)]
 struct DirectionResponse {
-    event: EventMapResponse,
+    frame: DirectionFrameResponse,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     selection: Option<TransitSelection>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    qtm: Option<QtmResponse>,
 }
 
+#[derive(Serialize)]
+struct DirectionFrameResponse {
+    qtm: QtmFrameResponse,
+    event: EventMapResponse,
+}
 
 #[derive(Serialize)]
 struct EventMapResponse {
-    activation: u64,
     scale: String,
     runtime: RuntimeResponse,
-    heritage: HeritageResponse,
+    depth: DepthResponse,
+}
+
+#[derive(Serialize)]
+struct DepthResponse {
+    path: String,
+    objects: Vec<DepthObjectResponse>,
+}
+
+#[derive(Serialize)]
+struct DepthObjectResponse {
+    position: usize,
+    identifier: String,
+    mass: String,
+    from: String,
 }
 
 #[derive(Serialize)]
@@ -185,36 +141,21 @@ struct RuntimeResponse {
 }
 
 #[derive(Serialize)]
-struct HeritageResponse {
-    state: StateResponse,
-    transition: TransitionResponse,
-}
-
-#[derive(Serialize)]
-struct StateResponse {
-    dimension: String,
-    structural_value: String,
-    activations: String,
-    retained_mass: String,
-}
-
-#[derive(Deserialize)]
-struct ReceiveRequest {
-    amount: u64,
-    flow: String,
-}
-
-#[derive(Serialize)]
-struct QuantumTransactionResponse {
-    amount: u64,
-    qtm: QtmResponse,
-    constant: String,
+struct ReceiveResponse {
+    frame: QuantumTransactionFrame,
 }
 
 #[derive(Serialize)]
 struct QuantumTransactionFrame {
     quantum_transaction: QuantumTransactionResponse,
     event: EventMapResponse,
+}
+
+#[derive(Serialize)]
+struct QuantumTransactionResponse {
+    amount: u64,
+    qtm: QtmFrameResponse,
+    constant: String,
 }
 
 #[derive(Serialize)]
@@ -452,7 +393,9 @@ fn scale_name(scale: Scale) -> &'static str {
 }
 
 fn serialize_runtime(runtime: SystemTime) -> RuntimeResponse {
-    let duration = runtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let duration = runtime
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
 
     RuntimeResponse {
         unix_seconds: duration.as_secs(),
@@ -460,45 +403,55 @@ fn serialize_runtime(runtime: SystemTime) -> RuntimeResponse {
     }
 }
 
+fn qtm_frame(qtm: QtmResponse) -> QtmFrameResponse {
+    QtmFrameResponse {
+        identifier: qtm.commitment.clone(),
+        qtm,
+    }
+}
+
+fn depth_response(depth: &Depth) -> DepthResponse {
+    DepthResponse {
+        path: depth.path().to_string(),
+        objects: depth
+            .objects()
+            .map(|(position, identifier, retain)| {
+                DepthObjectResponse {
+                    position,
+                    identifier: identifier.to_string(),
+                    mass: retain.mass.to_string(),
+                    from: retain.from.to_string(),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn event_map_response(
+    direction: Direction,
+    depth: &Depth,
+) -> EventMapResponse {
+    let event = direction.into_event();
+
+    EventMapResponse {
+        scale: scale_name(event.scale).to_string(),
+        runtime: serialize_runtime(event.runtime),
+        depth: depth_response(depth),
+    }
+}
+
 fn direction_response(
     direction: Direction,
     selection: Option<TransitSelection>,
+    qtm: QtmResponse,
+    depth: &Depth,
 ) -> DirectionResponse {
-    let event = direction.into_event();
-
-    let activation = event.activation;
-    let scale = scale_name(event.scale).to_string();
-    let runtime = serialize_runtime(event.runtime);
-    let heritage = event.heritage;
-
     DirectionResponse {
-        event: EventMapResponse {
-            activation,
-            scale,
-            runtime,
-            heritage: HeritageResponse {
-                state: StateResponse {
-                    dimension: heritage.state.dimension().to_string(),
-                    structural_value: heritage.state.structural_value().to_string(),
-                    activations: heritage.state.activations().to_string(),
-                    retained_mass: heritage.state.retained_mass().to_string(),
-                },
-                transition: TransitionResponse {
-                    tau: heritage.transition.tau.to_string(),
-                    delta: heritage.transition.delta.to_string(),
-                    gross_work: heritage.transition.gross_work.to_string(),
-                    net_work: heritage.transition.net_work.to_string(),
-                    mirror_bytes: heritage
-                        .transition
-                        .mirror_bytes
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect(),
-                },
-            },
+        frame: DirectionFrameResponse {
+            qtm: qtm_frame(qtm),
+            event: event_map_response(direction, depth),
         },
         selection,
-        qtm: None,
     }
 }
 
@@ -775,9 +728,22 @@ async fn transit_wallet(
     .memorize();
 
     let event = commands::qtm_transit(&name, payload, body.activation);
+
+    let qtm = QtmResponse {
+        commitment: event.qtm.commitment,
+        coordinate: event.qtm.coordinate,
+        sigma: event.qtm.sigma,
+        network: event.qtm.net_work,
+    };
+
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    Ok(Json(direction_response(direction, Some(selection))))
+    Ok(Json(direction_response(
+        direction,
+        Some(selection),
+        qtm,
+        &event.depth,
+    )))
 }
 
 async fn receive_wallet(
@@ -809,10 +775,7 @@ async fn receive_wallet(
         }
     };
 
-    let transaction = QuantumTransaction::send(
-        &name,
-        body.amount,
-    );
+    let transaction = QuantumTransaction::send(&name, body.amount);
 
     let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
@@ -828,21 +791,30 @@ async fn receive_wallet(
         },
     };
 
-    let event = transaction.receive(
-        &name,
-        flow,
-    );
+    let event = transaction.receive(&name, flow);
+
+    let exile_event = commands::qtm_exile(&name);
 
     let direction = Direction::from_heritage(
-        event.heritage,
+        exile_event.heritage,
         Scale::Local,
     );
 
     let event_response = direction_response(
         direction,
         None,
+        QtmResponse {
+            commitment: hex::encode(exile_event.qtm.commitment),
+            coordinate: hex::encode(exile_event.qtm.coordinate),
+            sigma: exile_event.qtm.sigma.to_string(),
+            network: exile_event.qtm.net_work.to_string(),
+        },
+        &exile_event.depth,
     )
+    .frame
     .event;
+
+    let _ = event;
 
     Ok(Json(ReceiveResponse {
         frame: QuantumTransactionFrame {
@@ -863,20 +835,25 @@ async fn exile_wallet(
     ensure_existing_substrate(&name)?;
 
     let event = commands::qtm_exile(&name);
-    let qtm = event.qtm;
 
     let qtm_response = QtmResponse {
-        commitment: hex::encode(qtm.commitment),
-        coordinate: hex::encode(qtm.coordinate),
-        sigma: qtm.sigma.to_string(),
-        network: qtm.net_work.to_string(),
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
     };
 
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
-    let mut response = direction_response(direction, None);
-    response.qtm = Some(qtm_response);
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
 
-    Ok(Json(response))
+    Ok(Json(direction_response(
+        direction,
+        None,
+        qtm_response,
+        &event.depth,
+    )))
 }
 
 #[tokio::main]
@@ -916,12 +893,10 @@ async fn main() {
             "/wallets/:name/transit",
             post(transit_wallet).options(preflight),
         )
-        
         .route(
-    "/wallets/:name/receive",
-    post(receive_wallet).options(preflight),
-)
-        
+            "/wallets/:name/receive",
+            post(receive_wallet).options(preflight),
+        )
         .route(
             "/wallets/:name/exile",
             post(exile_wallet).options(preflight),
