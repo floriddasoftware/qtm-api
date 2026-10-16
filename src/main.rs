@@ -158,10 +158,83 @@ struct QuantumTransactionResponse {
     constant: String,
 }
 
+
 #[derive(Serialize)]
-struct ReceiveResponse {
-    frame: QuantumTransactionFrame,
+struct SubstrateResponse {
+    namespace: String,
+    indices: String,
+    entropy: String,
+    dimension: String,
+    commitment: String,
+    coordinate: String,
+    sigma: String,
+    network: String,
 }
+
+#[derive(Serialize)]
+struct SubstrateListResponse {
+    substrates: Vec<SubstrateEntry>,
+}
+
+#[derive(Serialize)]
+struct SubstrateEntry {
+    name: String,
+    dimension: String,
+    activations: String,
+}
+
+#[derive(Serialize)]
+struct NetworkListResponse {
+    networks: Vec<NetworkOption>,
+}
+
+#[derive(Serialize, Clone)]
+struct NetworkOption {
+    id: String,
+    name: String,
+    coin: u64,
+    purpose: u64,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct TransitRequest {
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    purpose: Option<u64>,
+    #[serde(default)]
+    coin: Option<u64>,
+    #[serde(default)]
+    account: Option<u64>,
+    #[serde(default)]
+    change: Option<u64>,
+    #[serde(default)]
+    external: Option<u64>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    activation: u64,
+}
+
+#[derive(Serialize)]
+struct TransitSelection {
+    network: Option<String>,
+    path: Option<String>,
+    activation: u64,
+    purpose: u64,
+    coin: u64,
+    account: u64,
+    change: u64,
+    external: u64,
+}
+
+#[derive(Deserialize)]
+struct ReceiveRequest {
+    amount: u64,
+    flow: String,
+}
+
 
 #[derive(Serialize)]
 struct TransitionResponse {
@@ -730,11 +803,11 @@ async fn transit_wallet(
     let event = commands::qtm_transit(&name, payload, body.activation);
 
     let qtm = QtmResponse {
-        commitment: event.qtm.commitment,
-        coordinate: event.qtm.coordinate,
-        sigma: event.qtm.sigma,
-        network: event.qtm.net_work,
-    };
+    commitment: hex::encode(event.qtm.commitment),
+    coordinate: hex::encode(event.qtm.coordinate),
+    sigma: event.qtm.sigma.to_string(),
+    network: event.qtm.net_work.to_string(),
+};
 
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
@@ -779,12 +852,12 @@ async fn receive_wallet(
 
     let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
-        qtm: QtmResponse {
-            commitment: hex::encode(transaction.qtm.commitment),
-            coordinate: hex::encode(transaction.qtm.coordinate),
-            sigma: transaction.qtm.sigma.to_string(),
-            network: transaction.qtm.net_work.to_string(),
-        },
+        qtm: qtm_frame(QtmResponse {
+    commitment: hex::encode(transaction.qtm.commitment),
+    coordinate: hex::encode(transaction.qtm.coordinate),
+    sigma: transaction.qtm.sigma.to_string(),
+    network: transaction.qtm.net_work.to_string(),
+}),
         constant: match &transaction.constant {
             qp_hd::PersistedEvent::Transit(_) => "transit".to_string(),
             qp_hd::PersistedEvent::Exile(_) => "exile".to_string(),
