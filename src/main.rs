@@ -731,6 +731,7 @@ async fn open_wallet(
     Ok(Json(substrate_json(&name)?))
 }
 
+
 async fn transit_wallet(
     Path(name): Path<String>,
     Json(body): Json<TransitRequest>,
@@ -769,12 +770,14 @@ async fn transit_wallet(
     let path = match body.path {
         Some(path) => {
             let path = path.trim();
+
             if path.is_empty() {
                 return Err(error(
                     StatusCode::BAD_REQUEST,
                     "path must not be empty",
                 ));
             }
+
             Some(path.to_string())
         }
         None => preset.as_ref().map(|network| network.path.clone()),
@@ -800,16 +803,23 @@ async fn transit_wallet(
     )
     .memorize();
 
-    let event = commands::qtm_transit(&name, payload, body.activation);
+    let event = commands::qtm_transit(
+        &name,
+        payload,
+        body.activation,
+    );
 
     let qtm = QtmResponse {
-    commitment: hex::encode(event.qtm.commitment),
-    coordinate: hex::encode(event.qtm.coordinate),
-    sigma: event.qtm.sigma.to_string(),
-    network: event.qtm.net_work.to_string(),
-};
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
 
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
 
     Ok(Json(direction_response(
         direction,
@@ -848,16 +858,19 @@ async fn receive_wallet(
         }
     };
 
-    let transaction = QuantumTransaction::send(&name, body.amount);
+    let transaction = QuantumTransaction::send(
+        &name,
+        body.amount,
+    );
 
     let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
         qtm: qtm_frame(QtmResponse {
-    commitment: hex::encode(transaction.qtm.commitment),
-    coordinate: hex::encode(transaction.qtm.coordinate),
-    sigma: transaction.qtm.sigma.to_string(),
-    network: transaction.qtm.net_work.to_string(),
-}),
+            commitment: hex::encode(transaction.qtm.commitment),
+            coordinate: hex::encode(transaction.qtm.coordinate),
+            sigma: transaction.qtm.sigma.to_string(),
+            network: transaction.qtm.net_work.to_string(),
+        }),
         constant: match &transaction.constant {
             qp_hd::PersistedEvent::Transit(_) => "transit".to_string(),
             qp_hd::PersistedEvent::Exile(_) => "exile".to_string(),
@@ -866,28 +879,24 @@ async fn receive_wallet(
 
     let event = transaction.receive(&name, flow);
 
-    let exile_event = commands::qtm_exile(&name);
+    let qtm = QtmResponse {
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
 
     let direction = Direction::from_heritage(
-        exile_event.heritage,
+        event.heritage,
         Scale::Local,
     );
 
-    let event_response = direction_response(
+    let event_response = event_map_response(
         direction,
-        None,
-        QtmResponse {
-            commitment: hex::encode(exile_event.qtm.commitment),
-            coordinate: hex::encode(exile_event.qtm.coordinate),
-            sigma: exile_event.qtm.sigma.to_string(),
-            network: exile_event.qtm.net_work.to_string(),
-        },
-        &exile_event.depth,
-    )
-    .frame
-    .event;
+        &event.depth,
+    );
 
-    let _ = event;
+    let _ = qtm;
 
     Ok(Json(ReceiveResponse {
         frame: QuantumTransactionFrame {
@@ -928,6 +937,7 @@ async fn exile_wallet(
         &event.depth,
     )))
 }
+
 
 #[tokio::main]
 async fn main() {
