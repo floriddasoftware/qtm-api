@@ -180,6 +180,26 @@ struct SubstrateResponse {
 }
 
 #[derive(Serialize)]
+struct EventStoreResponse {
+    substrate: String,
+    directory: String,
+    events_directory: String,
+    events: Vec<PersistedEventSummary>,
+    runtime: RuntimeResponse,
+}
+
+#[derive(Serialize)]
+struct PersistedEventSummary {
+    kind: String,
+    record: String,
+    activation: String,
+    dimension: String,
+    structural_value: String,
+    depth_objects: usize,
+    retained_mass: String,
+}
+
+#[derive(Serialize)]
 struct SubstrateListResponse {
     substrates: Vec<SubstrateEntry>,
 }
@@ -589,6 +609,91 @@ async fn head_wallets() -> ApiResult<StatusCode> {
     Ok(StatusCode::OK)
 }
 
+async fn list_events(
+    Path(name): Path<String>,
+) -> ApiResult<Json<EventStoreResponse>> {
+    let substrate_path = ensure_existing_substrate(&name)?;
+    let events_path = substrate_path.join("events");
+
+    let mut events = Vec::new();
+
+    if events_path.is_dir() {
+        let entries = std::fs::read_dir(&events_path).map_err(|io_error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to list events: {io_error}"),
+            )
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|io_error| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to read event entry: {io_error}"),
+                )
+            })?;
+
+            let record_path = entry.path();
+
+            if !record_path.is_dir() {
+                continue;
+            }
+
+            let record = entry.file_name().to_string_lossy().to_string();
+
+            let kind = if record.starts_with("exile_") {
+                "exile"
+            } else if record.starts_with("event_") {
+                "transit"
+            } else {
+                continue;
+            };
+
+            let activation = read_trim(&record_path.join("manifold.activations"))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let dimension = read_trim(&record_path.join("manifold.dimension"))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let structural_value =
+                read_trim(&record_path.join("manifold.structural_value"))
+                    .unwrap_or_else(|| "unknown".to_string());
+
+            let retained_mass = read_trim(&record_path.join("manifold.retained_mass"))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let depth_objects = read_trim(&record_path.join("depth.objects"))
+                .map(|contents| {
+                    contents
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count()
+                })
+                .unwrap_or(0);
+
+            events.push(PersistedEventSummary {
+                kind: kind.to_string(),
+                record,
+                activation,
+                dimension,
+                structural_value,
+                depth_objects,
+                retained_mass,
+            });
+        }
+    }
+
+    events.sort_by_key(|event| event.activation.parse::<u64>().unwrap_or(0));
+
+    Ok(Json(EventStoreResponse {
+        substrate: name,
+        directory: substrate_path.display().to_string(),
+        events_directory: events_path.display().to_string(),
+        events,
+        runtime: serialize_runtime(SystemTime::now()),
+    }))
+}
+
 async fn create_wallet(
     Json(body): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<SubstrateResponse>)> {
@@ -978,6 +1083,10 @@ async fn main() {
         .route(
             "/wallets/:name",
             get(open_wallet).options(preflight),
+        )
+        .route(
+            "/wallets/:name/events",
+            get(list_events).options(preflight),
         )
         .route(
             "/wallets/:name/transit",
