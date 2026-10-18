@@ -5,7 +5,346 @@ use qp_hd{coin};
 
 
 
+#[inline(always)]
+pub fn process(
+    &self,
+    receipt: EventReceipt,
+    mut bitcoin: BitcoinPayload,
+    parent: ObservedBitcoinTransaction,
+) -> Result<
+    (FinalizedSettlement, Retain),
+    SettlementError,
+> {
+    println!(
+        "trace=settlement_process_begin \
+         parent_txid={} \
+         inputs={} \
+         outputs={}",
+        parent.txid,
+        bitcoin.inputs.len(),
+        bitcoin.outputs.len(),
+    );
 
+    let settled_receipt =
+        Self::settle(receipt);
+
+    println!(
+        "trace=settlement_receipt_complete \
+         parent_txid={}",
+        parent.txid,
+    );
+
+    println!(
+        "trace=settlement_state_begin \
+         parent_txid={}",
+        parent.txid,
+    );
+
+    println!(
+        "trace=settlement_state \
+         parent_txid={} \
+         state={:?}",
+        parent.txid,
+        settled_receipt.state,
+    );
+
+    let manifold =
+        &settled_receipt
+            .event
+            .heritage
+            .state;
+
+    let delta =
+        settled_receipt
+            .event
+            .heritage
+            .transition
+            .delta;
+
+    println!(
+        "trace=settlement_state_complete \
+         parent_txid={}",
+        parent.txid,
+    );
+
+    println!(
+        "trace=settlement_parameters \
+         parent_txid={} \
+         activation={} \
+         delta={}",
+        parent.txid,
+        manifold.activations(),
+        delta,
+    );
+
+    println!(
+        "trace=settlement_retained_begin \
+         parent_txid={}",
+        parent.txid,
+    );
+
+    let input_mass =
+        bitcoin
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(position, input)| {
+                input
+                    .deep(
+                        manifold,
+                        "input",
+                        position,
+                    )
+                    .mass
+            })
+            .sum::<u128>();
+
+    let output_mass =
+        bitcoin
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(position, output)| {
+                output
+                    .deep(
+                        manifold,
+                        "output",
+                        bitcoin.inputs.len() + position,
+                    )
+                    .mass
+            })
+            .sum::<u128>();
+
+    let input_retained =
+        manifold.retain(
+            input_mass,
+            manifold.dimension(),
+        );
+
+    let output_retained =
+        manifold.retain(
+            output_mass,
+            manifold.dimension(),
+        );
+
+    let retained =
+        bitcoin.retained(
+            manifold,
+        );
+
+    println!(
+        "trace=settlement_retained_complete \
+         parent_txid={} \
+         input_retained_mass={} \
+         output_retained_mass={} \
+         retained_mass={}",
+        parent.txid,
+        input_retained.mass,
+        output_retained.mass,
+        retained.mass,
+    );
+
+    println!(
+        "trace=settlement_fee_begin \
+         parent_txid={}",
+        parent.txid,
+    );
+
+    let fee =
+        bitcoin
+            .fee_mass(
+                manifold,
+                delta,
+            ) as u64;
+
+    println!(
+        "trace=settlement_fee_complete \
+         parent_txid={} \
+         fee={}",
+        parent.txid,
+        fee,
+    );
+
+    let last =
+        bitcoin
+            .outputs
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| {
+                SettlementError::Unsupported(
+                    "settlement payload has no outputs",
+                )
+            })?;
+
+    println!(
+        "trace=settlement_output_selected \
+         parent_txid={} \
+         vout={} \
+         outputs={}",
+        parent.txid,
+        last,
+        bitcoin.outputs.len(),
+    );
+
+    let input_value =
+        parent
+            .transaction
+            .input
+            .iter()
+            .enumerate()
+            .map(|(input_index, _)| {
+                bitcoin
+                    .inputs
+                    .get(input_index)
+                    .map(|_| {
+                        parent
+                            .transaction
+                            .output
+                            .iter()
+                            .map(|output| output.value.to_sat())
+                            .sum::<u64>()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+
+    let assigned_output_value =
+        bitcoin
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position != last)
+            .map(|(_, output)| output.value)
+            .sum::<u64>();
+
+    let final_settlement_value =
+        input_value
+            .saturating_sub(
+                assigned_output_value,
+            )
+            .saturating_sub(
+                fee,
+            );
+
+    println!(
+        "trace=settlement_value \
+         parent_txid={} \
+         input_value={} \
+         assigned_output_value={} \
+         fee={} \
+         settlement_value={}",
+        parent.txid,
+        input_value,
+        assigned_output_value,
+        fee,
+        final_settlement_value,
+    );
+
+    println!(
+        "trace=settlement_output_update_begin \
+         parent_txid={} \
+         vout={}",
+        parent.txid,
+        last,
+    );
+
+    let output =
+        bitcoin
+            .outputs
+            .get_mut(last)
+            .ok_or_else(|| {
+                SettlementError::Unsupported(
+                    "settlement output disappeared",
+                )
+            })?;
+
+    output.value =
+        final_settlement_value;
+
+    println!(
+        "trace=settlement_output_update_complete \
+         parent_txid={} \
+         vout={} \
+         value={}",
+        parent.txid,
+        last,
+        output.value,
+    );
+
+    println!(
+        "trace=settlement_transaction_begin \
+         parent_txid={}",
+        parent.txid,
+    );
+
+    let transaction =
+        ObservedBitcoinTransaction::new_transaction(
+            &bitcoin,
+            parent.source.clone(),
+        )
+        .ok_or_else(|| {
+            SettlementError::Unsupported(
+                "failed to construct settlement transaction",
+            )
+        })?;
+
+    println!(
+        "trace=settlement_transaction_complete \
+         parent_txid={} \
+         transaction_txid={}",
+        parent.txid,
+        transaction
+            .transaction
+            .compute_txid(),
+    );
+
+    println!(
+        "trace=settlement_finalized_begin \
+         parent_txid={} \
+         vout={}",
+        parent.txid,
+        last,
+    );
+
+    let finalized =
+        FinalizedSettlement::new(
+            Some(settled_receipt),
+            parent,
+            Some(transaction.transaction),
+            last as u32,
+        );
+
+    println!(
+        "trace=settlement_finalized_complete \
+         finalized_txid={} \
+         vout={}",
+        finalized.txid(),
+        finalized.vout,
+    );
+
+    println!(
+        "trace=settlement_process_complete \
+         finalized_txid={} \
+         vout={} \
+         fee={} \
+         settlement_value={} \
+         input_retained_mass={} \
+         output_retained_mass={} \
+         retained_mass={}",
+        finalized.txid(),
+        finalized.vout,
+        fee,
+        final_settlement_value,
+        input_retained.mass,
+        output_retained.mass,
+        retained.mass,
+    );
+
+    Ok((
+        finalized,
+        retained,
+    ))
+}
 
 #[repr(C)]
 pub struct QPBlock {
