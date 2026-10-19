@@ -5,7 +5,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-
 use qp_hd::{
     commands,
     economic_gate::QuantumTransaction,
@@ -13,21 +12,16 @@ use qp_hd::{
     purpose::{BIP39Handler, BIP39Language},
     qp44::{Flow, TotalMass},
 };
-
-use qtm_graph::graph::{
-    frame::{Depth, Direction},
-    Scale,
+use qtm_graph::{
+    graph::{frame::{Depth, Direction}, Scale},
 };
-
 use serde::{Deserialize, Serialize};
-
 use std::{
     collections::HashMap,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
-
 use tower_http::cors::CorsLayer;
 
 const DOMAIN_SIZE: u16 = 2048;
@@ -54,44 +48,18 @@ struct ApiError {
 #[derive(Deserialize)]
 struct CreateRequest {
     name: String,
-
     #[serde(default)]
     indices: Option<String>,
-
     #[serde(default)]
     entropy: Option<String>,
-
     #[serde(default)]
     seed_source: Option<String>,
-
     #[serde(default)]
     phrase: Option<String>,
-
     #[serde(default)]
     language: Option<String>,
-
     #[serde(default)]
     passphrase: Option<String>,
-}
-
-fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "english" => Ok(BIP39Language::English),
-        "chinese_simplified" | "chinese-simplified" => {
-            Ok(BIP39Language::ChineseSimplified)
-        }
-        "chinese_traditional" | "chinese-traditional" => {
-            Ok(BIP39Language::ChineseTraditional)
-        }
-        "french" => Ok(BIP39Language::French),
-        "italian" => Ok(BIP39Language::Italian),
-        "japanese" => Ok(BIP39Language::Japanese),
-        "korean" => Ok(BIP39Language::Korean),
-        "spanish" => Ok(BIP39Language::Spanish),
-        "czech" => Ok(BIP39Language::Czech),
-        "portuguese" => Ok(BIP39Language::Portuguese),
-        _ => Err("unsupported BIP39 language".to_string()),
-    }
 }
 
 #[derive(Serialize)]
@@ -111,7 +79,6 @@ struct QtmFrameResponse {
 #[derive(Serialize)]
 struct DirectionResponse {
     frame: DirectionFrameResponse,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     selection: Option<TransitSelection>,
 }
@@ -129,25 +96,27 @@ struct EventMapResponse {
     depth: DepthResponse,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct DepthResponse {
     path: String,
     objects: Vec<DepthObjectResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct DepthObjectResponse {
     position: usize,
     identifier: String,
     mass: String,
     from: String,
 }
+
 static EXILE_DEPTH_MEMORY: OnceLock<Mutex<HashMap<String, DepthResponse>>> =
     OnceLock::new();
 
 fn exile_depth_memory() -> &'static Mutex<HashMap<String, DepthResponse>> {
     EXILE_DEPTH_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
 #[derive(Serialize)]
 struct RuntimeResponse {
     unix_seconds: u64,
@@ -234,25 +203,18 @@ struct NetworkOption {
 struct TransitRequest {
     #[serde(default)]
     network: Option<String>,
-
     #[serde(default)]
     purpose: Option<u64>,
-
     #[serde(default)]
     coin: Option<u64>,
-
     #[serde(default)]
     account: Option<u64>,
-
     #[serde(default)]
     change: Option<u64>,
-
     #[serde(default)]
     external: Option<u64>,
-
     #[serde(default)]
     path: Option<String>,
-
     #[serde(default)]
     activation: u64,
 }
@@ -280,7 +242,6 @@ static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
     let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-
     let mut registry = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -329,93 +290,24 @@ fn valid_substrate_name(name: &str) -> bool {
         })
 }
 
-fn required_depth_response(depth: &Depth) -> Result<DepthResponse, String> {
-    let response = depth_response(depth);
-
-    if response.path.trim().is_empty() {
-        return Err("exile depth path is empty".to_string());
-    }
-
-    if response.objects.is_empty() {
-        return Err("exile requires at least one retained depth object".to_string());
-    }
-
-    for object in &response.objects {
-        if object.identifier.trim().is_empty() {
-            return Err(format!(
-                "exile depth object at position {} has no identifier",
-                object.position,
-            ));
+fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "english" => Ok(BIP39Language::English),
+        "chinese_simplified" | "chinese-simplified" => {
+            Ok(BIP39Language::ChineseSimplified)
         }
+        "chinese_traditional" | "chinese-traditional" => {
+            Ok(BIP39Language::ChineseTraditional)
+        }
+        "french" => Ok(BIP39Language::French),
+        "italian" => Ok(BIP39Language::Italian),
+        "japanese" => Ok(BIP39Language::Japanese),
+        "korean" => Ok(BIP39Language::Korean),
+        "spanish" => Ok(BIP39Language::Spanish),
+        "czech" => Ok(BIP39Language::Czech),
+        "portuguese" => Ok(BIP39Language::Portuguese),
+        _ => Err("unsupported BIP39 language".to_string()),
     }
-
-    Ok(response)
-}
-
-async fn exile_wallet(
-    Path(name): Path<String>,
-) -> ApiResult<Json<DirectionResponse>> {
-    let lock = substrate_lock(&name);
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    ensure_existing_substrate(&name)?;
-
-    let event = commands::qtm_exile(&name);
-
-    let depth = required_depth_response(&event.depth)
-        .map_err(|message| {
-            error(StatusCode::CONFLICT, message)
-        })?;
-
-    let qtm_response = QtmResponse {
-        commitment: hex::encode(event.qtm.commitment),
-        coordinate: hex::encode(event.qtm.coordinate),
-        sigma: event.qtm.sigma.to_string(),
-        network: event.qtm.net_work.to_string(),
-    };
-
-    let direction = Direction::from_heritage(
-        event.heritage,
-        Scale::Local,
-    );
-
-    exile_depth_memory()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(name, depth.clone());
-
-    Ok(Json(DirectionResponse {
-        frame: DirectionFrameResponse {
-            qtm: qtm_frame(qtm_response),
-            event: EventMapResponse {
-                scale: "Local".to_string(),
-                runtime: serialize_runtime(SystemTime::now()),
-                depth,
-            },
-        },
-        selection: None,
-    }))
-}
-
-async fn exile_depth(
-    Path(name): Path<String>,
-) -> ApiResult<Json<DepthResponse>> {
-    ensure_existing_substrate(&name)?;
-
-    let memory = exile_depth_memory()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let depth = memory.get(&name).cloned().ok_or_else(|| {
-        error(
-            StatusCode::NOT_FOUND,
-            format!("no in-memory exile depth record for substrate: {name}"),
-        )
-    })?;
-
-    Ok(Json(depth))
 }
 
 fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
@@ -435,9 +327,7 @@ fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
         .collect::<Result<Vec<u16>, String>>()?;
 
     if parsed.len() != NUM_INDICES {
-        return Err(
-            "indices must contain exactly 12 comma-separated integers".to_string(),
-        );
+        return Err("indices must contain exactly 12 comma-separated integers".to_string());
     }
 
     parsed.try_into().map_err(|_| {
@@ -458,6 +348,33 @@ fn substrate_json(name: &str) -> ApiResult<SubstrateResponse> {
         sigma: required_file(&path.join("qtm.sigma"))?,
         network: required_file(&path.join("qtm.network"))?,
     })
+}
+
+fn ensure_existing_substrate(name: &str) -> ApiResult<PathBuf> {
+    if !valid_substrate_name(name) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    }
+
+    let path = commands::substrate_root().join(name);
+
+    if !path.is_dir() {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("substrate does not exist: {name}"),
+        ));
+    }
+
+    for filename in SUBSTRATE_FILES {
+        let file = path.join(filename);
+        if !file.is_file() {
+            return Err(error(
+                StatusCode::CONFLICT,
+                format!("substrate state is incomplete: missing {}", file.display()),
+            ));
+        }
+    }
+
+    Ok(path)
 }
 
 fn list_substrates() -> ApiResult<SubstrateListResponse> {
@@ -488,7 +405,6 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
         })?;
 
         let path = entry.path();
-
         if !path.is_dir() {
             continue;
         }
@@ -505,20 +421,15 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
             continue;
         }
 
-        let dimension = required_file(&path.join("perm.dimension"))?;
-
-        let activations = read_trim(&path.join("manifold.activations"))
-            .unwrap_or_else(|| "0".to_string());
-
         substrates.push(SubstrateEntry {
             name,
-            dimension,
-            activations,
+            dimension: required_file(&path.join("perm.dimension"))?,
+            activations: read_trim(&path.join("manifold.activations"))
+                .unwrap_or_else(|| "0".to_string()),
         });
     }
 
     substrates.sort_by(|a, b| a.name.cmp(&b.name));
-
     Ok(SubstrateListResponse { substrates })
 }
 
@@ -567,7 +478,6 @@ fn registered_networks() -> NetworkListResponse {
     ));
 
     networks.sort_by(|a, b| a.id.cmp(&b.id));
-
     NetworkListResponse { networks }
 }
 
@@ -588,10 +498,7 @@ fn scale_name(scale: Scale) -> &'static str {
 }
 
 fn serialize_runtime(runtime: SystemTime) -> RuntimeResponse {
-    let duration = runtime
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
+    let duration = runtime.duration_since(UNIX_EPOCH).unwrap_or_default();
     RuntimeResponse {
         unix_seconds: duration.as_secs(),
         subsec_nanos: duration.subsec_nanos(),
@@ -620,10 +527,7 @@ fn depth_response(depth: &Depth) -> DepthResponse {
     }
 }
 
-fn event_map_response(
-    direction: Direction,
-    depth: &Depth,
-) -> EventMapResponse {
+fn event_map_response(direction: Direction, depth: &Depth) -> EventMapResponse {
     let event = direction.into_event();
 
     EventMapResponse {
@@ -646,40 +550,6 @@ fn direction_response(
         },
         selection,
     }
-}
-
-fn ensure_existing_substrate(name: &str) -> ApiResult<PathBuf> {
-    if !valid_substrate_name(name) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "invalid substrate name",
-        ));
-    }
-
-    let path = commands::substrate_root().join(name);
-
-    if !path.is_dir() {
-        return Err(error(
-            StatusCode::NOT_FOUND,
-            format!("substrate does not exist: {name}"),
-        ));
-    }
-
-    for filename in SUBSTRATE_FILES {
-        let file = path.join(filename);
-
-        if !file.is_file() {
-            return Err(error(
-                StatusCode::CONFLICT,
-                format!(
-                    "substrate state is incomplete: missing {}",
-                    file.display()
-                ),
-            ));
-        }
-    }
-
-    Ok(path)
 }
 
 async fn health() -> &'static str {
@@ -708,7 +578,6 @@ async fn list_events(
 ) -> ApiResult<Json<EventStoreResponse>> {
     let substrate_path = ensure_existing_substrate(&name)?;
     let events_path = substrate_path.join("events");
-
     let mut events = Vec::new();
 
     if events_path.is_dir() {
@@ -728,13 +597,11 @@ async fn list_events(
             })?;
 
             let record_path = entry.path();
-
             if !record_path.is_dir() {
                 continue;
             }
 
             let record = entry.file_name().to_string_lossy().to_string();
-
             let kind = if record.starts_with("exile_") {
                 "exile"
             } else if record.starts_with("event_") {
@@ -745,23 +612,16 @@ async fn list_events(
 
             let activation = read_trim(&record_path.join("manifold.activations"))
                 .unwrap_or_else(|| "unknown".to_string());
-
             let dimension = read_trim(&record_path.join("manifold.dimension"))
                 .unwrap_or_else(|| "unknown".to_string());
-
             let structural_value =
                 read_trim(&record_path.join("manifold.structural_value"))
                     .unwrap_or_else(|| "unknown".to_string());
-
             let retained_mass = read_trim(&record_path.join("manifold.retained_mass"))
                 .unwrap_or_else(|| "unknown".to_string());
-
             let depth_objects = read_trim(&record_path.join("depth.objects"))
                 .map(|contents| {
-                    contents
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .count()
+                    contents.lines().filter(|line| !line.trim().is_empty()).count()
                 })
                 .unwrap_or(0);
 
@@ -810,38 +670,25 @@ async fn create_wallet(
     {
         "persistent" | "custom" => {
             let raw_indices = body.indices.as_deref().ok_or_else(|| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    "indices are required for persistent creation",
-                )
+                error(StatusCode::BAD_REQUEST, "indices are required for persistent creation")
             })?;
-
             let parsed = parse_indices(raw_indices)
                 .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
-
             let entropy = body
                 .entropy
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    error(
-                        StatusCode::BAD_REQUEST,
-                        "non-empty entropy is required",
-                    )
+                    error(StatusCode::BAD_REQUEST, "non-empty entropy is required")
                 })?
                 .to_string();
 
             (
-                parsed
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                parsed.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
                 entropy,
             )
         }
-
         "bip39" => {
             let phrase = body
                 .phrase
@@ -849,30 +696,16 @@ async fn create_wallet(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    error(
-                        StatusCode::BAD_REQUEST,
-                        "a BIP39 phrase is required",
-                    )
+                    error(StatusCode::BAD_REQUEST, "a BIP39 phrase is required")
                 })?;
-
             let language_name = body.language.as_deref().ok_or_else(|| {
-                error(
-                    StatusCode::BAD_REQUEST,
-                    "select a BIP39 language in the UI",
-                )
+                error(StatusCode::BAD_REQUEST, "select a BIP39 language in the UI")
             })?;
-
             let language = parse_bip39_language(language_name)
                 .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
-
-            let indices = BIP39Handler::mnemonic_indices(phrase, language)
-                .map_err(|e| {
-                    error(
-                        StatusCode::BAD_REQUEST,
-                        format!("invalid BIP39 mnemonic: {e}"),
-                    )
-                })?;
-
+            let indices = BIP39Handler::mnemonic_indices(phrase, language).map_err(|e| {
+                error(StatusCode::BAD_REQUEST, format!("invalid BIP39 mnemonic: {e}"))
+            })?;
             let entropy = BIP39Handler::mnemonic_entropy(
                 phrase,
                 language,
@@ -886,15 +719,10 @@ async fn create_wallet(
             })?;
 
             (
-                indices
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                indices.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
                 hex::encode(entropy),
             )
         }
-
         _ => {
             return Err(error(
                 StatusCode::BAD_REQUEST,
@@ -904,10 +732,7 @@ async fn create_wallet(
     };
 
     let lock = substrate_lock(name);
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = commands::substrate_root();
 
     std::fs::create_dir_all(&root).map_err(|io_error| {
@@ -917,9 +742,7 @@ async fn create_wallet(
         )
     })?;
 
-    let path = root.join(name);
-
-    if path.exists() {
+    if root.join(name).exists() {
         return Err(error(
             StatusCode::CONFLICT,
             format!("substrate already exists: {name}"),
@@ -927,24 +750,17 @@ async fn create_wallet(
     }
 
     commands::qtm_create(name.to_string(), Some(indices), Some(entropy));
-
-    let response = substrate_json(name)?;
-
-    Ok((StatusCode::CREATED, Json(response)))
+    Ok((StatusCode::CREATED, Json(substrate_json(name)?)))
 }
 
 async fn open_wallet(
     Path(name): Path<String>,
 ) -> ApiResult<Json<SubstrateResponse>> {
     let lock = substrate_lock(&name);
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     ensure_existing_substrate(&name)?;
-
     commands::qtm_open(name.clone());
-
     Ok(Json(substrate_json(&name)?))
 }
 
@@ -953,32 +769,22 @@ async fn transit_wallet(
     Json(body): Json<TransitRequest>,
 ) -> ApiResult<Json<DirectionResponse>> {
     let lock = substrate_lock(&name);
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_existing_substrate(&name)?;
 
     let preset = match body.network.as_deref() {
         Some(id) => Some(selected_network(id).ok_or_else(|| {
-            error(
-                StatusCode::BAD_REQUEST,
-                format!("unsupported network: {id}"),
-            )
+            error(StatusCode::BAD_REQUEST, format!("unsupported network: {id}"))
         })?),
         None => None,
     };
 
-    let purpose = body
-        .purpose
+    let purpose = body.purpose
         .or_else(|| preset.as_ref().map(|network| network.purpose))
         .unwrap_or(44);
-
-    let coin = body
-        .coin
+    let coin = body.coin
         .or_else(|| preset.as_ref().map(|network| network.coin))
         .unwrap_or(0);
-
     let account = body.account.unwrap_or(0);
     let change = body.change.unwrap_or(0);
     let external = body.external.unwrap_or(0);
@@ -986,14 +792,9 @@ async fn transit_wallet(
     let path = match body.path {
         Some(path) => {
             let path = path.trim();
-
             if path.is_empty() {
-                return Err(error(
-                    StatusCode::BAD_REQUEST,
-                    "path must not be empty",
-                ));
+                return Err(error(StatusCode::BAD_REQUEST, "path must not be empty"));
             }
-
             Some(path.to_string())
         }
         None => preset.as_ref().map(|network| network.path.clone()),
@@ -1019,11 +820,7 @@ async fn transit_wallet(
     )
     .memorize();
 
-    let event = commands::qtm_transit(
-        &name,
-        payload,
-        body.activation,
-    );
+    let event = commands::qtm_transit(&name, payload, body.activation);
 
     let qtm = QtmResponse {
         commitment: hex::encode(event.qtm.commitment),
@@ -1031,18 +828,9 @@ async fn transit_wallet(
         sigma: event.qtm.sigma.to_string(),
         network: event.qtm.net_work.to_string(),
     };
+    let direction = Direction::from_heritage(event.heritage, Scale::Local);
 
-    let direction = Direction::from_heritage(
-        event.heritage,
-        Scale::Local,
-    );
-
-    Ok(Json(direction_response(
-        direction,
-        Some(selection),
-        qtm,
-        &event.depth,
-    )))
+    Ok(Json(direction_response(direction, Some(selection), qtm, &event.depth)))
 }
 
 async fn receive_wallet(
@@ -1050,17 +838,11 @@ async fn receive_wallet(
     Json(body): Json<ReceiveRequest>,
 ) -> ApiResult<Json<ReceiveResponse>> {
     let lock = substrate_lock(&name);
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_existing_substrate(&name)?;
 
     if body.amount == 0 {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "amount must be greater than zero",
-        ));
+        return Err(error(StatusCode::BAD_REQUEST, "amount must be greater than zero"));
     }
 
     let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
@@ -1074,10 +856,7 @@ async fn receive_wallet(
         }
     };
 
-    let transaction = QuantumTransaction::send(
-        &name,
-        body.amount,
-    );
+    let transaction = QuantumTransaction::send(&name, body.amount);
 
     let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
@@ -1094,16 +873,8 @@ async fn receive_wallet(
     };
 
     let event = transaction.receive(&name, flow);
-
-    let direction = Direction::from_heritage(
-        event.heritage,
-        Scale::Local,
-    );
-
-    let event_response = event_map_response(
-        direction,
-        &event.depth,
-    );
+    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let event_response = event_map_response(direction, &event.depth);
 
     Ok(Json(ReceiveResponse {
         frame: QuantumTransactionFrame {
@@ -1117,32 +888,60 @@ async fn exile_wallet(
     Path(name): Path<String>,
 ) -> ApiResult<Json<DirectionResponse>> {
     let lock = substrate_lock(&name);
-    let _guard = lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     ensure_existing_substrate(&name)?;
 
+    // qtm_exile produces the canonical depth record. Do not call it once
+    // to validate and again to return: exile is a state transition.
     let event = commands::qtm_exile(&name);
 
-    let qtm_response = QtmResponse {
+    let qtm = QtmResponse {
         commitment: hex::encode(event.qtm.commitment),
         coordinate: hex::encode(event.qtm.coordinate),
         sigma: event.qtm.sigma.to_string(),
         network: event.qtm.net_work.to_string(),
     };
 
-    let direction = Direction::from_heritage(
-        event.heritage,
-        Scale::Local,
-    );
+    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let depth = depth_response(&event.depth);
 
-    Ok(Json(direction_response(
-        direction,
-        None,
-        qtm_response,
-        &event.depth,
-    )))
+    // Cache the actual generated depth for the selected substrate.
+    exile_depth_memory()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name, depth.clone());
+
+    Ok(Json(DirectionResponse {
+        frame: DirectionFrameResponse {
+            qtm: qtm_frame(qtm),
+            event: EventMapResponse {
+                scale: "Local".to_string(),
+                runtime: serialize_runtime(SystemTime::now()),
+                depth,
+            },
+        },
+        selection: None,
+    }))
+}
+
+async fn exile_depth(
+    Path(name): Path<String>,
+) -> ApiResult<Json<DepthResponse>> {
+    ensure_existing_substrate(&name)?;
+
+    let memory = exile_depth_memory()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let depth = memory.get(&name).cloned().ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!("no in-memory exile depth record for substrate: {name}"),
+        )
+    })?;
+
+    Ok(Json(depth))
 }
 
 #[tokio::main]
@@ -1174,32 +973,12 @@ async fn main() {
                 .head(head_wallets)
                 .options(preflight),
         )
-        .route(
-            "/wallets/:name",
-            get(open_wallet).options(preflight),
-        )
-        .route(
-            "/wallets/:name/events",
-            get(list_events).options(preflight),
-        )
-        .route(
-            "/wallets/:name/transit",
-            post(transit_wallet).options(preflight),
-        )
-        .route(
-            "/wallets/:name/receive",
-            post(receive_wallet).options(preflight),
-        )
-        
-        .route(
-       "/wallets/:name/exile/depth",
-       get(exile_depth).options(preflight),
-        )
-        
-        .route(
-            "/wallets/:name/exile",
-            post(exile_wallet).options(preflight),
-        )
+        .route("/wallets/:name", get(open_wallet).options(preflight))
+        .route("/wallets/:name/events", get(list_events).options(preflight))
+        .route("/wallets/:name/transit", post(transit_wallet).options(preflight))
+        .route("/wallets/:name/receive", post(receive_wallet).options(preflight))
+        .route("/wallets/:name/exile/depth", get(exile_depth).options(preflight))
+        .route("/wallets/:name/exile", post(exile_wallet).options(preflight))
         .layer(cors);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -1210,10 +989,7 @@ async fn main() {
         .expect("failed to bind qtm-api listener");
 
     println!("qtm-api listening on http://{address}");
-    println!(
-        "substrate_root={}",
-        commands::substrate_root().display()
-    );
+    println!("substrate_root={}", commands::substrate_root().display());
 
     axum::serve(listener, app)
         .await
