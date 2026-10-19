@@ -1,7 +1,14 @@
 use qp_hd{coin};
 
 
+let max_events = activation_count()
+    .saturating_mul(delta);
 
+let budget = BlockBudget {
+    min_events,
+    max_events,
+    max_retained_mass: u128::MAX,
+};
 
 let budget = BlockBudget {
         min_events,
