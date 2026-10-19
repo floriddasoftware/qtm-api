@@ -97,11 +97,7 @@ struct DepthObjectResponse {
     mass: String,
     from: String,
 }
-static EXILE_DEPTH_MEMORY: OnceLock<Mutex<HashMap<String, DepthResponse>>> =
-    OnceLock::new();
-fn exile_depth_memory() -> &'static Mutex<HashMap<String, DepthResponse>> {
-    EXILE_DEPTH_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
-}
+
 #[derive(Serialize)]
 struct RuntimeResponse {
     unix_seconds: u64,
@@ -493,6 +489,235 @@ fn depth_response(depth: &Depth) -> DepthResponse {
             .collect(),
     }
 }
+
+fn write_depth_payload(
+    record_path: &FsPath,
+    network: &str,
+    depth: &Depth,
+) -> ApiResult<()> {
+    // Restrict the network directory to a single path component.
+    if network.is_empty()
+        || network == "."
+        || network == ".."
+        || !network
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for depth persistence",
+        ));
+    }
+
+    let payload_path = record_path.join(network).join("payload");
+
+    std::fs::create_dir_all(&payload_path).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "unable to create depth payload directory {}: {e}",
+                payload_path.display()
+            ),
+        )
+    })?;
+
+    let response = depth_response(depth);
+
+    // Keep the canonical Depth path as returned by qtm_graph.
+    let path_file = payload_path.join("depth.path");
+    let objects_file = payload_path.join("depth.objects");
+
+    let mut objects = String::new();
+
+    for object in &response.objects {
+        // Hex-encode the identifier so tabs/newlines in identifiers cannot
+        // corrupt the tab-separated persistence format.
+        objects.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            object.position,
+            hex::encode(object.identifier.as_bytes()),
+            object.mass,
+            object.from
+        ));
+    }
+
+    write_atomic(&path_file, response.path.as_bytes())?;
+    write_atomic(&objects_file, objects.as_bytes())?;
+
+    Ok(())
+}
+
+fn write_atomic(path: &FsPath, contents: &[u8]) -> ApiResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "depth persistence path has no parent directory",
+        )
+    })?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("depth");
+
+    let temporary = parent.join(format!("{file_name}.tmp"));
+
+    std::fs::write(&temporary, contents).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to write {}: {e}", temporary.display()),
+        )
+    })?;
+
+    std::fs::rename(&temporary, path).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to persist {}: {e}", path.display()),
+        )
+    })?;
+
+    Ok(())
+}
+
+fn latest_record_path(
+    substrate_path: &FsPath,
+    prefix: &str,
+) -> ApiResult<PathBuf> {
+    let events_path = substrate_path.join("events");
+
+    let entries = std::fs::read_dir(&events_path).map_err(|e| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "event store is unavailable at {}: {e}",
+                events_path.display()
+            ),
+        )
+    })?;
+
+    let mut records: Vec<(SystemTime, PathBuf)> = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read event-store entry: {e}"),
+            )
+        })?;
+
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if !path.is_dir() || !name.starts_with(prefix) {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+
+        records.push((modified, path));
+    }
+
+    records.sort_by(|a, b| b.0.cmp(&a.0));
+
+    records
+        .into_iter()
+        .map(|(_, path)| path)
+        .next()
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                format!("no {prefix} record exists in the event store"),
+            )
+        })
+}
+
+fn read_persisted_depth(
+    payload_path: &FsPath,
+) -> ApiResult<DepthResponse> {
+    let path_file = payload_path.join("depth.path");
+    let objects_file = payload_path.join("depth.objects");
+
+    let path = std::fs::read_to_string(&path_file).map_err(|e| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "persisted depth path is unavailable at {}: {e}",
+                path_file.display()
+            ),
+        )
+    })?;
+
+    let contents = std::fs::read_to_string(&objects_file).map_err(|e| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "persisted depth objects are unavailable at {}: {e}",
+                objects_file.display()
+            ),
+        )
+    })?;
+
+    let mut objects = Vec::new();
+
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+
+        if fields.len() != 4 {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "invalid persisted depth object at {}:{}",
+                    objects_file.display(),
+                    line_number + 1
+                ),
+            ));
+        }
+
+        let position = fields[0].parse::<usize>().map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid depth position at line {}", line_number + 1),
+            )
+        })?;
+
+        let identifier_bytes = hex::decode(fields[1]).map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid depth identifier at line {}", line_number + 1),
+            )
+        })?;
+
+        let identifier = String::from_utf8(identifier_bytes).map_err(|_| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "depth identifier is not valid UTF-8 at line {}",
+                    line_number + 1
+                ),
+            )
+        })?;
+
+        objects.push(DepthObjectResponse {
+            position,
+            identifier,
+            mass: fields[2].to_string(),
+            from: fields[3].to_string(),
+        });
+    }
+
+    Ok(DepthResponse {
+        path: path.trim().to_string(),
+        objects,
+    })
+}
+
 fn event_map_response(direction: Direction, depth: &Depth) -> EventMapResponse {
     let event = direction.into_event();
     EventMapResponse {
@@ -501,6 +726,8 @@ fn event_map_response(direction: Direction, depth: &Depth) -> EventMapResponse {
         depth: depth_response(depth),
     }
 }
+
+
 fn direction_response(
     direction: Direction,
     selection: Option<TransitSelection>,
@@ -925,42 +1152,67 @@ async fn open_wallet(
     commands::qtm_open(name.clone());
     Ok(Json(substrate_json(&name)?))
 }
+
 async fn transit_wallet(
     Path(name): Path<String>,
     Json(body): Json<TransitRequest>,
 ) -> ApiResult<Json<DirectionResponse>> {
     let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    ensure_existing_substrate(&name)?;
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+
     let preset = match body.network.as_deref() {
         Some(id) => Some(selected_network(id).ok_or_else(|| {
-            error(StatusCode::BAD_REQUEST, format!("unsupported network: {id}"))
+            error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported network: {id}"),
+            )
         })?),
         None => None,
     };
+
     let purpose = body
         .purpose
         .or_else(|| preset.as_ref().map(|network| network.purpose))
         .unwrap_or(44);
+
     let coin = body
         .coin
         .or_else(|| preset.as_ref().map(|network| network.coin))
         .unwrap_or(0);
+
     let account = body.account.unwrap_or(0);
     let change = body.change.unwrap_or(0);
     let external = body.external.unwrap_or(0);
+
     let path = match body.path {
         Some(path) => {
             let path = path.trim();
+
             if path.is_empty() {
-                return Err(error(StatusCode::BAD_REQUEST, "path must not be empty"));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "path must not be empty",
+                ));
             }
+
             Some(path.to_string())
         }
         None => preset.as_ref().map(|network| network.path.clone()),
     };
+
+    let network_id = body
+        .network
+        .as_deref()
+        .or_else(|| preset.as_ref().map(|network| network.id.as_str()))
+        .unwrap_or("default")
+        .to_string();
+
     let selection = TransitSelection {
-        network: body.network.clone(),
+        network: Some(network_id.clone()),
         path,
         activation: body.activation,
         purpose,
@@ -969,6 +1221,7 @@ async fn transit_wallet(
         change,
         external,
     };
+
     let payload = TotalMass::new(
         purpose as u128,
         coin as u128,
@@ -977,14 +1230,24 @@ async fn transit_wallet(
         external as u128,
     )
     .memorize();
+
+    // Execute the transition once. The returned event contains the
+    // canonical depth; persist it without reconstructing or recomputing it.
     let event = commands::qtm_transit(&name, payload, body.activation);
+
+    // Persist input depth under this event record and selected network.
+    let record_path = latest_record_path(&substrate_path, "event_")?;
+    write_depth_payload(&record_path, &network_id, &event.depth)?;
+
     let qtm = QtmResponse {
         commitment: hex::encode(event.qtm.commitment),
         coordinate: hex::encode(event.qtm.coordinate),
         sigma: event.qtm.sigma.to_string(),
         network: event.qtm.net_work.to_string(),
     };
+
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
+
     Ok(Json(direction_response(
         direction,
         Some(selection),
@@ -1039,54 +1302,56 @@ async fn receive_wallet(
         },
     }))
 }
-async fn exile_wallet(
-    Path(name): Path<String>,
-) -> ApiResult<Json<DirectionResponse>> {
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    ensure_existing_substrate(&name)?;
-    // qtm_exile produces the canonical depth record. Do not call it once
-    // to validate and again to return: exile is a state transition.
-    let event = commands::qtm_exile(&name);
-    let qtm = QtmResponse {
-        commitment: hex::encode(event.qtm.commitment),
-        coordinate: hex::encode(event.qtm.coordinate),
-        sigma: event.qtm.sigma.to_string(),
-        network: event.qtm.net_work.to_string(),
-    };
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
-    let depth = depth_response(&event.depth);
-    exile_depth_memory()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(name, depth.clone());
-    Ok(Json(DirectionResponse {
-        frame: DirectionFrameResponse {
-            qtm: qtm_frame(qtm),
-            event: EventMapResponse {
-                scale: "Local".to_string(),
-                runtime: serialize_runtime(SystemTime::now()),
-                depth,
-            },
-        },
-        selection: None,
-    }))
-}
+
 async fn exile_depth(
     Path(name): Path<String>,
 ) -> ApiResult<Json<DepthResponse>> {
-    ensure_existing_substrate(&name)?;
-    let memory = exile_depth_memory()
+    let lock = substrate_lock(&name);
+    let _guard = lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let depth = memory.get(&name).cloned().ok_or_else(|| {
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+    let record_path = latest_record_path(&substrate_path, "exile_")?;
+
+    let entries = std::fs::read_dir(&record_path).map_err(|e| {
         error(
-            StatusCode::NOT_FOUND,
-            format!("no in-memory exile depth record for substrate: {name}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to read exile record: {e}"),
         )
     })?;
-    Ok(Json(depth))
+
+    let mut payload_directories = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read exile network entry: {e}"),
+            )
+        })?;
+
+        let payload = entry.path().join("payload");
+
+        if payload.join("depth.path").is_file()
+            && payload.join("depth.objects").is_file()
+        {
+            payload_directories.push(payload);
+        }
+    }
+
+    payload_directories.sort();
+
+    let payload_path = payload_directories.into_iter().next().ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!("no persisted exile depth exists for substrate: {name}"),
+        )
+    })?;
+
+    Ok(Json(read_persisted_depth(&payload_path)?))
 }
+
 #[tokio::main]
 async fn main() {
     let cors = CorsLayer::new()
