@@ -142,7 +142,12 @@ struct DepthObjectResponse {
     mass: String,
     from: String,
 }
+static EXILE_DEPTH_MEMORY: OnceLock<Mutex<HashMap<String, DepthResponse>>> =
+    OnceLock::new();
 
+fn exile_depth_memory() -> &'static Mutex<HashMap<String, DepthResponse>> {
+    EXILE_DEPTH_MEMORY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 #[derive(Serialize)]
 struct RuntimeResponse {
     unix_seconds: u64,
@@ -322,6 +327,95 @@ fn valid_substrate_name(name: &str) -> bool {
         && name.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
         })
+}
+
+fn required_depth_response(depth: &Depth) -> Result<DepthResponse, String> {
+    let response = depth_response(depth);
+
+    if response.path.trim().is_empty() {
+        return Err("exile depth path is empty".to_string());
+    }
+
+    if response.objects.is_empty() {
+        return Err("exile requires at least one retained depth object".to_string());
+    }
+
+    for object in &response.objects {
+        if object.identifier.trim().is_empty() {
+            return Err(format!(
+                "exile depth object at position {} has no identifier",
+                object.position,
+            ));
+        }
+    }
+
+    Ok(response)
+}
+
+async fn exile_wallet(
+    Path(name): Path<String>,
+) -> ApiResult<Json<DirectionResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    ensure_existing_substrate(&name)?;
+
+    let event = commands::qtm_exile(&name);
+
+    let depth = required_depth_response(&event.depth)
+        .map_err(|message| {
+            error(StatusCode::CONFLICT, message)
+        })?;
+
+    let qtm_response = QtmResponse {
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
+
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
+
+    exile_depth_memory()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name, depth.clone());
+
+    Ok(Json(DirectionResponse {
+        frame: DirectionFrameResponse {
+            qtm: qtm_frame(qtm_response),
+            event: EventMapResponse {
+                scale: "Local".to_string(),
+                runtime: serialize_runtime(SystemTime::now()),
+                depth,
+            },
+        },
+        selection: None,
+    }))
+}
+
+async fn exile_depth(
+    Path(name): Path<String>,
+) -> ApiResult<Json<DepthResponse>> {
+    ensure_existing_substrate(&name)?;
+
+    let memory = exile_depth_memory()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let depth = memory.get(&name).cloned().ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!("no in-memory exile depth record for substrate: {name}"),
+        )
+    })?;
+
+    Ok(Json(depth))
 }
 
 fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
@@ -1096,6 +1190,12 @@ async fn main() {
             "/wallets/:name/receive",
             post(receive_wallet).options(preflight),
         )
+        
+        .route(
+       "/wallets/:name/exile/depth",
+       get(exile_depth).options(preflight),
+        )
+        
         .route(
             "/wallets/:name/exile",
             post(exile_wallet).options(preflight),
