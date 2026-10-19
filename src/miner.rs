@@ -10,9 +10,202 @@ let budget = BlockBudget {
     };
     
 pub struct BitcoinUTXOCollector {
-    broadcaster: Broadcaster,
-    bitcoin: BitcoinBroadcaster,
+broadcaster: Broadcaster,
+bitcoin: BitcoinBroadcaster,
+}
+
+impl BitcoinUTXOCollector {
+#[inline(always)]
+pub fn new(
+_substrate: &str,
+_activation: u64,
+) -> Result<Self, SettlementError> {
+let config =
+BitcoinObservationConfig::defaults(
+BitcoinNetwork::Mainnet,
+)
+.with_substrate_observations(true);
+
+    let mut frontend =
+        PeerFrontend::new(config)
+            .map_err(|error|
+                SettlementError::Backend(
+                    error.to_string(),
+                )
+            )?;
+    frontend
+        .start_p2p()
+        .map_err(|error|
+            SettlementError::Backend(
+                error.to_string(),
+            )
+        )?;
+    println!(
+        "trace=p2p_initialized \
+         peers={} \
+         sessions={}",
+        frontend.peers().len(),
+        frontend.sessions.len(),
+    );
+    let rpc =
+        BitcoinBroadcaster::from_env()
+            .map_err(|error|
+                SettlementError::Backend(
+                    error.to_string(),
+                )
+            )?;
+    Ok(Self {
+        broadcaster:
+            Broadcaster::init(),
+        bitcoin:
+            BitcoinBroadcaster::new(
+                rpc.rpc,
+                frontend,
+            ),
+    })
+}
+#[inline(always)]
+pub fn collect(
+    &mut self,
+    observed: &ObservedBitcoinTransaction,
+    event: QP44Event,
+) -> BitcoinPayload {
+    let tx = &observed.transaction;
+    let manifold = &event.heritage.state;
+    let coordinate = event.qtm.coordinate;
+    println!(
+        "trace=utxo_transaction \
+         txid={} \
+         inputs={} \
+         outputs={}",
+        observed.txid,
+        tx.input.len(),
+        tx.output.len(),
+    );
+    /*
+     * The observed transaction's historical inputs describe how the
+     * transaction entered observation.
+     *
+     * They remain authoritative on the observation boundary, but are
+     * deliberately not propagated into the QP44 execution payload.
+     */
+    for (index, input) in tx.input.iter().enumerate() {
+        println!(
+            "trace=topology_observed \
+             index={} \
+             previous_txid={} \
+             previous_vout={}",
+            index,
+            input.previous_output.txid,
+            input.previous_output.vout,
+        );
     }
+    /*
+     * Materialize the observed Bitcoin outputs into QP44 outputs.
+     *
+     * The observed output value is authoritative. The QP44 script
+     * representation is derived from the event coordinate.
+     */
+    let outputs = tx
+        .output
+        .iter()
+        .enumerate()
+        .map(|(vout, output)| {
+            let mut bitcoin = BitcoinOutput::new(
+                manifold,
+                vout as u32,
+                output.value.to_sat(),
+            );
+            bitcoin.script_pubkey =
+                crate::bit_block::derive_script_pubkey(
+                    &coordinate,
+                );
+            bitcoin
+        })
+        .collect::<Vec<_>>();
+    /*
+     * Every output produced by the observed transaction becomes one
+     * QP44 execution input.
+     *
+     * Canonical topology:
+     *
+     *     observed.txid:0
+     *     observed.txid:1
+     *     ...
+     *
+     * The historical transaction inputs above are deliberately not
+     * propagated into this execution representation.
+     */
+    let inputs = tx
+        .output
+        .iter()
+        .enumerate()
+        .map(|(vout, _output)| BitcoinInput {
+            previous_output: bitcoin::OutPoint {
+                txid: observed.txid,
+                vout: vout as u32,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        })
+        .collect::<Vec<_>>();
+    /*
+     * Validate the canonical QP44 execution topology before moving
+     * `inputs` into BitcoinPayload.
+     */
+    assert_eq!(
+        inputs.len(),
+        tx.output.len(),
+        "QP44 execution input count mismatch: \
+         observed_outputs={} payload_inputs={}",
+        tx.output.len(),
+        inputs.len(),
+    );
+    for (index, input) in inputs.iter().enumerate() {
+        let expected = bitcoin::OutPoint {
+            txid: observed.txid,
+            vout: index as u32,
+        };
+        assert_eq!(
+            input.previous_output,
+            expected,
+            "QP44 execution topology changed at vin={}: \
+             expected={}:{} payload={}:{}",
+            index,
+            expected.txid,
+            expected.vout,
+            input.previous_output.txid,
+            input.previous_output.vout,
+        );
+        println!(
+            "trace=topology_qp44_execution \
+             index={} \
+             previous_txid={} \
+             previous_vout={}",
+            index,
+            input.previous_output.txid,
+            input.previous_output.vout,
+        );
+    }
+    /*
+     * BitcoinPayload owns the canonical QP44 execution
+     * representation of this observation.
+     *
+     * Collection ends at this boundary.
+     *
+     * The caller still owns `observed` and therefore retains access
+     * to the complete Bitcoin observation for all downstream
+     * settlement semantics.
+     */
+    BitcoinPayload::new(
+        observed.txid,
+        inputs,
+        outputs,
+    )
+}
+
+}
     
 // -----------------------------------------------------------------------------
 // Bitcoin Observation Pipeline
