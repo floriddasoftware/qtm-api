@@ -146,7 +146,41 @@ struct PersistedEventSummary {
     structural_value: String,
     depth_objects: usize,
     retained_mass: String,
+
+    // Persisted transition window; never recomputed by the API.
+    delta: String,
+    tau: String,
+    gross_work: String,
+    net_work: String,
+    commitment: String,
+    coordinate: String,
 }
+
+#[derive(Serialize)]
+struct PersistedPayloadNetwork {
+    id: String,
+    name: String,
+    registered: bool,
+}
+
+#[derive(Serialize)]
+struct PersistedPayloadEntry {
+    record: String,
+    direction: String,
+    network: PersistedPayloadNetwork,
+    path: String,
+    depth_identifier: String,
+    objects: Vec<DepthObjectResponse>,
+}
+
+#[derive(Serialize)]
+struct PersistedPayloadsResponse {
+    substrate: String,
+    record: String,
+    directory: String,
+    payloads: Vec<PersistedPayloadEntry>,
+}
+
 #[derive(Serialize)]
 struct SubstrateListResponse {
     substrates: Vec<SubstrateEntry>,
@@ -634,6 +668,61 @@ fn latest_record_path(
         })
 }
 
+fn parse_record_identity(record: &str) -> Option<(u64, u128)> {
+    let rest = record
+        .strip_prefix("event_")
+        .or_else(|| record.strip_prefix("exile_"))?;
+
+    let (activation, dimension) = rest.split_once('_')?;
+
+    Some((
+        activation.parse().ok()?,
+        dimension.parse().ok()?,
+    ))
+}
+
+fn canonical_record_path(
+    substrate_path: &FsPath,
+    kind: &str,
+    activation: u64,
+    dimension: u128,
+) -> ApiResult<PathBuf> {
+    let prefix = match kind {
+        "transit" => "event",
+        "exile" => "exile",
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "record kind must be transit or exile",
+            ));
+        }
+    };
+
+    let path = substrate_path
+        .join("events")
+        .join(format!("{prefix}_{activation}_{dimension}"));
+
+    if !path.is_dir() {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "canonical {kind} record does not exist: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(path)
+}
+
+fn valid_record_name(record: &str) -> bool {
+    (record.starts_with("event_") || record.starts_with("exile_"))
+        && record
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        && parse_record_identity(record).is_some()
+}
+
 fn read_persisted_depth(
     payload_path: &FsPath,
 ) -> ApiResult<DepthResponse> {
@@ -975,31 +1064,149 @@ async fn head_wallets() -> ApiResult<StatusCode> {
     list_substrates()?;
     Ok(StatusCode::OK)
 }
+
+async fn list_event_payloads(
+    Path((name, record)): Path<(String, String)>,
+) -> ApiResult<Json<PersistedPayloadsResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+
+    if !valid_record_name(&record) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid event record identifier",
+        ));
+    }
+
+    let record_path = substrate_path
+        .join("events")
+        .join(&record);
+
+    if !record_path.is_dir() {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!("event record does not exist: {record}"),
+        ));
+    }
+
+    let direction = if record.starts_with("event_") {
+        "transit_inputs"
+    } else {
+        "exile_outputs"
+    };
+
+    let entries = std::fs::read_dir(&record_path).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to read event record: {e}"),
+        )
+    })?;
+
+    let mut payloads = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read event payload entry: {e}"),
+            )
+        })?;
+
+        let network_path = entry.path();
+
+        if !network_path.is_dir() {
+            continue;
+        }
+
+        let network_id = entry.file_name().to_string_lossy().to_string();
+
+        // A network payload is recognized only when both persisted
+        // depth files exist beneath its payload directory.
+        let payload_path = network_path.join("payload");
+
+        if !payload_path.join("depth.path").is_file()
+            || !payload_path.join("depth.objects").is_file()
+        {
+            continue;
+        }
+
+        let depth = read_persisted_depth(&payload_path)?;
+
+        let registered = selected_network(&network_id).is_some();
+
+        let network_name = selected_network(&network_id)
+            .map(|network| network.name)
+            .unwrap_or_else(|| network_id.clone());
+
+        payloads.push(PersistedPayloadEntry {
+            record: record.clone(),
+            direction: direction.to_string(),
+            network: PersistedPayloadNetwork {
+                id: network_id,
+                name: network_name,
+                registered,
+            },
+            path: payload_path.display().to_string(),
+            depth_identifier: depth.path,
+            objects: depth.objects,
+        });
+    }
+
+    payloads.sort_by(|a, b| {
+        a.network
+            .id
+            .cmp(&b.network.id)
+    });
+
+    Ok(Json(PersistedPayloadsResponse {
+        substrate: name,
+        record,
+        directory: record_path.display().to_string(),
+        payloads,
+    }))
+}
+
+
 async fn list_events(
     Path(name): Path<String>,
 ) -> ApiResult<Json<EventStoreResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let substrate_path = ensure_existing_substrate(&name)?;
     let events_path = substrate_path.join("events");
     let mut events = Vec::new();
+
     if events_path.is_dir() {
-        let entries = std::fs::read_dir(&events_path).map_err(|io_error| {
+        let entries = std::fs::read_dir(&events_path).map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to list events: {io_error}"),
+                format!("unable to list events: {e}"),
             )
         })?;
+
         for entry in entries {
-            let entry = entry.map_err(|io_error| {
+            let entry = entry.map_err(|e| {
                 error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read event entry: {io_error}"),
+                    format!("unable to read event entry: {e}"),
                 )
             })?;
+
             let record_path = entry.path();
+
             if !record_path.is_dir() {
                 continue;
             }
+
             let record = entry.file_name().to_string_lossy().to_string();
+
             let kind = if record.starts_with("exile_") {
                 "exile"
             } else if record.starts_with("event_") {
@@ -1007,20 +1214,46 @@ async fn list_events(
             } else {
                 continue;
             };
-            let activation = read_trim(&record_path.join("manifold.activations"))
-                .unwrap_or_else(|| "unknown".to_string());
-            let dimension = read_trim(&record_path.join("manifold.dimension"))
-                .unwrap_or_else(|| "unknown".to_string());
-            let structural_value =
-                read_trim(&record_path.join("manifold.structural_value"))
-                    .unwrap_or_else(|| "unknown".to_string());
-            let retained_mass = read_trim(&record_path.join("manifold.retained_mass"))
-                .unwrap_or_else(|| "unknown".to_string());
-            let depth_objects = read_trim(&record_path.join("depth.objects"))
-                .map(|contents| {
-                    contents.lines().filter(|line| !line.trim().is_empty()).count()
-                })
-                .unwrap_or(0);
+
+            let activation = read_trim(
+                &record_path.join("manifold.activations"),
+            )
+            .or_else(|| {
+                parse_record_identity(&record)
+                    .map(|(activation, _)| activation.to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+            let dimension = read_trim(
+                &record_path.join("manifold.dimension"),
+            )
+            .or_else(|| {
+                parse_record_identity(&record)
+                    .map(|(_, dimension)| dimension.to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+            let structural_value = read_trim(
+                &record_path.join("manifold.structural_value"),
+            )
+            .unwrap_or_else(|| "unknown".to_string());
+
+            let retained_mass = read_trim(
+                &record_path.join("manifold.retained_mass"),
+            )
+            .unwrap_or_else(|| "unknown".to_string());
+
+            let depth_objects = read_trim(
+                &record_path.join("depth.objects"),
+            )
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count()
+            })
+            .unwrap_or(0);
+
             events.push(PersistedEventSummary {
                 kind: kind.to_string(),
                 record,
@@ -1029,10 +1262,47 @@ async fn list_events(
                 structural_value,
                 depth_objects,
                 retained_mass,
+
+                // Read stored transition values. Missing values remain
+                // explicitly unknown rather than being reconstructed.
+                delta: read_trim(&record_path.join("transition.delta"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+
+                tau: read_trim(&record_path.join("transition.tau"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+
+                gross_work: read_trim(
+                    &record_path.join("transition.gross_work"),
+                )
+                .unwrap_or_else(|| "unknown".to_string()),
+
+                net_work: read_trim(
+                    &record_path.join("transition.net_work"),
+                )
+                .unwrap_or_else(|| "unknown".to_string()),
+
+                commitment: read_trim(
+                    &record_path.join("qtm.commitment"),
+                )
+                .unwrap_or_else(|| "unknown".to_string()),
+
+                coordinate: read_trim(
+                    &record_path.join("qtm.coordinate"),
+                )
+                .unwrap_or_else(|| "unknown".to_string()),
             });
         }
     }
-    events.sort_by_key(|event| event.activation.parse::<u64>().unwrap_or(0));
+
+    events.sort_by(|a, b| {
+        let a_activation = a.activation.parse::<u64>().unwrap_or(0);
+        let b_activation = b.activation.parse::<u64>().unwrap_or(0);
+
+        a_activation
+            .cmp(&b_activation)
+            .then_with(|| a.record.cmp(&b.record))
+    });
+
     Ok(Json(EventStoreResponse {
         substrate: name,
         directory: substrate_path.display().to_string(),
@@ -1041,6 +1311,7 @@ async fn list_events(
         runtime: serialize_runtime(SystemTime::now()),
     }))
 }
+
 async fn create_wallet(
     Json(body): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<SubstrateResponse>)> {
@@ -1231,13 +1502,25 @@ async fn transit_wallet(
     )
     .memorize();
 
-    // Execute the transition once. The returned event contains the
-    // canonical depth; persist it without reconstructing or recomputing it.
+    // Execute the transition exactly once.
     let event = commands::qtm_transit(&name, payload, body.activation);
 
-    // Persist input depth under this event record and selected network.
-    let record_path = latest_record_path(&substrate_path, "event_")?;
-    write_depth_payload(&record_path, &network_id, &event.depth)?;
+    let activation = event.heritage.state.activations();
+    let dimension = event.heritage.state.dimension();
+
+    let record_path = canonical_record_path(
+        &substrate_path,
+        "transit",
+        activation,
+        dimension,
+    )?;
+
+    // Persist the actual input depth under this event and network.
+    write_depth_payload(
+        &record_path,
+        &network_id,
+        &event.depth,
+    )?;
 
     let qtm = QtmResponse {
         commitment: hex::encode(event.qtm.commitment),
@@ -1246,7 +1529,10 @@ async fn transit_wallet(
         network: event.qtm.net_work.to_string(),
     };
 
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
 
     Ok(Json(direction_response(
         direction,
@@ -1314,6 +1600,15 @@ async fn exile_depth(
     let substrate_path = ensure_existing_substrate(&name)?;
     let record_path = latest_record_path(&substrate_path, "exile_")?;
 
+    // The canonical exile depth is stored at the record root.
+    if record_path.join("depth.path").is_file()
+        && record_path.join("depth.objects").is_file()
+    {
+        return Ok(Json(read_persisted_depth(&record_path)?));
+    }
+
+    // Compatibility fallback for older records that stored depth only
+    // under a network-specific payload.
     let entries = std::fs::read_dir(&record_path).map_err(|e| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1350,6 +1645,122 @@ async fn exile_depth(
     })?;
 
     Ok(Json(read_persisted_depth(&payload_path)?))
+}
+
+async fn exile_wallet(
+    Path(name): Path<String>,
+) -> ApiResult<Json<DirectionResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+
+    // qtm_exile removes the consumed transit record. Capture its network
+    // identifiers first, so output persistence does not depend on a
+    // directory that will no longer exist.
+    let activation = read_trim(
+        &substrate_path.join("manifold.activations"),
+    )
+    .ok_or_else(|| {
+        error(
+            StatusCode::CONFLICT,
+            "substrate activation is unavailable",
+        )
+    })?
+    .parse::<u64>()
+    .map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "substrate activation is invalid",
+        )
+    })?;
+
+    let transit_path = commands::event_path_at_activation(
+        &name,
+        activation,
+    )
+    .ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!("no transit event exists at activation {activation}"),
+        )
+    })?;
+
+    let mut network_ids = Vec::new();
+
+    let entries = std::fs::read_dir(&transit_path).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to inspect transit payloads: {e}"),
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect transit network: {e}"),
+            )
+        })?;
+
+        let payload = entry.path().join("payload");
+
+        if payload.join("depth.path").is_file()
+            && payload.join("depth.objects").is_file()
+        {
+            network_ids.push(
+                entry.file_name().to_string_lossy().to_string(),
+            );
+        }
+    }
+
+    network_ids.sort();
+    network_ids.dedup();
+
+    // This performs the canonical balance/exile transition, persists
+    // the resulting heritage, and consumes the transit event.
+    let event = commands::qtm_exile(&name);
+
+    let resulting_activation = event.heritage.state.activations();
+    let dimension = event.heritage.state.dimension();
+
+    let record_path = canonical_record_path(
+        &substrate_path,
+        "exile",
+        resulting_activation,
+        dimension,
+    )?;
+
+    // The event root is the canonical output. Network payloads are
+    // persisted only for networks that actually existed in the input.
+    for network_id in &network_ids {
+        write_depth_payload(
+            &record_path,
+            network_id,
+            &event.depth,
+        )?;
+    }
+
+    let qtm = QtmResponse {
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
+
+    let direction = Direction::from_heritage(
+        event.heritage,
+        Scale::Local,
+    );
+
+    Ok(Json(direction_response(
+        direction,
+        None,
+        qtm,
+        &event.depth,
+    )))
 }
 
 #[tokio::main]
@@ -1391,6 +1802,9 @@ async fn main() {
             "/wallets/:name/activations/:activation/budgets/:network",
             put(update_activation_network_budget).options(preflight),
         )
+        .route(
+    "/wallets/:name/events/:record/payloads",
+    get(list_event_payloads).options(preflight),)
         .route("/wallets/:name/transit", post(transit_wallet).options(preflight))
         .route("/wallets/:name/receive", post(receive_wallet).options(preflight))
         .route("/wallets/:name/exile/depth", get(exile_depth).options(preflight))
