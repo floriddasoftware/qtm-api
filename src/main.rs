@@ -27,10 +27,11 @@ use tower_http::cors::CorsLayer;
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
 const MAX_SUBSTRATE_NAME_LENGTH: usize = 64;
-const SUBSTRATE_FILES: [&str; 7] = [
+const SUBSTRATE_FILES: [&str; 8] = [
     "perm.indices",
     "perm.entropy",
     "perm.dimension",
+    "activation",
     "qtm.commitment",
     "qtm.coordinate",
     "qtm.sigma",
@@ -326,6 +327,22 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Ap
     )
 }
 
+// qp_hd reports failures by panicking (expect/panic!). Convert that into a
+// JSON 500 so the client sees the cause instead of a dropped connection.
+fn guarded<T>(label: &str, operation: impl FnOnce() -> T) -> ApiResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown failure".to_string());
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{label} failed in qp_hd: {detail}"),
+        )
+    })
+}
+
 fn read_trim(path: &FsPath) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -479,7 +496,7 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
         substrates.push(SubstrateEntry {
             name,
             dimension: required_file(&path.join("perm.dimension"))?,
-            activations: read_trim(&path.join("manifold.activations"))
+            activations: read_trim(&path.join("activation"))
                 .unwrap_or_else(|| "0".to_string()),
         });
     }
@@ -1427,7 +1444,9 @@ async fn create_wallet(
     }
 
     // Installation is delegated to the canonical qp_hd runtime.
-    commands::qtm_create(name.to_string(), Some(indices), Some(entropy));
+    guarded("substrate creation", || {
+        commands::qtm_create(name.to_string(), Some(indices), Some(entropy))
+    })?;
 
     // qtm_create returns (), so confirm the runtime actually persisted a valid
     // substrate before returning HTTP 201 to the client.
@@ -1440,7 +1459,7 @@ async fn open_wallet(Path(name): Path<String>) -> ApiResult<Json<SubstrateRespon
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_existing_substrate(&name)?;
-    commands::qtm_open(name.clone());
+    guarded("open", || commands::qtm_open(name.clone()))?;
     Ok(Json(substrate_json(&name)?))
 }
 
@@ -1515,7 +1534,9 @@ async fn transit_wallet(
     .memorize();
 
     // Execute the transition exactly once.
-    let event = commands::qtm_transit(&name, payload, body.activation);
+    let event = guarded("transit", || {
+        commands::qtm_transit(&name, payload, body.activation)
+    })?;
     let activation = event.heritage.state.activations();
     let dimension = event.heritage.state.dimension();
 
@@ -1568,7 +1589,7 @@ async fn receive_wallet(
         }
     };
 
-    let transaction = QuantumTransaction::send(&name, body.amount);
+    let transaction = guarded("receive", || QuantumTransaction::send(&name, body.amount))?;
     let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
         qtm: qtm_frame(QtmResponse {
@@ -1583,7 +1604,7 @@ async fn receive_wallet(
         },
     };
 
-    let event = transaction.receive(&name, flow);
+    let event = guarded("receive", || transaction.receive(&name, flow))?;
     let direction = Direction::from_heritage(event.heritage, Scale::Local);
     let event_response = event_map_response(direction, &event.depth);
 
@@ -1648,20 +1669,9 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     let substrate_path = ensure_existing_substrate(&name)?;
 
     // Capture network identifiers before qtm_exile consumes the transit record.
-    let activation = read_trim(&substrate_path.join("manifold.activations"))
-        .ok_or_else(|| {
-            error(
-                StatusCode::CONFLICT,
-                "substrate activation is unavailable",
-            )
-        })?
-        .parse::<u64>()
-        .map_err(|_| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "substrate activation is invalid",
-            )
-        })?;
+    // qtm_exile locates the transit record through qp_hd's own activation
+    // accessor, so use the same source here.
+    let activation = guarded("activation lookup", || commands::load_activation(&name))?;
 
     let transit_path = commands::event_path_at_activation(&name, activation).ok_or_else(|| {
         error(
@@ -1696,7 +1706,7 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     network_ids.dedup();
 
     // Canonical balance/exile transition: persist resulting heritage and consume transit.
-    let event = commands::qtm_exile(&name);
+    let event = guarded("exile", || commands::qtm_exile(&name))?;
     let resulting_activation = event.heritage.state.activations();
     let dimension = event.heritage.state.dimension();
 
@@ -1729,8 +1739,33 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     )))
 }
 
-#[tokio::main]
-async fn main() {
+// qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
+// from USERPROFILE before any thread starts.
+fn resolve_home() {
+    if std::env::var_os("HOME").is_some() {
+        return;
+    }
+    match std::env::var_os("USERPROFILE") {
+        // Single-threaded here; `unsafe` is required on edition 2024 only.
+        #[allow(unused_unsafe)]
+        Some(profile) => unsafe { std::env::set_var("HOME", profile) },
+        None => {
+            eprintln!("neither HOME nor USERPROFILE is set; qp_hd cannot resolve ~/.qp/substrates");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn main() {
+    resolve_home();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(serve());
+}
+
+async fn serve() {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([
@@ -1782,11 +1817,6 @@ async fn main() {
     // Miner-style startup discovery: use the canonical substrate root and
     // inspect existing directories directly. The API remains request-driven;
     // no parallel polling loop or secondary registry is introduced.
-    if std::env::var_os("HOME").is_none() && std::env::var_os("USERPROFILE").is_none() {
-        eprintln!("HOME/USERPROFILE is not set; qp_hd cannot resolve ~/.qp/substrates");
-        std::process::exit(1);
-    }
-
     let root = commands::substrate_root();
     println!("substrate_root={}", root.display());
 
