@@ -1540,9 +1540,12 @@ async fn transit_wallet(
     let activation = event.heritage.state.activations();
     let dimension = event.heritage.state.dimension();
 
-    let record_path =
-        canonical_record_path(&substrate_path, "transit", activation, dimension)?;
-
+    let record_path = canonical_record_path(
+    &substrate_path,
+    "transit",
+    activation,
+    u128::from(dimension),
+    )?;
     // Persist the actual input depth under this event and network.
     write_depth_payload(&record_path, &network_id, &event.depth)?;
 
@@ -1711,10 +1714,10 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     let dimension = event.heritage.state.dimension();
 
     let record_path = canonical_record_path(
-        &substrate_path,
-        "exile",
-        resulting_activation,
-        dimension,
+    &substrate_path,
+    "exile",
+    resulting_activation,
+    u128::from(dimension),
     )?;
 
     // Event root is canonical output; network payloads are persisted only for input networks.
