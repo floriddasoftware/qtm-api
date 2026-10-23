@@ -1,7 +1,7 @@
 use axum::{
     extract::Path,
     http::{Method, StatusCode},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use qp_hd::{
@@ -302,13 +302,6 @@ struct ActivationBudgetsResponse {
     budgets: Vec<NetworkBudgetEntry>,
 }
 
-
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::Path as FsPath,
-    sync::{Mutex, OnceLock},
-};
 
 #[derive(Deserialize, Default)]
 struct ObservationStartRequest {
@@ -1966,9 +1959,12 @@ async fn start_bitcoin_observation(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let clips = guarded("bitcoin observation pipeline", || {
-        init_bitcoin_observation_clips(activation, &name)
-    })?;
+    let clips = match init_bitcoin_observation_clips(activation, &name) {
+        Ok(clips) => clips,
+        Err(message) => {
+            return Err(error(StatusCode::INTERNAL_SERVER_ERROR, message));
+        }
+    };
 
     let status = ObservationPipelineStatus {
         substrate: name.clone(),
@@ -2117,6 +2113,350 @@ async fn stop_bitcoin_observation(
     Ok(Json(live.status))
 }
 
+
+/*
+ * Payload board — exclusive API entry into shared payload state (payload.rs).
+ *
+ * Model (from payload.rs + bit_miner::sharedtypes):
+ *   PayloadKind::{Bitcoin, Ethereum, Solana, Tron}
+ *   AuthorizedPayload { request: SettlementRequest, authorization_state, settlement_state }
+ *   SettlementRequest { packet, authorization: Authorization { commitment, activation, locked } }
+ *   AuthorizationState::{Unauthorized, Authorized, Spent, Invalidated}
+ *   SettlementState::{Pending, Success, Failed}
+ *
+ * Contract:
+ *   Observation click → GET .../networks/:network/payload-board (after observation active).
+ *   Network-scoped board marks matching kind in scope; activation-wide returns all four kinds.
+ *
+ * OBSERVATION_REGISTRY is an in-memory control-plane status map only. It is not proof that
+ * an Electrum listener is bound or that a SettlementRequest is carried. Without the
+ * bit-minner feature, clips are fallback placeholders. The board reports these conditions
+ * explicitly and does not synthesize AuthorizedPayload.
+ *
+ * Routes:
+ *   GET /wallets/:name/activations/:activation/payload-board
+ *   GET /wallets/:name/activations/:activation/networks/:network/payload-board
+ */
+
+#[derive(Serialize, Clone)]
+struct AuthorizationView {
+    /// Hex commitment when a real Authorization is available.
+    commitment: Option<String>,
+    activation: Option<u64>,
+    /// Opaque locked structure is not expanded here.
+    locked_present: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct SettlementRequestView {
+    /// Present only when the runtime has supplied a SettlementRequest.
+    carried: bool,
+    authorization: Option<AuthorizationView>,
+    /// WirePacket is opaque binary; only report presence.
+    packet_present: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct AuthorizedPayloadView {
+    /// Present only when runtime-carried; never a synthesized placeholder.
+    carried: bool,
+    request: Option<SettlementRequestView>,
+    /// Unauthorized | Authorized | Spent | Invalidated when known.
+    authorization_state: Option<String>,
+    /// Pending | Success | Failed when known.
+    settlement_state: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct PayloadKindEntry {
+    /// bitcoin | ethereum | solana | tron  (PayloadKind discriminant)
+    kind: String,
+    network: Option<NetworkOption>,
+    /// Kind is in scope for this board request (network filter / activation-wide).
+    in_scope: bool,
+    /// Registered network exists for this kind.
+    available: bool,
+    /// Runtime-carried AuthorizedPayload only; None if not populated by the pipeline.
+    authorized_payload: Option<AuthorizedPayloadView>,
+    /// Depth from persisted event records matching this activation + network.
+    depth_objects: Vec<DepthObjectResponse>,
+    depth_path: Option<String>,
+    depth_record: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ObservationControlPlane {
+    /// True if OBSERVATION_REGISTRY has a running entry for this context.
+    registry_running: bool,
+    /// Commitment-derived candidate port (not proof a socket is listening).
+    listen_port_candidate: Option<u16>,
+    path_hint: Option<String>,
+    /// Whether this binary was built with the bit-minner feature.
+    bit_minner_feature: bool,
+    /// True only when a live Electrum-compatible listener is known bound (not yet).
+    electrum_listener_bound: bool,
+    /// True only when a SettlementRequest was supplied by the runtime for this context.
+    settlement_payload_carried: bool,
+}
+
+#[derive(Serialize)]
+struct PayloadBoardResponse {
+    substrate: String,
+    activation: u64,
+    network: Option<String>,
+    observation: ObservationControlPlane,
+    commitment: Option<String>,
+    /// One entry per PayloadKind — simultaneous view; API remains authoritative.
+    kinds: Vec<PayloadKindEntry>,
+    runtime: RuntimeResponse,
+    message: String,
+}
+
+fn payload_kind_id_for_network(network_id: &str) -> Option<&'static str> {
+    let lower = network_id.trim().to_ascii_lowercase();
+    if lower.contains("bitcoin") || lower == "btc" {
+        Some("bitcoin")
+    } else if lower.contains("ethereum") || lower == "eth" {
+        Some("ethereum")
+    } else if lower.contains("solana") || lower == "sol" {
+        Some("solana")
+    } else if lower.contains("tron") || lower == "trx" {
+        Some("tron")
+    } else {
+        None
+    }
+}
+
+fn record_matches_activation(record_name: &str, activation: u64) -> bool {
+    // event_{activation}_{dimension} or exile_{activation}_{dimension}
+    let rest = record_name
+        .strip_prefix("event_")
+        .or_else(|| record_name.strip_prefix("exile_"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let Some((act_str, _)) = rest.split_once('_') else {
+        return false;
+    };
+    act_str.parse::<u64>().ok() == Some(activation)
+}
+
+/// Collect persisted depth only from event/exile records for this activation + network.
+fn collect_depth_for_activation_network(
+    substrate_path: &FsPath,
+    activation: u64,
+    network_id: &str,
+) -> (Option<String>, Option<String>, Vec<DepthObjectResponse>) {
+    let events_path = substrate_path.join("events");
+    if !events_path.is_dir() {
+        return (None, None, Vec::new());
+    }
+
+    let Ok(entries) = std::fs::read_dir(&events_path) else {
+        return (None, None, Vec::new());
+    };
+
+    let mut best: Option<(SystemTime, String, PathBuf)> = None;
+
+    for entry in entries.flatten() {
+        let record_path = entry.path();
+        if !record_path.is_dir() {
+            continue;
+        }
+        let record_name = entry.file_name().to_string_lossy().to_string();
+        if !record_matches_activation(&record_name, activation) {
+            continue;
+        }
+
+        let payload = record_path.join(network_id).join("payload");
+        if !(payload.join("depth.path").is_file() && payload.join("depth.objects").is_file()) {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+
+        match &best {
+            Some((t, _, _)) if *t >= modified => {}
+            _ => best = Some((modified, record_name, payload)),
+        }
+    }
+
+    let Some((_, record_name, payload_path)) = best else {
+        return (None, None, Vec::new());
+    };
+
+    match read_persisted_depth(&payload_path) {
+        Ok(depth) => (Some(record_name), Some(depth.path), depth.objects),
+        Err(_) => (Some(record_name), None, Vec::new()),
+    }
+}
+
+fn bit_minner_enabled() -> bool {
+    cfg!(feature = "bit-minner")
+}
+
+fn build_payload_board(
+    name: &str,
+    activation: u64,
+    network_filter: Option<&str>,
+) -> ApiResult<PayloadBoardResponse> {
+    let substrate_path = ensure_existing_substrate(name)?;
+    let commitment = read_trim(&substrate_path.join("qtm.commitment"));
+
+    // Control-plane observation status only — not settlement proof.
+    let (registry_running, listen_port_candidate, path_hint) = {
+        let registry = observation_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(net) = network_filter {
+            let key = observation_key(name, activation, net);
+            match registry.get(&key).filter(|l| l.status.running) {
+                Some(live) => (
+                    true,
+                    Some(live.status.listen_port),
+                    live.status.path.clone(),
+                ),
+                None => (false, None, None),
+            }
+        } else {
+            match registry.iter().find(|(k, live)| {
+                k.0 == name && k.1 == activation && live.status.running
+            }) {
+                Some((_, live)) => (
+                    true,
+                    Some(live.status.listen_port),
+                    live.status.path.clone(),
+                ),
+                None => (false, None, None),
+            }
+        }
+    };
+
+    // AuthorizedPayload is not synthesized. Until the observation pipeline
+    // (bit_minner) exposes a real SettlementRequest for this context, carried=false.
+    let settlement_payload_carried = false;
+    let electrum_listener_bound = false;
+
+    let registered = registered_networks().networks;
+    let kind_order = ["bitcoin", "ethereum", "solana", "tron"];
+
+    let mut kinds = Vec::new();
+
+    for kind in kind_order {
+        let matching: Vec<&NetworkOption> = registered
+            .iter()
+            .filter(|n| payload_kind_id_for_network(&n.id) == Some(kind))
+            .collect();
+
+        let in_scope = match network_filter {
+            Some(net) => payload_kind_id_for_network(net) == Some(kind),
+            None => true,
+        };
+
+        let primary = matching.first().copied();
+        let network_id_for_depth = match network_filter {
+            Some(net) if in_scope => Some(net.to_string()),
+            _ => primary.map(|n| n.id.clone()).filter(|_| in_scope),
+        };
+
+        let (depth_record, depth_path, depth_objects) = match &network_id_for_depth {
+            Some(id) => {
+                collect_depth_for_activation_network(&substrate_path, activation, id)
+            }
+            None => (None, None, Vec::new()),
+        };
+
+        // Do not invent AuthorizedPayload. Report structure only when carried.
+        let authorized_payload = if in_scope {
+            Some(AuthorizedPayloadView {
+                carried: settlement_payload_carried,
+                request: None,
+                authorization_state: None,
+                settlement_state: None,
+            })
+        } else {
+            None
+        };
+
+        kinds.push(PayloadKindEntry {
+            kind: kind.to_string(),
+            network: primary.cloned(),
+            in_scope,
+            available: primary.is_some(),
+            authorized_payload,
+            depth_objects,
+            depth_path,
+            depth_record,
+        });
+    }
+
+    let observation = ObservationControlPlane {
+        registry_running,
+        listen_port_candidate,
+        path_hint,
+        bit_minner_feature: bit_minner_enabled(),
+        electrum_listener_bound,
+        settlement_payload_carried,
+    };
+
+    let message = if registry_running && !settlement_payload_carried {
+        format!(
+            "payload board open; observation registry active for substrate={name} activation={activation}, but no SettlementRequest is carried yet"
+        )
+    } else if registry_running {
+        format!(
+            "payload board open via observation substrate={name} activation={activation}"
+        )
+    } else {
+        format!(
+            "payload board for substrate={name} activation={activation} (observation registry not running)"
+        )
+    };
+
+    Ok(PayloadBoardResponse {
+        substrate: name.to_string(),
+        activation,
+        network: network_filter.map(str::to_string),
+        observation,
+        commitment,
+        kinds,
+        runtime: serialize_runtime(SystemTime::now()),
+        message,
+    })
+}
+
+async fn get_payload_board(
+    Path((name, activation)): Path<(String, u64)>,
+) -> ApiResult<Json<PayloadBoardResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(Json(build_payload_board(&name, activation, None)?))
+}
+
+async fn get_payload_board_for_network(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<PayloadBoardResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if !valid_observation_network_id(&network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for payload board",
+        ));
+    }
+
+    Ok(Json(build_payload_board(
+        &name,
+        activation,
+        Some(network.as_str()),
+    )?))
+}
+
 // qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
 // from USERPROFILE before any thread starts.
 fn resolve_home() {
@@ -2214,6 +2554,16 @@ async fn serve() {
         .route(
             "/wallets/:name/activations/:activation/observations",
             get(list_bitcoin_observations).options(preflight),
+        )
+        // Payload board — exclusive entry into shared payload state (payload.rs).
+        // Opened from Observation; not a second persistence layer.
+        .route(
+            "/wallets/:name/activations/:activation/payload-board",
+            get(get_payload_board).options(preflight),
+        )
+        .route(
+            "/wallets/:name/activations/:activation/networks/:network/payload-board",
+            get(get_payload_board_for_network).options(preflight),
         )
         .layer(cors);
 
