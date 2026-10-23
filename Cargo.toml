@@ -14,4 +14,12 @@ qp-hd = { git = "https://github.com/floriddasoftware/QTM" }
 qtm-graph = { git = "https://github.com/floriddasoftware/Quantum-Economies" }
 hex = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
-bit_minner = { git = "https://github.com/floriddasoftware/bit-miner", optional = true }
+bit_minner = {
+    package = "bit-minner",
+    git = "https://github.com/floriddasoftware/bit-miner",
+    optional = true
+}
+
+[features]
+default = ["bit-minner"]
+bit-minner = ["dep:bit_minner"]
