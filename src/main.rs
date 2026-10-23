@@ -302,6 +302,187 @@ struct ActivationBudgetsResponse {
     budgets: Vec<NetworkBudgetEntry>,
 }
 
+
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    path::Path as FsPath,
+    sync::{Mutex, OnceLock},
+};
+
+#[derive(Deserialize, Default)]
+struct ObservationStartRequest {
+    #[serde(default)]
+    listen_port: Option<u16>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ObservationClipStatus {
+    substrate: String,
+    active: bool,
+    direction: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ObservationPipelineStatus {
+    substrate: String,
+    activation: u64,
+    network: String,
+    commitment: String,
+    listen_port: u16,
+    running: bool,
+    path: Option<String>,
+    clips: Vec<ObservationClipStatus>,
+    runtime: RuntimeResponse,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ObservationListResponse {
+    substrate: String,
+    activation: u64,
+    pipelines: Vec<ObservationPipelineStatus>,
+}
+
+struct LiveObservation {
+    status: ObservationPipelineStatus,
+}
+
+type ObservationKey = (String, u64, String);
+
+static OBSERVATION_REGISTRY: OnceLock<Mutex<HashMap<ObservationKey, LiveObservation>>> =
+    OnceLock::new();
+
+fn observation_registry() -> &'static Mutex<HashMap<ObservationKey, LiveObservation>> {
+    OBSERVATION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn observation_key(
+    substrate: &str,
+    activation: u64,
+    network: &str,
+) -> ObservationKey {
+    (
+        substrate.to_string(),
+        activation,
+        network.to_string(),
+    )
+}
+
+fn read_substrate_commitment(substrate_path: &FsPath) -> ApiResult<String> {
+    required_file(&substrate_path.join("qtm.commitment"))
+}
+
+fn listen_port_from_commitment(
+    commitment: &str,
+    preferred: Option<u16>,
+) -> Result<u16, String> {
+    if let Some(port) = preferred {
+        if (1024..=65535).contains(&port) {
+            return Ok(port);
+        }
+
+        return Err(format!(
+            "invalid observation listen port {port}; expected 1024..=65535"
+        ));
+    }
+
+    let commitment = commitment.trim();
+
+    if commitment.is_empty() {
+        return Err("qtm.commitment is empty".to_string());
+    }
+
+    let mut acc: u32 = 0;
+
+    for byte in commitment.bytes() {
+        acc = acc.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+
+    Ok(20_000 + (acc % 20_000) as u16)
+}
+
+fn is_bitcoin_network_id(network: &str) -> bool {
+    let lower = network.trim().to_ascii_lowercase();
+
+    matches!(
+        lower.as_str(),
+        "bitcoin-legacy"
+            | "bitcoin-native-segwit"
+            | "bitcoin"
+            | "btc"
+    ) || lower.contains("bitcoin")
+}
+
+fn valid_observation_network_id(network: &str) -> bool {
+    !network.is_empty()
+        && network.len() <= 64
+        && network != "."
+        && network != ".."
+        && network.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+        })
+}
+
+fn init_bitcoin_observation_clips(
+    activation: u64,
+    substrate: &str,
+) -> Result<Vec<ObservationClipStatus>, String> {
+    if substrate.trim().is_empty() {
+        return Err("substrate must not be empty".to_string());
+    }
+
+    #[cfg(feature = "bit-minner")]
+    {
+        let pipeline =
+            bit_minner::BitcoinObservationPipeline::new(activation, substrate)
+                .map_err(|error| {
+                    format!(
+                        "failed to initialize Bitcoin observation pipeline \
+                         for substrate '{substrate}' at activation {activation}: \
+                         {error}"
+                    )
+                })?;
+
+        let clips = pipeline.miner().clips.iter().map(|clip| {
+            let window =
+                bit_minner::RenderState::window(clip.substrate.clone());
+
+            ObservationClipStatus {
+                substrate: window.substrate,
+                active: window.active,
+                direction: None,
+            }
+        });
+
+        let mut windows: Vec<ObservationClipStatus> = clips.collect();
+
+        if windows.is_empty() {
+            windows.push(ObservationClipStatus {
+                substrate: substrate.to_string(),
+                active: true,
+                direction: None,
+            });
+        }
+
+        Ok(windows)
+    }
+
+    #[cfg(not(feature = "bit-minner"))]
+    {
+        let _ = activation;
+
+        Ok(vec![ObservationClipStatus {
+            substrate: substrate.to_string(),
+            active: true,
+            direction: None,
+        }])
+    }
+}
+
+
 static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     OnceLock::new();
 
@@ -1742,6 +1923,200 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     )))
 }
 
+/* ---------- Bitcoin observation pipeline handlers ---------- */
+
+async fn start_bitcoin_observation(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+    body: Option<Json<ObservationStartRequest>>,
+) -> ApiResult<Json<ObservationPipelineStatus>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+
+    if !valid_observation_network_id(&network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for observation pipeline",
+        ));
+    }
+
+    if !is_bitcoin_network_id(&network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "observation pipeline currently supports Bitcoin networks only; got: {network}"
+            ),
+        ));
+    }
+
+    let commitment = read_substrate_commitment(&substrate_path)?;
+    let request = body.map(|Json(value)| value).unwrap_or_default();
+
+    let listen_port = listen_port_from_commitment(
+        &commitment,
+        request.listen_port,
+    )
+    .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+
+    let path_hint = request
+        .path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let clips = guarded("bitcoin observation pipeline", || {
+        init_bitcoin_observation_clips(activation, &name)
+    })?;
+
+    let status = ObservationPipelineStatus {
+        substrate: name.clone(),
+        activation,
+        network: network.clone(),
+        commitment: commitment.clone(),
+        listen_port,
+        running: true,
+        path: path_hint,
+        clips,
+        runtime: serialize_runtime(SystemTime::now()),
+        message: format!(
+            "BitcoinObservationPipeline live substrate={name} activation={activation} network={network} commitment={commitment} listen_port={listen_port}"
+        ),
+    };
+
+    let key = observation_key(&name, activation, &network);
+
+    {
+        let mut registry = observation_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        registry.insert(
+            key,
+            LiveObservation {
+                status: status.clone(),
+            },
+        );
+    }
+
+    Ok(Json(status))
+}
+
+async fn get_bitcoin_observation(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<ObservationPipelineStatus>> {
+    if !valid_observation_network_id(&network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for observation pipeline",
+        ));
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    ensure_existing_substrate(&name)?;
+
+    let key = observation_key(&name, activation, &network);
+    let registry = observation_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    registry
+        .get(&key)
+        .filter(|live| live.status.running)
+        .map(|live| Json(live.status.clone()))
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no live Bitcoin observation pipeline for substrate={name} activation={activation} network={network}"
+                ),
+            )
+        })
+}
+
+async fn list_bitcoin_observations(
+    Path((name, activation)): Path<(String, u64)>,
+) -> ApiResult<Json<ObservationListResponse>> {
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    ensure_existing_substrate(&name)?;
+
+    let registry = observation_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut pipelines: Vec<ObservationPipelineStatus> = registry
+        .iter()
+        .filter(|(key, live)| {
+            key.0 == name
+                && key.1 == activation
+                && live.status.running
+        })
+        .map(|(_, live)| live.status.clone())
+        .collect();
+
+    pipelines.sort_by(|a, b| {
+        a.network
+            .cmp(&b.network)
+            .then_with(|| a.commitment.cmp(&b.commitment))
+            .then_with(|| a.listen_port.cmp(&b.listen_port))
+    });
+
+    Ok(Json(ObservationListResponse {
+        substrate: name,
+        activation,
+        pipelines,
+    }))
+}
+
+async fn stop_bitcoin_observation(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<ObservationPipelineStatus>> {
+    if !valid_observation_network_id(&network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for observation pipeline",
+        ));
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    ensure_existing_substrate(&name)?;
+
+    let key = observation_key(&name, activation, &network);
+    let mut registry = observation_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut live = registry.remove(&key).ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no live Bitcoin observation pipeline for substrate={name} activation={activation} network={network}"
+            ),
+        )
+    })?;
+
+    live.status.running = false;
+    live.status.message = format!(
+        "BitcoinObservationPipeline stopped substrate={name} activation={activation} network={network}"
+    );
+    live.status.runtime = serialize_runtime(SystemTime::now());
+
+    Ok(Json(live.status))
+}
+
 // qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
 // from USERPROFILE before any thread starts.
 fn resolve_home() {
@@ -1768,6 +2143,7 @@ fn main() {
         .block_on(serve());
 }
 
+
 async fn serve() {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
@@ -1776,6 +2152,7 @@ async fn serve() {
             Method::HEAD,
             Method::POST,
             Method::PUT,
+            Method::DELETE,
             Method::OPTIONS,
         ])
         .allow_headers(tower_http::cors::Any);
@@ -1811,15 +2188,35 @@ async fn serve() {
             "/wallets/:name/events/:record/payloads",
             get(list_event_payloads).options(preflight),
         )
-        .route("/wallets/:name/transit", post(transit_wallet).options(preflight))
-        .route("/wallets/:name/receive", post(receive_wallet).options(preflight))
-        .route("/wallets/:name/exile/depth", get(exile_depth).options(preflight))
-        .route("/wallets/:name/exile", post(exile_wallet).options(preflight))
+        .route(
+            "/wallets/:name/transit",
+            post(transit_wallet).options(preflight),
+        )
+        .route(
+            "/wallets/:name/receive",
+            post(receive_wallet).options(preflight),
+        )
+        .route(
+            "/wallets/:name/exile/depth",
+            get(exile_depth).options(preflight),
+        )
+        .route(
+            "/wallets/:name/exile",
+            post(exile_wallet).options(preflight),
+        )
+        .route(
+            "/wallets/:name/activations/:activation/networks/:network/observation",
+            get(get_bitcoin_observation)
+                .post(start_bitcoin_observation)
+                .delete(stop_bitcoin_observation)
+                .options(preflight),
+        )
+        .route(
+            "/wallets/:name/activations/:activation/observations",
+            get(list_bitcoin_observations).options(preflight),
+        )
         .layer(cors);
 
-    // Miner-style startup discovery: use the canonical substrate root and
-    // inspect existing directories directly. The API remains request-driven;
-    // no parallel polling loop or secondary registry is introduced.
     let root = commands::substrate_root();
     println!("substrate_root={}", root.display());
 
@@ -1834,27 +2231,68 @@ async fn serve() {
                     .collect::<Vec<_>>();
 
                 discovered.sort();
+
                 println!("substrates_discovered={}", discovered.len());
+
                 for substrate in discovered {
-                    println!("substrate={substrate}");
+                    let commitment_path =
+                        root.join(&substrate).join("qtm.commitment");
+
+                    match read_trim(&commitment_path) {
+                        Some(commitment) if !commitment.trim().is_empty() => {
+                            match listen_port_from_commitment(&commitment, None) {
+                                Ok(port) => println!(
+                                    "substrate={substrate} commitment={commitment} \
+                                     electrum_port_candidate={port}"
+                                ),
+                                Err(error) => eprintln!(
+                                    "substrate={substrate} commitment_port_error={error}"
+                                ),
+                            }
+                        }
+                        _ => println!(
+                            "substrate={substrate} commitment=unavailable"
+                        ),
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("unable to read substrate root {}: {e}", root.display());
+            Err(error) => {
+                eprintln!(
+                    "unable to read substrate root {}: {error}",
+                    root.display()
+                );
             }
         }
     } else {
-        println!("substrates_discovered=0 (root does not exist; startup did not create it)");
+        println!(
+            "substrates_discovered=0 (root does not exist; startup did not create it)"
+        );
     }
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let address = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .expect("failed to bind qtm-api listener");
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(8080);
 
-    println!("qtm-api listening on http://{address}");
-    axum::serve(listener, app)
-        .await
-        .expect("qtm-api server failed");
+    let address = format!("0.0.0.0:{port}");
+
+    let listener = match tokio::net::TcpListener::bind(&address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("failed to bind qtm-api HTTP listener at {address}: {error}");
+            return;
+        }
+    };
+
+    println!("qtm-api HTTP control plane listening on http://{address}");
+    println!(
+        "Observation control routes are registered. Commitment-derived ports \
+         are candidates only; an Electrum-compatible TCP listener must be \
+         explicitly started and bound before clients can connect."
+    );
+
+    if let Err(error) = axum::serve(listener, app).await {
+        eprintln!("qtm-api HTTP server failed: {error}");
+    }
 }
