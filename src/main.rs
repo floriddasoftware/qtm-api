@@ -343,6 +343,127 @@ struct LiveObservation {
     status: ObservationPipelineStatus,
 }
 
+
+#[derive(Serialize)]
+struct WirePacketsResponse {
+    substrate: String,
+    activation: u64,
+    network: String,
+    commitment: String,
+    path: String,
+    exists: bool,
+    packets: Vec<WirePacketEntry>,
+}
+
+#[derive(Serialize)]
+struct WirePacketEntry {
+    name: String,
+    path: String,
+    bytes: u64,
+}
+
+fn wirepackets_directory(
+    substrate_path: &FsPath,
+    activation: u64,
+    commitment: &str,
+) -> ApiResult<PathBuf> {
+    if commitment.is_empty()
+        || commitment.len() > 256
+        || !commitment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid commitment for wire-packet path",
+        ));
+    }
+
+    Ok(substrate_path
+        .join(activation.to_string())
+        .join("events")
+        .join(commitment)
+        .join("wallet")
+        .join("wirepackets"))
+}
+
+async fn get_wirepackets(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<WirePacketsResponse>> {
+    if !valid_observation_network_id(&network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier",
+        ));
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+    let commitment = read_substrate_commitment(&substrate_path)?;
+
+    let path = wirepackets_directory(
+        &substrate_path,
+        activation,
+        commitment.trim(),
+    )?;
+
+    let exists = path.is_dir();
+    let mut packets = Vec::new();
+
+    if exists {
+        let entries = std::fs::read_dir(&path).map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read wire-packet directory: {e}"),
+            )
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to read wire-packet entry: {e}"),
+                )
+            })?;
+
+            let packet_path = entry.path();
+
+            if !packet_path.is_file() {
+                continue;
+            }
+
+            let metadata = entry.metadata().map_err(|e| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect wire packet: {e}"),
+                )
+            })?;
+
+            packets.push(WirePacketEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path: packet_path.display().to_string(),
+                bytes: metadata.len(),
+            });
+        }
+
+        packets.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    Ok(Json(WirePacketsResponse {
+        substrate: name,
+        activation,
+        network,
+        commitment,
+        path: path.display().to_string(),
+        exists,
+        packets,
+    }))
+}
+
 type ObservationKey = (String, u64, String);
 
 static OBSERVATION_REGISTRY: OnceLock<Mutex<HashMap<ObservationKey, LiveObservation>>> =
@@ -2560,6 +2681,10 @@ async fn serve() {
         .route(
             "/wallets/:name/activations/:activation/payload-board",
             get(get_payload_board).options(preflight),
+        )
+        .route(
+        "/wallets/:name/activations/:activation/networks/:network/wirepackets",
+        get(get_wirepackets).options(preflight),
         )
         .route(
             "/wallets/:name/activations/:activation/networks/:network/payload-board",
