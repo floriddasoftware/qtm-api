@@ -110,7 +110,7 @@ struct DepthObjectResponse {
     from: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct RuntimeResponse {
     unix_seconds: u64,
     subsec_nanos: u32,
@@ -318,7 +318,7 @@ struct ObservationClipStatus {
     direction: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ObservationPipelineStatus {
     substrate: String,
     activation: u64,
