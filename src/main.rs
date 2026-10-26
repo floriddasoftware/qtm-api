@@ -318,7 +318,7 @@ struct ObservationClipStatus {
     direction: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize)]
 struct ObservationPipelineStatus {
     substrate: String,
     activation: u64,
