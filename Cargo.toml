@@ -15,11 +15,11 @@ qtm-graph = { git = "https://github.com/floriddasoftware/Quantum-Economies" }
 hex = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
 bit_minner = {
-    package = "bit-minner",
+    package = "bit-miner",
     git = "https://github.com/floriddasoftware/bit-miner",
     optional = true
 }
 
 [features]
-default = ["bit-minner"]
-bit-minner = ["dep:bit_minner"]
+default = ["bit-miner"]
+bit-miner = ["dep:bit_minner"]
