@@ -2065,10 +2065,10 @@ fn start_bitminer(substrate: &str, activation: u64) -> Result<(), String> {
         processes.remove(&key);
     }
 
-    let binary = std::env::var_os("BIT_MINER_BIN")
-        .unwrap_or_else(|| {
-            "/opt/render/project/src/target/release/bit-miner".into()
-        });
+      let binary = std::env::var_os("BIT_MINER_BIN")
+    .unwrap_or_else(|| {
+        "/opt/render/project/src/.cargo-bin/bin/bit-miner".into()
+    });
 
     let child = Command::new(binary)
         .arg(activation.to_string())
