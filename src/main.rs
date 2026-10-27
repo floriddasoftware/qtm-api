@@ -1,6 +1,7 @@
 use axum::{
     extract::Path,
     http::{Method, StatusCode},
+    routing::{get, post, put},
     Json, Router,
 };
 
@@ -2111,7 +2112,10 @@ fn refresh_bitminer(
             .unwrap_or_else(|p| p.into_inner());
 
         match processes.get_mut(&key) {
-            Some(child) if child.try_wait().map_err(|e| e.to_string())?.is_none() => true,
+            Some(child) => child
+    .try_wait()
+    .map_err(|e| e.to_string())?
+    .is_none(),
             Some(_) => {
                 processes.remove(&key);
                 false
