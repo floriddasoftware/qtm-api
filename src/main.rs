@@ -21,7 +21,6 @@ use tower_http::cors::CorsLayer;
 use std::{
     collections::HashMap,
     path::{Path as FsPath, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -303,7 +302,6 @@ struct ActivationBudgetsResponse {
     budgets: Vec<NetworkBudgetEntry>,
 }
 
-
 #[derive(Deserialize, Default)]
 struct ObservationStartRequest {
     #[serde(default)]
@@ -343,7 +341,6 @@ struct ObservationListResponse {
 struct LiveObservation {
     status: ObservationPipelineStatus,
 }
-
 
 #[derive(Serialize)]
 struct WirePacketsResponse {
@@ -541,6 +538,7 @@ fn valid_observation_network_id(network: &str) -> bool {
         })
 }
 
+#[allow(dead_code)]
 fn init_bitcoin_observation_clips(
     activation: u64,
     substrate: &str,
@@ -596,7 +594,6 @@ fn init_bitcoin_observation_clips(
         }])
     }
 }
-
 
 static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     OnceLock::new();
@@ -1837,10 +1834,10 @@ async fn transit_wallet(
     let dimension = event.heritage.state.dimension();
 
     let record_path = canonical_record_path(
-    &substrate_path,
-    "transit",
-    activation,
-    u128::from(dimension),
+        &substrate_path,
+        "transit",
+        activation,
+        u128::from(dimension),
     )?;
     // Persist the actual input depth under this event and network.
     write_depth_payload(&record_path, &network_id, &event.depth)?;
@@ -2010,10 +2007,10 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     let dimension = event.heritage.state.dimension();
 
     let record_path = canonical_record_path(
-    &substrate_path,
-    "exile",
-    resulting_activation,
-    u128::from(dimension),
+        &substrate_path,
+        "exile",
+        resulting_activation,
+        u128::from(dimension),
     )?;
 
     // Event root is canonical output; network payloads are persisted only for input networks.
@@ -2038,93 +2035,43 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     )))
 }
 
-type BitminerKey = (String, u64);
+/* ---------- Observation stream lifecycle (bit_minner manager) ----------
+ *
+ * The API no longer spawns a bit-miner OS process. The long-lived Mempool.space
+ * stream is owned by bit_minner::observestream::ObservationStreamManager, which
+ * keeps exactly one stream + pipeline per (substrate, activation). Network
+ * routes share that stream. OBSERVATION_REGISTRY remains the HTTP status map.
+ */
 
-static BITMINER_PROCESSES: OnceLock<Mutex<HashMap<BitminerKey, Child>>> =
-    OnceLock::new();
-
-#[inline]
-fn bitminer_processes() -> &'static Mutex<HashMap<BitminerKey, Child>> {
-    BITMINER_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn start_bitminer(substrate: &str, activation: u64) -> Result<(), String> {
-    if !valid_substrate_name(substrate) {
-        return Err("invalid substrate name".into());
+/// Asks the manager whether the stream for (substrate, activation) is running.
+/// Never creates a pipeline. Must not be called while holding a std Mutex guard
+/// (the future would not be Send).
+async fn observation_stream_running(substrate: &str, activation: u64) -> bool {
+    #[cfg(feature = "bit-minner")]
+    {
+        bit_minner::observestream::ObservationStreamManager::global()
+            .is_running(substrate, activation)
+            .await
     }
 
-    let key = (substrate.to_owned(), activation);
-    let mut processes = bitminer_processes()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-
-    if let Some(child) = processes.get_mut(&key) {
-        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
-            return Ok(());
-        }
-        processes.remove(&key);
+    #[cfg(not(feature = "bit-minner"))]
+    {
+        let _ = (substrate, activation);
+        false
     }
-
-      let binary = std::env::var_os("BIT_MINER_BIN")
-    .unwrap_or_else(|| {
-        "/opt/render/project/src/.cargo-bin/bin/bit-miner".into()
-    });
-
-    let child = Command::new(binary)
-        .arg(activation.to_string())
-        .arg(substrate)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to start bit-miner: {e}"))?;
-
-    processes.insert(key, child);
-    Ok(())
 }
 
-fn stop_bitminer(substrate: &str, activation: u64) -> Result<(), String> {
-    let key = (substrate.to_owned(), activation);
-    let mut processes = bitminer_processes()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-
-    if let Some(mut child) = processes.remove(&key) {
-        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
-            child.kill().map_err(|e| format!("failed to stop bit-miner: {e}"))?;
-            child.wait().map_err(|e| format!("failed to reap bit-miner: {e}"))?;
-        }
-    }
-
-    Ok(())
-}
-
-fn refresh_bitminer(
+/// Builds the clip status. `running` comes from the stream manager; `direction`
+/// is a filesystem scan of persisted event_{activation}_ records only. It
+/// describes persisted event state, not whether the stream is running.
+fn observation_clip_status(
     substrate: &str,
     activation: u64,
+    running: bool,
 ) -> Result<ObservationClipStatus, String> {
     if !valid_substrate_name(substrate) {
         return Err("invalid substrate name".into());
     }
-
-    let key = (substrate.to_owned(), activation);
-    let active = {
-        let mut processes = bitminer_processes()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        match processes.get_mut(&key) {
-            Some(child) => child
-    .try_wait()
-    .map_err(|e| e.to_string())?
-    .is_none(),
-            Some(_) => {
-                processes.remove(&key);
-                false
-            }
-            None => false,
-        }
-    };
 
     let substrate_path = commands::substrate_root().join(substrate);
     if !substrate_path.is_dir() {
@@ -2134,23 +2081,28 @@ fn refresh_bitminer(
     let events_path = substrate_path.join("events");
     let prefix = format!("event_{activation}_");
 
-    let direction = match std::fs::read_dir(events_path) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-            .then(|| format!("event activation {activation}"))
-            .into(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("failed to read events: {error}")),
+    let direction = match std::fs::read_dir(&events_path) {
+        Ok(entries) => {
+            let found = entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+
+            if found {
+                Some(format!("event activation {activation}"))
+            } else {
+                None
+            }
+        }
+        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(io_error) => return Err(format!("failed to read events: {io_error}")),
     };
 
     Ok(ObservationClipStatus {
         substrate: substrate.to_owned(),
-        active,
+        active: running,
         direction,
     })
 }
-
 
 /* ---------- Bitcoin observation pipeline handlers ---------- */
 
@@ -2158,13 +2110,11 @@ async fn start_bitcoin_observation(
     Path((name, activation, network)): Path<(String, u64, String)>,
     body: Option<Json<ObservationStartRequest>>,
 ) -> ApiResult<Json<ObservationPipelineStatus>> {
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-    let substrate_path = ensure_existing_substrate(&name)?;
-
     if !valid_observation_network_id(&network) {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid network identifier for observation pipeline"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for observation pipeline",
+        ));
     }
 
     if !is_bitcoin_network_id(&network) {
@@ -2174,20 +2124,62 @@ async fn start_bitcoin_observation(
         ));
     }
 
-    let commitment = read_substrate_commitment(&substrate_path)?;
+    // The std Mutex guard is scoped so it is dropped before any .await.
+    let commitment = {
+        let lock = substrate_lock(&name);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let substrate_path = ensure_existing_substrate(&name)?;
+        read_substrate_commitment(&substrate_path)?
+    };
+
     let request = body.map(|Json(value)| value).unwrap_or_default();
 
+    // Candidate value derived from the commitment; this WebSocket stream does
+    // not bind an Electrum listener.
     let listen_port = listen_port_from_commitment(&commitment, request.listen_port)
         .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
 
-    let path_hint = request.path
+    let path_hint = request
+        .path
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    start_bitminer(&name, activation)
-        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+    #[cfg(feature = "bit-minner")]
+    let running = {
+        let manager =
+            bit_minner::observestream::ObservationStreamManager::global();
 
-    let clip = refresh_bitminer(&name, activation)
+        manager
+            .start(&name, activation, move |txid, outcome| match outcome {
+                Ok(Some(_)) => eprintln!(
+                    "Bitcoin observation finalized txid={txid}"
+                ),
+                Ok(None) => eprintln!(
+                    "Bitcoin observation processed txid={txid}; \
+                     no finalized settlement"
+                ),
+                Err(e) => eprintln!(
+                    "Bitcoin observation failed txid={txid}: {e}"
+                ),
+            })
+            .await
+            .map_err(|e| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to start Bitcoin observation stream: {e}"),
+                )
+            })?;
+
+        manager.is_running(&name, activation).await
+    };
+
+    #[cfg(not(feature = "bit-minner"))]
+    let running: bool = return Err(error(
+        StatusCode::NOT_IMPLEMENTED,
+        "qtm-api was built without the bit-minner feature",
+    ));
+
+    let clip = observation_clip_status(&name, activation, running)
         .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
 
     let status = ObservationPipelineStatus {
@@ -2196,12 +2188,12 @@ async fn start_bitcoin_observation(
         network: network.clone(),
         commitment: commitment.clone(),
         listen_port,
-        running: clip.active,
+        running,
         path: path_hint,
         clips: vec![clip],
         runtime: serialize_runtime(SystemTime::now()),
         message: format!(
-            "bit-miner started substrate={name} activation={activation} network={network} commitment={commitment} listen_port={listen_port}"
+            "Bitcoin observation stream started substrate={name} activation={activation} network={network} commitment={commitment} listen_port_candidate={listen_port}"
         ),
     };
 
@@ -2220,15 +2212,21 @@ async fn get_bitcoin_observation(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<ObservationPipelineStatus>> {
     if !valid_observation_network_id(&network) {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid network identifier for observation pipeline"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for observation pipeline",
+        ));
     }
 
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let lock = substrate_lock(&name);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_existing_substrate(&name)?;
+    }
 
-    ensure_existing_substrate(&name)?;
+    let running = observation_stream_running(&name, activation).await;
 
-    let clip = refresh_bitminer(&name, activation)
+    let clip = observation_clip_status(&name, activation, running)
         .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
 
     let key = observation_key(&name, activation, &network);
@@ -2243,14 +2241,14 @@ async fn get_bitcoin_observation(
         )
     })?;
 
-    live.status.running = clip.active;
+    live.status.running = running;
     live.status.clips = vec![clip];
     live.status.runtime = serialize_runtime(SystemTime::now());
 
     if !live.status.running {
         return Err(error(
             StatusCode::NOT_FOUND,
-            format!("bit-miner is not running for substrate={name} activation={activation}"),
+            format!("observation stream is not running for substrate={name} activation={activation}"),
         ));
     }
 
@@ -2260,12 +2258,16 @@ async fn get_bitcoin_observation(
 async fn list_bitcoin_observations(
     Path((name, activation)): Path<(String, u64)>,
 ) -> ApiResult<Json<ObservationListResponse>> {
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let lock = substrate_lock(&name);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_existing_substrate(&name)?;
+    }
 
-    ensure_existing_substrate(&name)?;
+    // Query the manager once for this substrate + activation.
+    let running = observation_stream_running(&name, activation).await;
 
-    let clip = refresh_bitminer(&name, activation)
+    let clip = observation_clip_status(&name, activation, running)
         .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
 
     let mut registry = observation_registry()
@@ -2276,7 +2278,7 @@ async fn list_bitcoin_observations(
         .iter_mut()
         .filter(|(key, _)| key.0 == name && key.1 == activation)
         .filter_map(|(_, live)| {
-            live.status.running = clip.active;
+            live.status.running = running;
             live.status.clips = vec![clip.clone()];
             live.status.runtime = serialize_runtime(SystemTime::now());
 
@@ -2285,7 +2287,8 @@ async fn list_bitcoin_observations(
         .collect();
 
     pipelines.sort_by(|a, b| {
-        a.network.cmp(&b.network)
+        a.network
+            .cmp(&b.network)
             .then_with(|| a.commitment.cmp(&b.commitment))
             .then_with(|| a.listen_port.cmp(&b.listen_port))
     });
@@ -2301,13 +2304,27 @@ async fn stop_bitcoin_observation(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<ObservationPipelineStatus>> {
     if !valid_observation_network_id(&network) {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid network identifier for observation pipeline"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier for observation pipeline",
+        ));
     }
 
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let commitment = {
+        let lock = substrate_lock(&name);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let substrate_path = ensure_existing_substrate(&name)?;
+        read_substrate_commitment(&substrate_path)?
+    };
 
-    ensure_existing_substrate(&name)?;
+    #[cfg(feature = "bit-minner")]
+    let stopped =
+        bit_minner::observestream::ObservationStreamManager::global()
+            .stop(&name, activation)
+            .await;
+
+    #[cfg(not(feature = "bit-minner"))]
+    let stopped = false;
 
     let key = observation_key(&name, activation, &network);
 
@@ -2316,20 +2333,46 @@ async fn stop_bitcoin_observation(
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        registry.remove(&key).map(|live| live.status).ok_or_else(|| {
-            error(
-                StatusCode::NOT_FOUND,
-                format!("no observation status for substrate={name} activation={activation} network={network}"),
-            )
-        })?
+        // The stream is shared per (substrate, activation), so every network
+        // entry for it is no longer running once it is stopped.
+        if stopped {
+            for (entry_key, live) in registry.iter_mut() {
+                if entry_key.0 == name && entry_key.1 == activation {
+                    live.status.running = false;
+                }
+            }
+        }
+
+        match registry.remove(&key) {
+            Some(live) => live.status,
+            None if stopped => ObservationPipelineStatus {
+                substrate: name.clone(),
+                activation,
+                network: network.clone(),
+                commitment: commitment.clone(),
+                listen_port: listen_port_from_commitment(&commitment, None).unwrap_or(0),
+                running: false,
+                path: None,
+                clips: Vec::new(),
+                runtime: serialize_runtime(SystemTime::now()),
+                message: String::new(),
+            },
+            None => {
+                return Err(error(
+                    StatusCode::NOT_FOUND,
+                    format!("no observation status for substrate={name} activation={activation} network={network}"),
+                ));
+            }
+        }
     };
 
-    stop_bitminer(&name, activation)
-        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-
     status.running = false;
+    status.clips = vec![
+        observation_clip_status(&name, activation, false)
+            .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?,
+    ];
     status.message = format!(
-        "bit-miner stopped substrate={name} activation={activation} network={network}"
+        "Bitcoin observation stream stopped={stopped} substrate={name} activation={activation} network={network}"
     );
     status.runtime = serialize_runtime(SystemTime::now());
 
@@ -2352,7 +2395,7 @@ async fn stop_bitcoin_observation(
  *
  * OBSERVATION_REGISTRY is an in-memory control-plane status map only. It is not proof that
  * an Electrum listener is bound or that a SettlementRequest is carried. Without the
- * bit-minner feature, clips are fallback placeholders. The board reports these conditions
+ * bit-minner feature, the stream cannot be started. The board reports these conditions
  * explicitly and does not synthesize AuthorizedPayload.
  *
  * Routes:
@@ -2705,7 +2748,6 @@ fn main() {
         .block_on(serve());
 }
 
-
 async fn serve() {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
@@ -2784,8 +2826,8 @@ async fn serve() {
             get(get_payload_board).options(preflight),
         )
         .route(
-        "/wallets/:name/activations/:activation/networks/:network/wirepackets",
-        get(get_wirepackets).options(preflight),
+            "/wallets/:name/activations/:activation/networks/:network/wirepackets",
+            get(get_wirepackets).options(preflight),
         )
         .route(
             "/wallets/:name/activations/:activation/networks/:network/payload-board",
@@ -2821,8 +2863,8 @@ async fn serve() {
                                     "substrate={substrate} commitment={commitment} \
                                      electrum_port_candidate={port}"
                                 ),
-                                Err(error) => eprintln!(
-                                    "substrate={substrate} commitment_port_error={error}"
+                                Err(e) => eprintln!(
+                                    "substrate={substrate} commitment_port_error={e}"
                                 ),
                             }
                         }
@@ -2832,9 +2874,9 @@ async fn serve() {
                     }
                 }
             }
-            Err(error) => {
+            Err(e) => {
                 eprintln!(
-                    "unable to read substrate root {}: {error}",
+                    "unable to read substrate root {}: {e}",
                     root.display()
                 );
             }
@@ -2845,7 +2887,7 @@ async fn serve() {
         );
     }
 
-        let port = std::env::var("PORT")
+    let port = std::env::var("PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port != 0)
@@ -2855,8 +2897,8 @@ async fn serve() {
 
     let listener = tokio::net::TcpListener::bind(&address)
         .await
-        .unwrap_or_else(|error| {
-            panic!("failed to bind qtm-api HTTP listener at {address}: {error}");
+        .unwrap_or_else(|e| {
+            panic!("failed to bind qtm-api HTTP listener at {address}: {e}");
         });
 
     let bound_address = listener
@@ -2871,5 +2913,4 @@ async fn serve() {
     axum::serve(listener, app)
         .await
         .expect("qtm-api HTTP server failed");
-    }
-
+}
