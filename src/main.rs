@@ -2319,7 +2319,7 @@ async fn stop_bitcoin_observation(
 
     #[cfg(feature = "bit-miner")]
     let stopped =
-        bit_minner::observestream::ObservationStreamManager::global()
+        bit_miner::observestream::ObservationStreamManager::global()
             .stop(&name, activation)
             .await;
 
