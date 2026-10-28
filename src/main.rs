@@ -550,7 +550,7 @@ fn init_bitcoin_observation_clips(
     #[cfg(feature = "bit-miner")]
     {
         let pipeline =
-            bit_minner::BitcoinObservationPipeline::new(activation, substrate)
+            bit_miner::BitcoinObservationPipeline::new(activation, substrate)
                 .map_err(|error| {
                     format!(
                         "failed to initialize Bitcoin observation pipeline \
@@ -561,7 +561,7 @@ fn init_bitcoin_observation_clips(
 
         let clips = pipeline.miner().clips.iter().map(|clip| {
             let window =
-                bit_minner::RenderState::window(clip.substrate.clone());
+                bit_miner::RenderState::window(clip.substrate.clone());
 
             ObservationClipStatus {
                 substrate: window.substrate,
@@ -2049,7 +2049,7 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
 async fn observation_stream_running(substrate: &str, activation: u64) -> bool {
     #[cfg(feature = "bit-miner")]
     {
-        bit_minner::observestream::ObservationStreamManager::global()
+        bit_miner::observestream::ObservationStreamManager::global()
             .is_running(substrate, activation)
             .await
     }
@@ -2147,7 +2147,7 @@ async fn start_bitcoin_observation(
     #[cfg(feature = "bit-miner")]
     let running = {
         let manager =
-            bit_minner::observestream::ObservationStreamManager::global();
+            bit_miner::observestream::ObservationStreamManager::global();
 
         manager
             .start(&name, activation, move |txid, outcome| match outcome {
@@ -2317,13 +2317,13 @@ async fn stop_bitcoin_observation(
         read_substrate_commitment(&substrate_path)?
     };
 
-    #[cfg(feature = "bit-minner")]
+    #[cfg(feature = "bit-miner")]
     let stopped =
         bit_minner::observestream::ObservationStreamManager::global()
             .stop(&name, activation)
             .await;
 
-    #[cfg(not(feature = "bit-minner"))]
+    #[cfg(not(feature = "bit-miner"))]
     let stopped = false;
 
     let key = observation_key(&name, activation, &network);
@@ -2560,7 +2560,7 @@ fn collect_depth_for_activation_network(
 }
 
 fn bit_minner_enabled() -> bool {
-    cfg!(feature = "bit-minner")
+    cfg!(feature = "bit-miner")
 }
 
 fn build_payload_board(
