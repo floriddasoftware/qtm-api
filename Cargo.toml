@@ -22,4 +22,4 @@ bit_miner = {
 
 [features]
 default = ["bit-miner"]
-bit-miner = ["dep:bit_minner"]
+bit-miner = ["dep:bit_miner"]
