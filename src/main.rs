@@ -2845,7 +2845,7 @@ async fn serve() {
         );
     }
 
-    let port = std::env::var("PORT")
+        let port = std::env::var("PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port != 0)
@@ -2853,22 +2853,23 @@ async fn serve() {
 
     let address = format!("0.0.0.0:{port}");
 
-    let listener = match tokio::net::TcpListener::bind(&address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("failed to bind qtm-api HTTP listener at {address}: {error}");
-            return;
-        }
-    };
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to bind qtm-api HTTP listener at {address}: {error}");
+        });
 
-    println!("qtm-api HTTP control plane listening on http://{address}");
-    println!(
-        "Observation control routes are registered. Commitment-derived ports \
-         are candidates only; an Electrum-compatible TCP listener must be \
-         explicitly started and bound before clients can connect."
-    );
+    let bound_address = listener
+        .local_addr()
+        .expect("failed to obtain qtm-api listener address");
 
-    if let Err(error) = axum::serve(listener, app).await {
-        eprintln!("qtm-api HTTP server failed: {error}");
+    println!("qtm-api HTTP listener bound at {bound_address}");
+    println!("qtm-api health endpoint: /health");
+    println!("qtm-api networks endpoint: /networks");
+    println!("qtm-api wallets endpoint: /wallets");
+
+    axum::serve(listener, app)
+        .await
+        .expect("qtm-api HTTP server failed");
     }
 }
