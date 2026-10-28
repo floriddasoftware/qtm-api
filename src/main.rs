@@ -547,7 +547,7 @@ fn init_bitcoin_observation_clips(
         return Err("substrate must not be empty".to_string());
     }
 
-    #[cfg(feature = "bit-minner")]
+    #[cfg(feature = "bit-miner")]
     {
         let pipeline =
             bit_minner::BitcoinObservationPipeline::new(activation, substrate)
@@ -583,7 +583,7 @@ fn init_bitcoin_observation_clips(
         Ok(windows)
     }
 
-    #[cfg(not(feature = "bit-minner"))]
+    #[cfg(not(feature = "bit-miner"))]
     {
         let _ = activation;
 
@@ -2047,14 +2047,14 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
 /// Never creates a pipeline. Must not be called while holding a std Mutex guard
 /// (the future would not be Send).
 async fn observation_stream_running(substrate: &str, activation: u64) -> bool {
-    #[cfg(feature = "bit-minner")]
+    #[cfg(feature = "bit-miner")]
     {
         bit_minner::observestream::ObservationStreamManager::global()
             .is_running(substrate, activation)
             .await
     }
 
-    #[cfg(not(feature = "bit-minner"))]
+    #[cfg(not(feature = "bit-miner"))]
     {
         let _ = (substrate, activation);
         false
@@ -2144,7 +2144,7 @@ async fn start_bitcoin_observation(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    #[cfg(feature = "bit-minner")]
+    #[cfg(feature = "bit-miner")]
     let running = {
         let manager =
             bit_minner::observestream::ObservationStreamManager::global();
@@ -2173,7 +2173,7 @@ async fn start_bitcoin_observation(
         manager.is_running(&name, activation).await
     };
 
-    #[cfg(not(feature = "bit-minner"))]
+    #[cfg(not(feature = "bit-miner"))]
     let running: bool = return Err(error(
         StatusCode::NOT_IMPLEMENTED,
         "qtm-api was built without the bit-minner feature",
