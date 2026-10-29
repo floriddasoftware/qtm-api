@@ -347,7 +347,6 @@ struct WirePacketsResponse {
     substrate: String,
     activation: u64,
     network: String,
-    commitment: String,
     path: String,
     exists: bool,
     packets: Vec<WirePacketEntry>,
@@ -360,34 +359,15 @@ struct WirePacketEntry {
     bytes: u64,
 }
 
+
 /// Canonical persisted wire-packet file:
-/// ~/.qp/substrates/<substrate>/activations/<activation>/event/<commitment>/wirepackets
-fn wirepackets_directory(
-    substrate_path: &FsPath,
-    activation: u64,
-    commitment: &str,
-) -> ApiResult<PathBuf> {
-    let commitment_bytes = hex::decode(commitment.trim()).map_err(|_| {
-        error(
-            StatusCode::BAD_REQUEST,
-            "invalid commitment for wire-packet path",
-        )
-    })?;
-
-    let commitment_bytes: [u8; 32] =
-        commitment_bytes.try_into().map_err(|_| {
-            error(
-                StatusCode::BAD_REQUEST,
-                "commitment must decode to exactly 32 bytes",
-            )
-        })?;
-
-    Ok(substrate_path
+/// ~/.qp/substrates/<substrate>/activations/<activation>/event/wirepackets
+fn wirepackets_file_path(substrate_path: &FsPath, activation: u64) -> PathBuf {
+    substrate_path
         .join("activations")
         .join(activation.to_string())
         .join("event")
-        .join(hex::encode(commitment_bytes))
-        .join("wirepackets"))
+        .join("wirepackets")
 }
 
 async fn get_wirepackets(
@@ -406,14 +386,7 @@ async fn get_wirepackets(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let substrate_path = ensure_existing_substrate(&name)?;
-    let commitment = read_substrate_commitment(&substrate_path)?;
-    let commitment = commitment.trim().to_owned();
-
-    let path = wirepackets_directory(
-        &substrate_path,
-        activation,
-        &commitment,
-    )?;
+    let path = wirepackets_file_path(&substrate_path, activation);
 
     // `persist_wirepackets()` writes one file, not a directory.
     let exists = path.is_file();
@@ -438,12 +411,13 @@ async fn get_wirepackets(
         substrate: name,
         activation,
         network,
-        commitment,
         path: path.display().to_string(),
         exists,
         packets,
     }))
 }
+
+
 type ObservationKey = (String, u64, String);
 
 static OBSERVATION_REGISTRY: OnceLock<Mutex<HashMap<ObservationKey, LiveObservation>>> =
