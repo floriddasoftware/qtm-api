@@ -360,28 +360,33 @@ struct WirePacketEntry {
     bytes: u64,
 }
 
+/// Canonical persisted wire-packet file:
+/// ~/.qp/substrates/<substrate>/activations/<activation>/event/<commitment>/wirepackets
 fn wirepackets_directory(
     substrate_path: &FsPath,
     activation: u64,
     commitment: &str,
 ) -> ApiResult<PathBuf> {
-    if commitment.is_empty()
-        || commitment.len() > 256
-        || !commitment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(error(
+    let commitment_bytes = hex::decode(commitment.trim()).map_err(|_| {
+        error(
             StatusCode::BAD_REQUEST,
             "invalid commitment for wire-packet path",
-        ));
-    }
+        )
+    })?;
+
+    let commitment_bytes: [u8; 32] =
+        commitment_bytes.try_into().map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "commitment must decode to exactly 32 bytes",
+            )
+        })?;
 
     Ok(substrate_path
+        .join("activations")
         .join(activation.to_string())
-        .join("events")
-        .join(commitment)
-        .join("wallet")
+        .join("event")
+        .join(hex::encode(commitment_bytes))
         .join("wirepackets"))
 }
 
@@ -402,53 +407,31 @@ async fn get_wirepackets(
 
     let substrate_path = ensure_existing_substrate(&name)?;
     let commitment = read_substrate_commitment(&substrate_path)?;
+    let commitment = commitment.trim().to_owned();
 
     let path = wirepackets_directory(
         &substrate_path,
         activation,
-        commitment.trim(),
+        &commitment,
     )?;
 
-    let exists = path.is_dir();
+    // `persist_wirepackets()` writes one file, not a directory.
+    let exists = path.is_file();
     let mut packets = Vec::new();
 
     if exists {
-        let entries = std::fs::read_dir(&path).map_err(|e| {
+        let metadata = std::fs::metadata(&path).map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read wire-packet directory: {e}"),
+                format!("unable to inspect wire-packets file: {e}"),
             )
         })?;
 
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read wire-packet entry: {e}"),
-                )
-            })?;
-
-            let packet_path = entry.path();
-
-            if !packet_path.is_file() {
-                continue;
-            }
-
-            let metadata = entry.metadata().map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect wire packet: {e}"),
-                )
-            })?;
-
-            packets.push(WirePacketEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                path: packet_path.display().to_string(),
-                bytes: metadata.len(),
-            });
-        }
-
-        packets.sort_by(|a, b| a.name.cmp(&b.name));
+        packets.push(WirePacketEntry {
+            name: "wirepackets".to_owned(),
+            path: path.display().to_string(),
+            bytes: metadata.len(),
+        });
     }
 
     Ok(Json(WirePacketsResponse {
@@ -461,7 +444,6 @@ async fn get_wirepackets(
         packets,
     }))
 }
-
 type ObservationKey = (String, u64, String);
 
 static OBSERVATION_REGISTRY: OnceLock<Mutex<HashMap<ObservationKey, LiveObservation>>> =
