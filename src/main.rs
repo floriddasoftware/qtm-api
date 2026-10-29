@@ -2100,37 +2100,29 @@ async fn start_bitcoin_observation(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    #[cfg(feature = "bit-miner")]
+           #[cfg(feature = "bit-miner")]
     let running = {
         let manager =
             bit_miner::observestream::ObservationStreamManager::global();
 
-        
-                  let substrate = name.clone();
-        let commitment_hex = commitment.clone();
+        let substrate = name.clone();
+
+        // Needed only by `finalized.wire_packet(..)`. It is decoded once here,
+        // not per transaction, and plays no part in the wirepackets file path.
+        let commitment_bytes: [u8; 32] = hex::decode(commitment.trim())
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(|| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "substrate commitment must decode to exactly 32 bytes",
+                )
+            })?;
 
         manager
             .start(&name, activation, move |txid, outcome| {
                 match outcome {
                     Ok(Some((finalized, retained))) => {
-                        let commitment_bytes = match hex::decode(
-                            commitment_hex.trim(),
-                        )
-                        .ok()
-                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                        {
-                            Some(bytes) => bytes,
-                            None => {
-                                eprintln!(
-                                    "wirepackets persistence failed \
-                                     substrate={} activation={} txid={}: \
-                                     commitment must decode to 32 bytes",
-                                    substrate, activation, txid,
-                                );
-                                return;
-                            }
-                        };
-
                         // Store the actual serialized packets from the
                         // finalized transaction, not reconstructed payloads.
                         let mut packets = Vec::<u8>::new();
@@ -2185,10 +2177,10 @@ async fn start_bitcoin_observation(
                             return;
                         }
 
+                        // Path: activations/<activation>/event/wirepackets
                         match commands::persist_wirepackets(
                             &substrate,
                             activation,
-                            &commitment_bytes,
                             &packets,
                         ) {
                             Ok(()) => eprintln!(
@@ -2234,6 +2226,7 @@ async fn start_bitcoin_observation(
 
         manager.is_running(&name, activation).await
     };
+
 
     #[cfg(not(feature = "bit-miner"))]
     let running: bool = return Err(error(
