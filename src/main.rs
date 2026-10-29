@@ -2149,24 +2149,130 @@ async fn start_bitcoin_observation(
         let manager =
             bit_miner::observestream::ObservationStreamManager::global();
 
+        
+                  let substrate = name.clone();
+        let commitment_hex = commitment.clone();
+
         manager
-            .start(&name, activation, move |txid, outcome| match outcome {
-                Ok(Some(_)) => eprintln!(
-                    "Bitcoin observation finalized txid={txid}"
-                ),
-                Ok(None) => eprintln!(
-                    "Bitcoin observation processed txid={txid}; \
-                     no finalized settlement"
-                ),
-                Err(e) => eprintln!(
-                    "Bitcoin observation failed txid={txid}: {e}"
-                ),
+            .start(&name, activation, move |txid, outcome| {
+                match outcome {
+                    Ok(Some((finalized, retained))) => {
+                        let commitment_bytes = match hex::decode(
+                            commitment_hex.trim(),
+                        )
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                        {
+                            Some(bytes) => bytes,
+                            None => {
+                                eprintln!(
+                                    "wirepackets persistence failed \
+                                     substrate={} activation={} txid={}: \
+                                     commitment must decode to 32 bytes",
+                                    substrate, activation, txid,
+                                );
+                                return;
+                            }
+                        };
+
+                        // Store the actual serialized packets from the
+                        // finalized transaction, not reconstructed payloads.
+                        let mut packets = Vec::<u8>::new();
+                        let mut packet_count = 0usize;
+
+                        for vout in 0..finalized.transaction.output.len() {
+                            let Ok(vout) = u32::try_from(vout) else {
+                                eprintln!(
+                                    "wirepackets persistence failed \
+                                     txid={txid}: output index exceeds u32"
+                                );
+                                return;
+                            };
+
+                            let Some(packet) =
+                                finalized.wire_packet(vout, commitment_bytes)
+                            else {
+                                continue;
+                            };
+
+                            let bytes = packet.serialize();
+
+                            if bytes.is_empty() {
+                                eprintln!(
+                                    "wirepackets persistence failed \
+                                     txid={txid} vout={vout}: \
+                                     packet serialization returned empty bytes"
+                                );
+                                return;
+                            }
+
+                            // Frame each serialized packet with its
+                            // four-byte big-endian payload length.
+                            let Ok(length) = u32::try_from(bytes.len()) else {
+                                eprintln!(
+                                    "wirepackets persistence failed \
+                                     txid={txid} vout={vout}: packet too large"
+                                );
+                                return;
+                            };
+
+                            packets.extend_from_slice(&length.to_be_bytes());
+                            packets.extend_from_slice(&bytes);
+                            packet_count += 1;
+                        }
+
+                        if packet_count == 0 {
+                            eprintln!(
+                                "Bitcoin observation finalized txid={txid}, \
+                                 but produced no wire packets"
+                            );
+                            return;
+                        }
+
+                        match commands::persist_wirepackets(
+                            &substrate,
+                            activation,
+                            &commitment_bytes,
+                            &packets,
+                        ) {
+                            Ok(()) => eprintln!(
+                                "Bitcoin observation finalized txid={} \
+                                 substrate={} activation={} \
+                                 wirepackets={} retained={}",
+                                txid,
+                                substrate,
+                                activation,
+                                packet_count,
+                                retained.len(),
+                            ),
+                            Err(error) => eprintln!(
+                                "wirepackets persistence failed \
+                                 substrate={} activation={} txid={}: {}",
+                                substrate,
+                                activation,
+                                txid,
+                                error,
+                            ),
+                        }
+                    }
+
+                    Ok(None) => eprintln!(
+                        "Bitcoin observation processed txid={txid}; \
+                         no finalized settlement"
+                    ),
+
+                    Err(error) => eprintln!(
+                        "Bitcoin observation failed txid={txid}: {error}"
+                    ),
+                }
             })
             .await
             .map_err(|e| {
                 error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to start Bitcoin observation stream: {e}"),
+                    format!(
+                        "unable to start Bitcoin observation stream: {e}"
+                    ),
                 )
             })?;
 
