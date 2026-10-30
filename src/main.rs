@@ -2337,6 +2337,7 @@ async fn start_bitcoin_observation(
 }
 
 
+
 async fn get_bitcoin_observation(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<ObservationPipelineStatus>> {
@@ -2366,7 +2367,9 @@ async fn get_bitcoin_observation(
     let live = registry.get_mut(&key).ok_or_else(|| {
         error(
             StatusCode::NOT_FOUND,
-            format!("no observation status for substrate={name} activation={activation} network={network}"),
+            format!(
+                "no observation status for substrate={name} activation={activation} network={network}"
+            ),
         )
     })?;
 
@@ -2374,13 +2377,17 @@ async fn get_bitcoin_observation(
     live.status.clips = vec![clip];
     live.status.runtime = serialize_runtime(SystemTime::now());
 
-    if !live.status.running {
+    if !running {
         return Err(error(
             StatusCode::NOT_FOUND,
-            format!("observation stream is not running for substrate={name} activation={activation}"),
+            format!(
+                "observation stream is not running for substrate={name} activation={activation}"
+            ),
         ));
     }
 
+    // submissions is already updated by the stream callback from
+    // pipeline.miner.submissions; do not recalculate it here.
     Ok(Json(live.status.clone()))
 }
 
@@ -2393,7 +2400,7 @@ async fn list_bitcoin_observations(
         ensure_existing_substrate(&name)?;
     }
 
-    // Query the manager once for this substrate + activation.
+    // One manager lookup for the shared (substrate, activation) pipeline.
     let running = observation_stream_running(&name, activation).await;
 
     let clip = observation_clip_status(&name, activation, running)
@@ -2411,6 +2418,7 @@ async fn list_bitcoin_observations(
             live.status.clips = vec![clip.clone()];
             live.status.runtime = serialize_runtime(SystemTime::now());
 
+            // Keep the callback-supplied shared pipeline submissions count.
             live.status.running.then(|| live.status.clone())
         })
         .collect();
@@ -2462,8 +2470,7 @@ async fn stop_bitcoin_observation(
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        // The stream is shared per (substrate, activation), so every network
-        // entry for it is no longer running once it is stopped.
+        // The stream is shared per (substrate, activation).
         if stopped {
             for (entry_key, live) in registry.iter_mut() {
                 if entry_key.0 == name && entry_key.1 == activation {
@@ -2474,22 +2481,28 @@ async fn stop_bitcoin_observation(
 
         match registry.remove(&key) {
             Some(live) => live.status,
+
             None if stopped => ObservationPipelineStatus {
                 substrate: name.clone(),
                 activation,
                 network: network.clone(),
                 commitment: commitment.clone(),
-                listen_port: listen_port_from_commitment(&commitment, None).unwrap_or(0),
+                listen_port: listen_port_from_commitment(&commitment, None)
+                    .unwrap_or(0),
                 running: false,
                 path: None,
                 clips: Vec::new(),
+                submissions: 0,
                 runtime: serialize_runtime(SystemTime::now()),
                 message: String::new(),
             },
+
             None => {
                 return Err(error(
                     StatusCode::NOT_FOUND,
-                    format!("no observation status for substrate={name} activation={activation} network={network}"),
+                    format!(
+                        "no observation status for substrate={name} activation={activation} network={network}"
+                    ),
                 ));
             }
         }
@@ -2507,6 +2520,7 @@ async fn stop_bitcoin_observation(
 
     Ok(Json(status))
 }
+
 
 /*
  * Payload board — exclusive API entry into shared payload state (payload.rs).
