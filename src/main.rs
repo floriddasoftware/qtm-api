@@ -24,6 +24,11 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+use std::process::Stdio;
+use tokio::{
+    process::{Child, Command},
+    sync::Mutex as AsyncMutex,
+};
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
 const MAX_SUBSTRATE_NAME_LENGTH: usize = 64;
@@ -2274,6 +2279,63 @@ fn bit_minner_enabled() -> bool {
     cfg!(feature = "bit-miner")
 }
 
+#[derive(Serialize)]
+struct BitMinerProcessEntry {
+    substrate: String,
+    activation: u64,
+    running: bool,
+    pid: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct BitMinerProcessListResponse {
+    substrate: String,
+    activation: u64,
+    pipelines: Vec<BitMinerProcessEntry>,
+}
+
+async fn list_bitcoin_observations(
+    Path((name, activation)): Path<(String, u64)>,
+) -> ApiResult<Json<BitMinerProcessListResponse>> {
+    if !valid_substrate_name(&name) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    }
+
+    let mut processes = bit_miner_processes().lock().await;
+    let key = (name.clone(), activation);
+
+    let mut pipelines = Vec::new();
+
+    if let Some(child) = processes.get_mut(&key) {
+        match child.try_wait() {
+            Ok(None) => {
+                pipelines.push(BitMinerProcessEntry {
+                    substrate: name.clone(),
+                    activation,
+                    running: true,
+                    pid: child.id(),
+                });
+            }
+            Ok(Some(_)) => {
+                processes.remove(&key);
+            }
+            Err(io_error) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect bit-miner process: {io_error}"),
+                ));
+            }
+        }
+    }
+
+    Ok(Json(BitMinerProcessListResponse {
+        substrate: name,
+        activation,
+        pipelines,
+    }))
+}
+
+
 fn build_payload_board(
     name: &str,
     activation: u64,
@@ -2521,12 +2583,14 @@ async fn serve() {
         )
         .route(
     "/wallets/:name/activations/:activation/networks/:network/observation",
-    post(start_bitminer).options(preflight),
+    get(get_bitminer_status)
+        .post(start_bitminer)
+        .options(preflight),
 )
-        .route(
-            "/wallets/:name/activations/:activation/observations",
-            get(list_bitcoin_observations).options(preflight),
-        )
+.route(
+    "/wallets/:name/activations/:activation/observations",
+    get(list_bitcoin_observations).options(preflight),
+)
         // Payload board — exclusive entry into shared payload state (payload.rs).
         // Opened from Observation; not a second persistence layer.
         .route(
