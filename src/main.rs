@@ -327,6 +327,7 @@ struct ObservationPipelineStatus {
     running: bool,
     path: Option<String>,
     clips: Vec<ObservationClipStatus>,
+    submissions: usize,
     runtime: RuntimeResponse,
     message: String,
 }
