@@ -2176,6 +2176,100 @@ fn collect_depth_for_activation_network(
     }
 }
 
+type BitMinerKey = (String, u64);
+
+static BIT_MINER_PROCESSES: OnceLock<AsyncMutex<HashMap<BitMinerKey, Child>>> =
+    OnceLock::new();
+
+fn bit_miner_processes(
+) -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
+    BIT_MINER_PROCESSES.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+#[derive(Serialize)]
+struct BitMinerStartResponse {
+    substrate: String,
+    activation: u64,
+    pid: Option<u32>,
+    already_running: bool,
+    message: String,
+}
+
+async fn start_bitminer(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<BitMinerStartResponse>> {
+    if !valid_substrate_name(&name) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    }
+
+    if !valid_observation_network_id(&network)
+        || !is_bitcoin_network_id(&network)
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid Bitcoin network identifier",
+        ));
+    }
+
+    ensure_existing_substrate(&name)?;
+
+    let key = (name.clone(), activation);
+    let mut processes = bit_miner_processes().lock().await;
+
+    if let Some(child) = processes.get_mut(&key) {
+        match child.try_wait() {
+            Ok(None) => {
+                return Ok(Json(BitMinerStartResponse {
+                    substrate: name,
+                    activation,
+                    pid: child.id(),
+                    already_running: true,
+                    message: "bit-miner process is already running".into(),
+                }));
+            }
+            Ok(Some(_)) => {
+                processes.remove(&key);
+            }
+            Err(io_error) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect bit-miner process: {io_error}"),
+                ));
+            }
+        }
+    }
+
+    let executable = std::env::var_os("BIT_MINER_BIN")
+        .unwrap_or_else(|| "bit-miner".into());
+
+    let bitminer = Command::new(executable)
+        .arg(activation.to_string())
+        .arg(&name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|io_error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start bit-miner: {io_error}"),
+            )
+        })?;
+
+    let pid = bitminer.id();
+    processes.insert(key, bitminer);
+
+    Ok(Json(BitMinerStartResponse {
+        substrate: name,
+        activation,
+        pid,
+        already_running: false,
+        message: "bit-miner process started".into(),
+    }))
+}
+
+
 fn bit_minner_enabled() -> bool {
     cfg!(feature = "bit-miner")
 }
@@ -2426,12 +2520,9 @@ async fn serve() {
             post(exile_wallet).options(preflight),
         )
         .route(
-            "/wallets/:name/activations/:activation/networks/:network/observation",
-            get(get_bitcoin_observation)
-                .post(start_bitcoin_observation)
-                .delete(stop_bitcoin_observation)
-                .options(preflight),
-        )
+    "/wallets/:name/activations/:activation/networks/:network/observation",
+    post(start_bitminer).options(preflight),
+)
         .route(
             "/wallets/:name/activations/:activation/observations",
             get(list_bitcoin_observations).options(preflight),
