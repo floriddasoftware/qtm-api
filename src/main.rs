@@ -2274,6 +2274,75 @@ async fn start_bitminer(
     }))
 }
 
+#[derive(Serialize)]
+struct BitMinerStatusResponse {
+    substrate: String,
+    activation: u64,
+    network: String,
+    running: bool,
+    pid: Option<u32>,
+    path: Option<String>,
+    clips: Vec<ObservationClipStatus>,
+    runtime: RuntimeResponse,
+}
+
+async fn get_bitminer_status(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<BitMinerStatusResponse>> {
+    if !valid_substrate_name(&name) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid substrate name",
+        ));
+    }
+
+    if !valid_observation_network_id(&network)
+        || !is_bitcoin_network_id(&network)
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid Bitcoin network identifier",
+        ));
+    }
+
+    ensure_existing_substrate(&name)?;
+
+    let key = (name.clone(), activation);
+    let mut processes = bit_miner_processes().lock().await;
+
+    let (running, pid) = if let Some(child) = processes.get_mut(&key) {
+        match child.try_wait() {
+            Ok(None) => (true, child.id()),
+
+            Ok(Some(_status)) => {
+                processes.remove(&key);
+                (false, None)
+            }
+
+            Err(io_error) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect bit-miner process: {io_error}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        (false, None)
+    };
+
+    Ok(Json(BitMinerStatusResponse {
+        substrate: name,
+        activation,
+        network,
+        running,
+        pid,
+        path: None,
+        clips: Vec::new(),
+        runtime: serialize_runtime(SystemTime::now()),
+    }))
+}
 
 fn bit_minner_enabled() -> bool {
     cfg!(feature = "bit-miner")
