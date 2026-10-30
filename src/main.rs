@@ -2200,6 +2200,39 @@ struct BitMinerStartResponse {
     message: String,
 }
 
+fn bitminer_commitment(
+    substrate: &str,
+    substrate_path: &FsPath,
+    activation: u64,
+) -> ApiResult<String> {
+    // Prefer the persisted event commitment for this activation.
+    if let Some(event_path) =
+        commands::event_path_at_activation(substrate, activation)
+    {
+        if event_path.is_dir() {
+            let commitment =
+                read_trim(&event_path.join("qtm.commitment"))
+                    .filter(|value| !value.trim().is_empty());
+
+            if let Some(commitment) = commitment {
+                return Ok(commitment.trim().to_string());
+            }
+        }
+    }
+
+    // Fall back to the substrate commitment when no event is available.
+    let commitment = read_substrate_commitment(substrate_path)?;
+
+    if commitment.trim().is_empty() {
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "substrate qtm.commitment is empty",
+        ));
+    }
+
+    Ok(commitment.trim().to_string())
+}
+
 async fn start_bitminer(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<BitMinerStartResponse>> {
@@ -2216,9 +2249,9 @@ async fn start_bitminer(
         ));
     }
 
-    ensure_existing_substrate(&name)?;
+    let substrate_path = ensure_existing_substrate(&name)?;
+    let key = bitminer_commitment(&name, &substrate_path, activation)?;
 
-    let key = (name.clone(), activation);
     let mut processes = bit_miner_processes().lock().await;
 
     if let Some(child) = processes.get_mut(&key) {
@@ -2235,10 +2268,10 @@ async fn start_bitminer(
             Ok(Some(_)) => {
                 processes.remove(&key);
             }
-            Err(io_error) => {
+            Err(e) => {
                 return Err(error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect bit-miner process: {io_error}"),
+                    format!("unable to inspect bit-miner process: {e}"),
                 ));
             }
         }
@@ -2247,7 +2280,7 @@ async fn start_bitminer(
     let executable = std::env::var_os("BIT_MINER_BIN")
         .unwrap_or_else(|| "bit-miner".into());
 
-    let bitminer = Command::new(executable)
+    let child = Command::new(executable)
         .arg(activation.to_string())
         .arg(&name)
         .stdin(Stdio::null())
@@ -2255,15 +2288,15 @@ async fn start_bitminer(
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|io_error| {
+        .map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to start bit-miner: {io_error}"),
+                format!("failed to start bit-miner: {e}"),
             )
         })?;
 
-    let pid = bitminer.id();
-    processes.insert(key, bitminer);
+    let pid = child.id();
+    processes.insert(key, child);
 
     Ok(Json(BitMinerStartResponse {
         substrate: name,
@@ -2273,6 +2306,7 @@ async fn start_bitminer(
         message: "bit-miner process started".into(),
     }))
 }
+
 
 #[derive(Serialize)]
 struct BitMinerStatusResponse {
@@ -2305,32 +2339,31 @@ async fn get_bitminer_status(
         ));
     }
 
-    ensure_existing_substrate(&name)?;
+    let substrate_path = ensure_existing_substrate(&name)?;
+    let key = bitminer_commitment(&name, &substrate_path, activation)?;
 
-    let key = (name.clone(), activation);
     let mut processes = bit_miner_processes().lock().await;
 
-    let (running, pid) = if let Some(child) = processes.get_mut(&key) {
-        match child.try_wait() {
-            Ok(None) => (true, child.id()),
+    let (running, pid, remove_process) =
+        match processes.get_mut(&key) {
+            Some(child) => match child.try_wait() {
+                Ok(None) => (true, child.id(), false),
+                Ok(Some(_status)) => (false, None, true),
+                Err(io_error) => {
+                    return Err(error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "unable to inspect bit-miner process: {io_error}"
+                        ),
+                    ));
+                }
+            },
+            None => (false, None, false),
+        };
 
-            Ok(Some(_status)) => {
-                processes.remove(&key);
-                (false, None)
-            }
-
-            Err(io_error) => {
-                return Err(error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "unable to inspect bit-miner process: {io_error}"
-                    ),
-                ));
-            }
-        }
-    } else {
-        (false, None)
-    };
+    if remove_process {
+        processes.remove(&key);
+    }
 
     Ok(Json(BitMinerStatusResponse {
         substrate: name,
