@@ -2399,35 +2399,46 @@ async fn list_bitcoin_observations(
     Path((name, activation)): Path<(String, u64)>,
 ) -> ApiResult<Json<BitMinerProcessListResponse>> {
     if !valid_substrate_name(&name) {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid substrate name",
+        ));
     }
 
+    let substrate_path = ensure_existing_substrate(&name)?;
+    let key = bitminer_commitment(&name, &substrate_path, activation)?;
+
     let mut processes = bit_miner_processes().lock().await;
-    let key = (name.clone(), activation);
 
-    let mut pipelines = Vec::new();
-
-    if let Some(child) = processes.get_mut(&key) {
-        match child.try_wait() {
-            Ok(None) => {
-                pipelines.push(BitMinerProcessEntry {
+    let (entry, remove_process) = match processes.get_mut(&key) {
+        Some(child) => match child.try_wait() {
+            Ok(None) => (
+                Some(BitMinerProcessEntry {
                     substrate: name.clone(),
                     activation,
                     running: true,
                     pid: child.id(),
-                });
-            }
-            Ok(Some(_)) => {
-                processes.remove(&key);
-            }
+                }),
+                false,
+            ),
+            Ok(Some(_)) => (None, true),
             Err(io_error) => {
                 return Err(error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect bit-miner process: {io_error}"),
+                    format!(
+                        "unable to inspect bit-miner process: {io_error}"
+                    ),
                 ));
             }
-        }
+        },
+        None => (None, false),
+    };
+
+    if remove_process {
+        processes.remove(&key);
     }
+
+    let pipelines = entry.into_iter().collect();
 
     Ok(Json(BitMinerProcessListResponse {
         substrate: name,
@@ -2435,7 +2446,6 @@ async fn list_bitcoin_observations(
         pipelines,
     }))
 }
-
 
 fn build_payload_board(
     name: &str,
