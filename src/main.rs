@@ -1992,10 +1992,11 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     )))
 }
 
+
 /* ---------- Observation stream lifecycle (bit_minner manager) ----------
  *
  * The API no longer spawns a bit-miner OS process. The long-lived Mempool.space
- * stream is owned by bit_minner::observestream::ObservationStreamManager, which
+ * stream is owned by bit_miner::observestream::ObservationStreamManager, which
  * keeps exactly one stream + pipeline per (substrate, activation). Network
  * routes share that stream. OBSERVATION_REGISTRY remains the HTTP status map.
  */
@@ -2083,9 +2084,7 @@ async fn start_bitcoin_observation(
         ));
     }
 
-    // The std Mutex guard is scoped so it is dropped before any .await.
-    // Load the activation-scoped QTM — this is the same 32-byte commitment
-    // that travels on every WirePacket.
+    // Load the activation-scoped QTM commitment.
     let commitment_bytes = {
         let lock = substrate_lock(&name);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -2095,11 +2094,9 @@ async fn start_bitcoin_observation(
     };
 
     let commitment = hex::encode(commitment_bytes);
-
     let request = body.map(|Json(value)| value).unwrap_or_default();
 
-    // Candidate value derived from the commitment; this WebSocket stream does
-    // not bind an Electrum listener.
+    // Candidate derived from the commitment; this stream does not bind a listener.
     let listen_port = listen_port_from_commitment(&commitment, request.listen_port)
         .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
 
@@ -2109,22 +2106,73 @@ async fn start_bitcoin_observation(
         .filter(|value| !value.is_empty());
 
     #[cfg(feature = "bit-miner")]
-    let running = {
+    {
         let manager =
             bit_miner::observestream::ObservationStreamManager::global();
 
-        let substrate = name.clone();
+        let key = observation_key(&name, activation, &network);
 
-        // Binary commitment already loaded from the activation-scoped QTM.
-        // It is passed into finalized.wire_packet(..) and plays no part in
-        // the wirepackets file path.
+        // Publish the initial status before starting the stream so an early
+        // callback cannot arrive before its live submission count has a place.
+        let initial_clip = observation_clip_status(&name, activation, false)
+            .map_err(|message| {
+                error(StatusCode::INTERNAL_SERVER_ERROR, message)
+            })?;
+
+        let initial_status = ObservationPipelineStatus {
+            substrate: name.clone(),
+            activation,
+            network: network.clone(),
+            commitment: commitment.clone(),
+            listen_port,
+            running: false,
+            path: path_hint,
+            clips: vec![initial_clip],
+            submissions: 0,
+            runtime: serialize_runtime(SystemTime::now()),
+            message: format!(
+                "Starting Bitcoin observation stream substrate={name} \
+                 activation={activation} network={network}"
+            ),
+        };
+
+        observation_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                key.clone(),
+                LiveObservation {
+                    status: initial_status,
+                },
+            );
+
+        let callback_substrate = name.clone();
+
+        // This is the actual shared pipeline counter supplied by
+        // MempoolSpaceStream after processing each transaction.
         let commitment_bytes = commitment_bytes;
 
-        manager
-            .start(&name, activation, move |txid, outcome| {
+        if let Err(start_error) = manager
+            .start(&name, activation, move |txid, outcome, submissions| {
+                // One counter belongs to the shared (substrate, activation)
+                // pipeline. Update every network status representing that pipeline.
+                {
+                    let mut registry = observation_registry()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+
+                    for (entry_key, live) in registry.iter_mut() {
+                        if entry_key.0.as_str() == callback_substrate.as_str()
+                            && entry_key.1 == activation
+                        {
+                            live.status.submissions = submissions;
+                        }
+                    }
+                }
+
                 match outcome {
                     Ok(Some((finalized, retained))) => {
-                        // Store the actual serialized packets from the
+                        // Persist the actual serialized packets from the
                         // finalized transaction, not reconstructed payloads.
                         let mut packets = Vec::<u8>::new();
                         let mut packet_count = 0usize;
@@ -2173,33 +2221,36 @@ async fn start_bitcoin_observation(
                         if packet_count == 0 {
                             eprintln!(
                                 "Bitcoin observation finalized txid={txid}, \
-                                 but produced no wire packets"
+                                 but produced no wire packets; submissions={submissions}"
                             );
                             return;
                         }
 
                         // Path: activations/<activation>/event/wirepackets
                         match commands::persist_wirepackets(
-                            &substrate,
+                            &callback_substrate,
                             activation,
                             &packets,
                         ) {
                             Ok(()) => eprintln!(
                                 "Bitcoin observation finalized txid={} \
                                  substrate={} activation={} \
-                                 wirepackets={} retained={}",
+                                 submissions={} wirepackets={} retained={}",
                                 txid,
-                                substrate,
+                                callback_substrate,
                                 activation,
+                                submissions,
                                 packet_count,
                                 retained.len(),
                             ),
                             Err(error) => eprintln!(
                                 "wirepackets persistence failed \
-                                 substrate={} activation={} txid={}: {}",
-                                substrate,
+                                 substrate={} activation={} txid={} \
+                                 submissions={}: {}",
+                                callback_substrate,
                                 activation,
                                 txid,
+                                submissions,
                                 error,
                             ),
                         }
@@ -2207,62 +2258,84 @@ async fn start_bitcoin_observation(
 
                     Ok(None) => eprintln!(
                         "Bitcoin observation processed txid={txid}; \
-                         no finalized settlement"
+                         no finalized settlement; submissions={submissions}"
                     ),
 
                     Err(error) => eprintln!(
-                        "Bitcoin observation failed txid={txid}: {error}"
+                        "Bitcoin observation failed txid={txid}; \
+                         submissions={submissions}: {error}"
                     ),
                 }
             })
             .await
-            .map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "unable to start Bitcoin observation stream: {e}"
-                    ),
-                )
+        {
+            observation_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to start Bitcoin observation stream: {start_error}"
+                ),
+            ));
+        }
+
+        let running = manager.is_running(&name, activation).await;
+
+        let clip = observation_clip_status(&name, activation, running)
+            .map_err(|message| {
+                error(StatusCode::INTERNAL_SERVER_ERROR, message)
             })?;
 
-        manager.is_running(&name, activation).await
-    };
+        // Update the existing status instead of replacing it. A callback may
+        // already have supplied a nonzero submissions count while start awaited.
+        let status = {
+            let mut registry = observation_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
 
+            let Some(live) = registry.get_mut(&key) else {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "observation status disappeared while starting the stream",
+                ));
+            };
+
+            live.status.running = running;
+            live.status.clips = vec![clip];
+            live.status.runtime = serialize_runtime(SystemTime::now());
+            live.status.message = format!(
+                "Bitcoin observation stream started substrate={name} \
+                 activation={activation} network={network} \
+                 commitment={commitment} listen_port_candidate={listen_port}"
+            );
+
+            live.status.clone()
+        };
+
+        return Ok(Json(status));
+    }
 
     #[cfg(not(feature = "bit-miner"))]
-    let running: bool = return Err(error(
-        StatusCode::NOT_IMPLEMENTED,
-        "qtm-api was built without the bit-minner feature",
-    ));
-
-    let clip = observation_clip_status(&name, activation, running)
-        .map_err(|message| error(StatusCode::INTERNAL_SERVER_ERROR, message))?;
-
-    let status = ObservationPipelineStatus {
-        substrate: name.clone(),
-        activation,
-        network: network.clone(),
-        commitment: commitment.clone(),
-        listen_port,
-        running,
-        path: path_hint,
-        clips: vec![clip],
-        runtime: serialize_runtime(SystemTime::now()),
-        message: format!(
-            "Bitcoin observation stream started substrate={name} activation={activation} network={network} commitment={commitment} listen_port_candidate={listen_port}"
-        ),
-    };
-
-    observation_registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            observation_key(&name, activation, &network),
-            LiveObservation { status: status.clone() },
+    {
+        let _ = (
+            name,
+            activation,
+            network,
+            commitment,
+            listen_port,
+            path_hint,
         );
 
-    Ok(Json(status))
+        Err(error(
+            StatusCode::NOT_IMPLEMENTED,
+            "qtm-api was built without the bit-miner feature",
+        ))
+    }
 }
+
 
 async fn get_bitcoin_observation(
     Path((name, activation, network)): Path<(String, u64, String)>,
