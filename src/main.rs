@@ -2181,13 +2181,12 @@ fn collect_depth_for_activation_network(
     }
 }
 
-type BitMinerKey = (String, u64);
+type BitMinerKey = String;
 
 static BIT_MINER_PROCESSES: OnceLock<AsyncMutex<HashMap<BitMinerKey, Child>>> =
     OnceLock::new();
 
-fn bit_miner_processes(
-) -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
+fn bit_miner_processes() -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
     BIT_MINER_PROCESSES.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
