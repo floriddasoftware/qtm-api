@@ -2076,17 +2076,24 @@ async fn start_bitcoin_observation(
     if !is_bitcoin_network_id(&network) {
         return Err(error(
             StatusCode::BAD_REQUEST,
-            format!("observation pipeline currently supports Bitcoin networks only; got: {network}"),
+            format!(
+                "observation pipeline currently supports Bitcoin networks only; got: {network}"
+            ),
         ));
     }
 
     // The std Mutex guard is scoped so it is dropped before any .await.
-    let commitment = {
+    // Load the activation-scoped QTM — this is the same 32-byte commitment
+    // that travels on every WirePacket.
+    let commitment_bytes = {
         let lock = substrate_lock(&name);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let substrate_path = ensure_existing_substrate(&name)?;
-        read_substrate_commitment(&substrate_path)?
+        let _substrate_path = ensure_existing_substrate(&name)?;
+        let qtm = commands::load_qtm_at_activation(&name, activation);
+        qtm.commitment
     };
+
+    let commitment = hex::encode(commitment_bytes);
 
     let request = body.map(|Json(value)| value).unwrap_or_default();
 
@@ -2100,24 +2107,17 @@ async fn start_bitcoin_observation(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-           #[cfg(feature = "bit-miner")]
+    #[cfg(feature = "bit-miner")]
     let running = {
         let manager =
             bit_miner::observestream::ObservationStreamManager::global();
 
         let substrate = name.clone();
 
-        // Needed only by `finalized.wire_packet(..)`. It is decoded once here,
-        // not per transaction, and plays no part in the wirepackets file path.
-        let commitment_bytes: [u8; 32] = hex::decode(commitment.trim())
-            .ok()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .ok_or_else(|| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "substrate commitment must decode to exactly 32 bytes",
-                )
-            })?;
+        // Binary commitment already loaded from the activation-scoped QTM.
+        // It is passed into finalized.wire_packet(..) and plays no part in
+        // the wirepackets file path.
+        let commitment_bytes = commitment_bytes;
 
         manager
             .start(&name, activation, move |txid, outcome| {
