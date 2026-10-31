@@ -2284,27 +2284,7 @@ async fn start_bitminer(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<BitMinerStartResponse>> {
     validate_bitminer_scope(&name, &network)?;
-
-    let substrate_path = ensure_existing_substrate(&name)?;
-
-    let active = substrate_active_activation(&substrate_path)
-        .ok_or_else(|| {
-            error(
-                StatusCode::CONFLICT,
-                format!(
-                    "unable to read the active clip for substrate '{name}'"
-                ),
-            )
-        })?;
-
-    if active != activation {
-        return Err(error(
-            StatusCode::CONFLICT,
-            format!(
-                "active clip mismatch: substrate='{name}', requested_activation={activation}, active_activation={active}"
-            ),
-        ));
-    }
+    ensure_existing_substrate(&name)?;
 
     if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
         return Err(error(
@@ -2390,18 +2370,14 @@ async fn start_bitminer(
 
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "bit-miner exited at startup ({status}): {detail}"
-                ),
+                format!("bit-miner exited at startup ({status}): {detail}"),
             ));
         }
         Ok(None) => {}
         Err(io_error) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "unable to inspect bit-miner process: {io_error}"
-                ),
+                format!("unable to inspect bit-miner process: {io_error}"),
             ));
         }
     }
