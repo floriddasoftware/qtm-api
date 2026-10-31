@@ -1,6 +1,7 @@
 use axum::{
     extract::Path,
-    http::{Method, StatusCode},
+    http::{header, Method, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
@@ -307,14 +308,6 @@ struct ActivationBudgetsResponse {
     budgets: Vec<NetworkBudgetEntry>,
 }
 
-#[derive(Deserialize, Default)]
-struct ObservationStartRequest {
-    #[serde(default)]
-    listen_port: Option<u16>,
-    #[serde(default)]
-    path: Option<String>,
-}
-
 #[derive(Serialize, Clone)]
 struct ObservationClipStatus {
     substrate: String,
@@ -322,39 +315,21 @@ struct ObservationClipStatus {
     direction: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
-struct ObservationPipelineStatus {
-    substrate: String,
-    activation: u64,
-    network: String,
-    commitment: String,
-    listen_port: u16,
-    running: bool,
-    path: Option<String>,
-    clips: Vec<ObservationClipStatus>,
-    submissions: usize,
-    runtime: RuntimeResponse,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct ObservationListResponse {
-    substrate: String,
-    activation: u64,
-    pipelines: Vec<ObservationPipelineStatus>,
-}
-
-struct LiveObservation {
-    status: ObservationPipelineStatus,
-}
-
 #[derive(Serialize)]
 struct WirePacketsResponse {
     substrate: String,
     activation: u64,
     network: String,
+    /// Wire packets are persisted once per activation for Bitcoin settlement.
+    /// The network id only selects that (Bitcoin) scope.
+    scope: &'static str,
+    /// Canonical path from qp_hd::commands::wirepackets_path, the same
+    /// resolver bit-miner's persist_wirepackets() writes through.
     path: String,
     exists: bool,
+    bytes: Option<u64>,
+    /// Route that returns the raw file; present only when the file exists.
+    file_route: Option<String>,
     packets: Vec<WirePacketEntry>,
 }
 
@@ -365,117 +340,135 @@ struct WirePacketEntry {
     bytes: u64,
 }
 
+const WIREPACKETS_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Canonical persisted wire-packet file:
-/// ~/.qp/substrates/<substrate>/activations/<activation>/event/wirepackets
-fn wirepackets_file_path(substrate_path: &FsPath, activation: u64) -> PathBuf {
-    substrate_path
-        .join("activations")
-        .join(activation.to_string())
-        .join("event")
-        .join("wirepackets")
-}
+fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
+    if !valid_substrate_name(name) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    }
 
-async fn get_wirepackets(
-    Path((name, activation, network)): Path<(String, u64, String)>,
-) -> ApiResult<Json<WirePacketsResponse>> {
-    if !valid_observation_network_id(&network) {
+    if !valid_observation_network_id(network) {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid network identifier",
         ));
     }
 
+    if !is_bitcoin_network_id(network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "wire packets are persisted for Bitcoin settlement only",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Metadata for the persisted wire-packet file. A missing file is reported as
+/// `exists: false`; nothing is fabricated.
+async fn get_wirepackets(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<WirePacketsResponse>> {
+    validate_wirepackets_scope(&name, &network)?;
+
     let lock = substrate_lock(&name);
     let _guard = lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let substrate_path = ensure_existing_substrate(&name)?;
-    let path = wirepackets_file_path(&substrate_path, activation);
+    ensure_existing_substrate(&name)?;
 
-    // `persist_wirepackets()` writes one file, not a directory.
-    let exists = path.is_file();
-    let mut packets = Vec::new();
+    let path = commands::wirepackets_path(&name, activation);
 
-    if exists {
-        let metadata = std::fs::metadata(&path).map_err(|e| {
-            error(
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+        Ok(_) => None,
+        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(io_error) => {
+            return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect wire-packets file: {e}"),
-            )
-        })?;
+                format!("unable to inspect wire-packets file: {io_error}"),
+            ));
+        }
+    };
 
-        packets.push(WirePacketEntry {
+    let bytes = metadata.as_ref().map(|metadata| metadata.len());
+    let exists = bytes.is_some();
+
+    let packets = bytes
+        .map(|bytes| WirePacketEntry {
             name: "wirepackets".to_owned(),
             path: path.display().to_string(),
-            bytes: metadata.len(),
-        });
-    }
+            bytes,
+        })
+        .into_iter()
+        .collect();
 
     Ok(Json(WirePacketsResponse {
+        file_route: exists.then(|| {
+            format!(
+                "/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"
+            )
+        }),
         substrate: name,
         activation,
         network,
+        scope: "activation/bitcoin",
         path: path.display().to_string(),
         exists,
+        bytes,
         packets,
     }))
 }
 
+/// Raw bytes of the persisted wire-packet file.
+async fn get_wirepackets_file(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Response> {
+    validate_wirepackets_scope(&name, &network)?;
 
-type ObservationKey = (String, u64, String);
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-static OBSERVATION_REGISTRY: OnceLock<Mutex<HashMap<ObservationKey, LiveObservation>>> =
-    OnceLock::new();
+    ensure_existing_substrate(&name)?;
 
-fn observation_registry() -> &'static Mutex<HashMap<ObservationKey, LiveObservation>> {
-    OBSERVATION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
+    let path = commands::wirepackets_path(&name, activation);
 
-fn observation_key(
-    substrate: &str,
-    activation: u64,
-    network: &str,
-) -> ObservationKey {
-    (
-        substrate.to_string(),
-        activation,
-        network.to_string(),
-    )
-}
+    let metadata = std::fs::metadata(&path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                format!("no wire-packets file at {}", path.display()),
+            )
+        })?;
 
-fn read_substrate_commitment(substrate_path: &FsPath) -> ApiResult<String> {
-    required_file(&substrate_path.join("qtm.commitment"))
-}
-
-fn listen_port_from_commitment(
-    commitment: &str,
-    preferred: Option<u16>,
-) -> Result<u16, String> {
-    if let Some(port) = preferred {
-        if (1024..=65535).contains(&port) {
-            return Ok(port);
-        }
-
-        return Err(format!(
-            "invalid observation listen port {port}; expected 1024..=65535"
+    if metadata.len() > WIREPACKETS_MAX_BYTES {
+        return Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "wire-packets file is {} bytes; the limit is {WIREPACKETS_MAX_BYTES}",
+                metadata.len()
+            ),
         ));
     }
 
-    let commitment = commitment.trim();
+    let bytes = std::fs::read(&path).map_err(|io_error| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to read wire-packets file: {io_error}"),
+        )
+    })?;
 
-    if commitment.is_empty() {
-        return Err("qtm.commitment is empty".to_string());
-    }
-
-    let mut acc: u32 = 0;
-
-    for byte in commitment.bytes() {
-        acc = acc.wrapping_mul(31).wrapping_add(u32::from(byte));
-    }
-
-    Ok(20_000 + (acc % 20_000) as u16)
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
 }
 
 fn is_bitcoin_network_id(network: &str) -> bool {
@@ -502,125 +495,77 @@ fn valid_observation_network_id(network: &str) -> bool {
 
 // Active clip rule, identical to bit-miner's Miner::new: a substrate is an
 // active clip for an activation only when its `activation` file holds exactly
-// that number. Pure file read, so it cannot panic like the pipeline can.
+// that number. Pure file reads, so nothing here can panic like the miner can.
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
     read_trim(&substrate_path.join("activation"))
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
-// bit-miner's Miner::submit reads `events/event_<activation>` as a FILE, while
-// qp_hd's persisted records are directories named `event_<activation>_<dimension>`.
-// Accept either so the check matches whichever layout the miner is built for.
-fn stored_event_exists(substrate_path: &FsPath, activation: u64) -> bool {
-    let events = substrate_path.join("events");
-
-    if events.join(format!("event_{activation}")).is_file() {
-        return true;
-    }
-
-    let prefix = format!("event_{activation}_");
-
-    std::fs::read_dir(&events)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry.path().is_dir()
-                    && entry.file_name().to_string_lossy().starts_with(&prefix)
-            })
+// Every active clip for an activation, in name order, exactly as the miner
+// discovers them under substrate_root().
+fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
+    let mut names: Vec<String> = std::fs::read_dir(commands::substrate_root())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| {
+            substrate_active_activation(&entry.path()) == Some(activation)
         })
-        .unwrap_or(false)
-}
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
 
-fn active_bitminer_clips(
-    substrate_path: &FsPath,
-    substrate: &str,
-    activation: u64,
-) -> Vec<ObservationClipStatus> {
-    match substrate_active_activation(substrate_path) {
-        Some(active) if active == activation => vec![ObservationClipStatus {
-            substrate: substrate.to_string(),
+    names.sort();
+
+    names
+        .into_iter()
+        .map(|substrate| ObservationClipStatus {
+            substrate,
             active: true,
             direction: None,
-        }],
-        _ => Vec::new(),
-    }
+        })
+        .collect()
 }
 
-#[allow(dead_code)]
-fn init_bitcoin_observation_clips(
-    activation: u64,
-    substrate: &str,
-) -> Result<Vec<ObservationClipStatus>, String> {
-    if substrate.trim().is_empty() {
-        return Err("substrate must not be empty".to_string());
+// Resolve the persisted event with the same resolver bit-miner uses
+// (qp_hd::commands::event_path_at_activation) and confirm its depth loads
+// (qp_hd::commands::load_depth), so the API never accepts an event layout the
+// miner cannot actually load.
+fn resolve_stored_event(name: &str, activation: u64) -> ApiResult<PathBuf> {
+    let stored = commands::event_path_at_activation(name, activation)
+        .ok_or_else(|| {
+            error(
+                StatusCode::CONFLICT,
+                format!(
+                    "No stored event for substrate '{name}' at activation {activation} \
+                     (expected {}/events/event_{activation}_<dimension>). Run a transit \
+                     first. On Render the disk is wiped on every deploy unless a \
+                     persistent disk is mounted for ~/.qp.",
+                    commands::substrate_root().join(name).display()
+                ),
+            )
+        })?;
+
+    if !stored.is_dir() {
+        return Err(error(
+            StatusCode::CONFLICT,
+            format!("stored event is not a directory: {}", stored.display()),
+        ));
     }
 
-    #[cfg(feature = "bit-miner")]
-    {
-        // Miner::new asserts when no substrate is active at this activation;
-        // verify first so this returns an Err instead of panicking.
-        let substrate_path = ensure_existing_substrate(substrate)
-            .map_err(|(_, Json(body))| body.error)?;
+    guarded("depth load", || commands::load_depth(&stored))?.map_err(
+        |io_error| {
+            error(
+                StatusCode::CONFLICT,
+                format!(
+                    "Depth unavailable for stored event {}: {io_error}",
+                    stored.display()
+                ),
+            )
+        },
+    )?;
 
-        match substrate_active_activation(&substrate_path) {
-            Some(active) if active == activation => {}
-            Some(active) => {
-                return Err(format!(
-                    "no active clip for activation {activation}: substrate \
-                     '{substrate}' is at activation {active}"
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "no active clip for activation {activation}: unable to \
-                     read the activation of substrate '{substrate}'"
-                ));
-            }
-        }
-
-        let pipeline =
-            bit_miner::BitcoinObservationPipeline::new(activation, substrate)
-                .map_err(|error| {
-                    format!(
-                        "failed to initialize Bitcoin observation pipeline \
-                         for substrate '{substrate}' at activation {activation}: \
-                         {error}"
-                    )
-                })?;
-
-        let clips = pipeline.miner().clips.iter().map(|clip| {
-            let window =
-                bit_miner::RenderState::window(clip.substrate.clone());
-
-            ObservationClipStatus {
-                substrate: window.substrate,
-                active: window.active,
-                direction: None,
-            }
-        });
-
-        let mut windows: Vec<ObservationClipStatus> = clips.collect();
-
-        if windows.is_empty() {
-            windows.push(ObservationClipStatus {
-                substrate: substrate.to_string(),
-                active: true,
-                direction: None,
-            });
-        }
-
-        Ok(windows)
-    }
-
-    #[cfg(not(feature = "bit-miner"))]
-    {
-        let _ = activation;
-
-        Ok(vec![ObservationClipStatus {
-            substrate: substrate.to_string(),
-            active: true,
-            direction: None,
-        }])
-    }
+    Ok(stored)
 }
 
 static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -2068,23 +2013,16 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
 
 
 /*
- * Payload board — exclusive API entry into shared payload state (payload.rs).
+ * Payload board — API entry into shared payload state.
  *
- * Model (from payload.rs + bit_miner::sharedtypes):
- *   PayloadKind::{Bitcoin, Ethereum, Solana, Tron}
- *   AuthorizedPayload { request: SettlementRequest, authorization_state, settlement_state }
- *   SettlementRequest { packet, authorization: Authorization { commitment, activation, locked } }
- *   AuthorizationState::{Unauthorized, Authorized, Spent, Invalidated}
- *   SettlementState::{Pending, Success, Failed}
- *
- * Contract:
- *   Observation click → GET .../networks/:network/payload-board (after observation active).
- *   Network-scoped board marks matching kind in scope; activation-wide returns all four kinds.
- *
- * OBSERVATION_REGISTRY is an in-memory control-plane status map only. It is not proof that
- * an Electrum listener is bound or that a SettlementRequest is carried. Without the
- * bit-minner feature, the stream cannot be started. The board reports these conditions
- * explicitly and does not synthesize AuthorizedPayload.
+ * Contract: qtm-api owns the HTTP control plane and persisted substrate
+ * state; bit-miner owns observation, payload materialization and settlement.
+ * The board therefore only reports what exists:
+ *   - miner process status comes from the child-process registry,
+ *   - depth objects come from persisted event records,
+ *   - a settlement payload counts as carried only when the wire-packet file
+ *     (qp_hd::commands::wirepackets_path) has actually been persisted.
+ * An AuthorizedPayload or settlement state is never manufactured.
  *
  * Routes:
  *   GET /wallets/:name/activations/:activation/payload-board
@@ -2139,16 +2077,14 @@ struct PayloadKindEntry {
 
 #[derive(Serialize)]
 struct ObservationControlPlane {
-    /// True if OBSERVATION_REGISTRY has a running entry for this context.
-    registry_running: bool,
-    /// Commitment-derived candidate port (not proof a socket is listening).
-    listen_port_candidate: Option<u16>,
-    path_hint: Option<String>,
-    /// Whether this binary was built with the bit-minner feature.
+    /// True while the bit-miner child process for this substrate + activation
+    /// is alive (child-process registry).
+    process_running: bool,
+    pid: Option<u32>,
+    /// Whether this binary can run the miner in-process mode.
     bit_minner_feature: bool,
-    /// True only when a live Electrum-compatible listener is known bound (not yet).
-    electrum_listener_bound: bool,
-    /// True only when a SettlementRequest was supplied by the runtime for this context.
+    /// True only when the wire-packet file has been persisted for this
+    /// activation. Independent of whether the process is running.
     settlement_payload_carried: bool,
 }
 
@@ -2294,63 +2230,72 @@ struct BitMinerStartResponse {
     message: String,
 }
 
-fn bitminer_commitment(
-    substrate: &str,
-    substrate_path: &FsPath,
-    activation: u64,
-) -> ApiResult<String> {
-    // Prefer the persisted event commitment for this activation.
-    if let Some(event_path) =
-        commands::event_path_at_activation(substrate, activation)
-    {
-        if event_path.is_dir() {
-            let commitment =
-                read_trim(&event_path.join("qtm.commitment"))
-                    .filter(|value| !value.trim().is_empty());
-
-            if let Some(commitment) = commitment {
-                return Ok(commitment.trim().to_string());
-            }
-        }
-    }
-
-    // Fall back to the substrate commitment when no event is available.
-    let commitment = read_substrate_commitment(substrate_path)?;
-
-    if commitment.trim().is_empty() {
-        return Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "substrate qtm.commitment is empty",
-        ));
-    }
-
-    Ok(commitment.trim().to_string())
+// One process per substrate + activation. Start, status, list, stop and the
+// payload board all use this key, so they always agree on which child they mean.
+fn bitminer_key(substrate: &str, activation: u64) -> BitMinerKey {
+    format!("{substrate}:{activation}")
 }
 
-async fn start_bitminer(
-    Path((name, activation, network)): Path<(String, u64, String)>,
-) -> ApiResult<Json<BitMinerStartResponse>> {
-    if !valid_substrate_name(&name) {
+// Reap an exited child so the registry never reports a stale `running: true`.
+// Returns (running, pid).
+fn live_bitminer(
+    processes: &mut HashMap<BitMinerKey, Child>,
+    key: &str,
+) -> ApiResult<(bool, Option<u32>)> {
+    let Some(child) = processes.get_mut(key) else {
+        return Ok((false, None));
+    };
+
+    match child.try_wait() {
+        Ok(None) => Ok((true, child.id())),
+        Ok(Some(_)) => {
+            processes.remove(key);
+            Ok((false, None))
+        }
+        Err(io_error) => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to inspect bit-miner process: {io_error}"),
+        )),
+    }
+}
+
+async fn bitminer_process_state(
+    name: &str,
+    activation: u64,
+) -> ApiResult<(bool, Option<u32>)> {
+    let mut processes = bit_miner_processes().lock().await;
+    live_bitminer(&mut processes, &bitminer_key(name, activation))
+}
+
+fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
+    if !valid_substrate_name(name) {
         return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
     }
 
-    if !valid_observation_network_id(&network)
-        || !is_bitcoin_network_id(&network)
-    {
+    if !valid_observation_network_id(network) || !is_bitcoin_network_id(network) {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid Bitcoin network identifier",
         ));
     }
 
-    let substrate_path = ensure_existing_substrate(&name)?;
-    let key = bitminer_commitment(&name, &substrate_path, activation)?;
+    Ok(())
+}
 
-    // Mirror the miner's own startup conditions so failures come back as a
-    // clear 409 instead of a panic inside the child process.
-    //   1. Miner::new   -> the substrate's `activation` file must equal the
-    //                      requested activation (the "active clip").
-    //   2. Miner::submit -> events/event_<activation> must be a file.
+// Failure mapping:
+//   invalid substrate / network      400
+//   substrate not found              404
+//   activation mismatch              409
+//   event or depth unavailable       409
+//   miner startup failure            500
+async fn start_bitminer(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<BitMinerStartResponse>> {
+    validate_bitminer_scope(&name, &network)?;
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+
+    // Miner::new: the substrate's `activation` file must equal the request.
     match substrate_active_activation(&substrate_path) {
         Some(active) if active == activation => {}
         Some(active) => {
@@ -2359,7 +2304,7 @@ async fn start_bitminer(
                 format!(
                     "No active clip for activation {activation}: substrate '{name}' \
                      is currently at activation {active}. The miner only runs the \
-                     substrate's active activation — select activation {active}."
+                     substrate's active activation, so select activation {active}."
                 ),
             ));
         }
@@ -2374,42 +2319,29 @@ async fn start_bitminer(
         }
     }
 
-    if !stored_event_exists(&substrate_path, activation) {
+    // Miner::submit: the persisted event and its depth must load.
+    resolve_stored_event(&name, activation)?;
+
+    if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
         return Err(error(
-            StatusCode::CONFLICT,
-            format!(
-                "No stored event for substrate '{name}' at activation {activation} \
-                 (looked for {0}/events/event_{activation} or event_{activation}_<dimension>). \
-                 Run a transit first. On Render the disk is wiped on every deploy \
-                 unless a persistent disk is mounted for ~/.qp.",
-                substrate_path.display()
-            ),
+            StatusCode::NOT_IMPLEMENTED,
+            "this qtm-api build does not include the bit-miner feature and BIT_MINER_BIN is not set",
         ));
     }
 
+    let key = bitminer_key(&name, activation);
     let mut processes = bit_miner_processes().lock().await;
 
-    if let Some(child) = processes.get_mut(&key) {
-        match child.try_wait() {
-            Ok(None) => {
-                return Ok(Json(BitMinerStartResponse {
-                    substrate: name,
-                    activation,
-                    pid: child.id(),
-                    already_running: true,
-                    message: "bit-miner process is already running".into(),
-                }));
-            }
-            Ok(Some(_)) => {
-                processes.remove(&key);
-            }
-            Err(e) => {
-                return Err(error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect bit-miner process: {e}"),
-                ));
-            }
-        }
+    let (running, pid) = live_bitminer(&mut processes, &key)?;
+
+    if running {
+        return Ok(Json(BitMinerStartResponse {
+            substrate: name,
+            activation,
+            pid,
+            already_running: true,
+            message: "bit-miner process is already running".into(),
+        }));
     }
 
     // Default: re-run this very binary in miner mode. BIT_MINER_BIN still
@@ -2419,10 +2351,10 @@ async fn start_bitminer(
             Some(bin) => (bin, Vec::new()),
             None => (
                 std::env::current_exe()
-                    .map_err(|e| {
+                    .map_err(|io_error| {
                         error(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("unable to locate the qtm-api executable: {e}"),
+                            format!("unable to locate the qtm-api executable: {io_error}"),
                         )
                     })?
                     .into_os_string(),
@@ -2432,17 +2364,17 @@ async fn start_bitminer(
 
     let log_path = bitminer_log_path(&name, activation);
 
-    let log_file = std::fs::File::create(&log_path).map_err(|e| {
+    let log_file = std::fs::File::create(&log_path).map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to create bit-miner log file: {e}"),
+            format!("unable to create bit-miner log file: {io_error}"),
         )
     })?;
 
-    let log_file_err = log_file.try_clone().map_err(|e| {
+    let log_file_err = log_file.try_clone().map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to open bit-miner log file: {e}"),
+            format!("unable to open bit-miner log file: {io_error}"),
         )
     })?;
 
@@ -2455,18 +2387,18 @@ async fn start_bitminer(
         .stderr(Stdio::from(log_file_err))
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| {
+        .map_err(|io_error| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
-                    "failed to start bit-miner ({}): {e}",
+                    "failed to start bit-miner ({}): {io_error}",
                     executable.to_string_lossy()
                 ),
             )
         })?;
 
-    // A startup failure (bad args, missing substrate files, init panic)
-    // exits almost immediately. Catch it here and report the real error.
+    // A startup failure (bad arguments, pipeline initialisation, a missing
+    // event) exits almost immediately. Catch it and report the real error.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     match child.try_wait() {
@@ -2480,10 +2412,10 @@ async fn start_bitminer(
             ));
         }
         Ok(None) => {}
-        Err(e) => {
+        Err(io_error) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect bit-miner process: {e}"),
+                format!("unable to inspect bit-miner process: {io_error}"),
             ));
         }
     }
@@ -2500,7 +2432,6 @@ async fn start_bitminer(
     }))
 }
 
-
 #[derive(Serialize)]
 struct BitMinerStatusResponse {
     substrate: String,
@@ -2508,65 +2439,37 @@ struct BitMinerStatusResponse {
     network: String,
     running: bool,
     pid: Option<u32>,
+    /// Persisted event record the miner loads its depth from, when one exists.
     path: Option<String>,
+    /// Same value as `path`, named for what it is.
+    event_path: Option<String>,
+    /// The miner's captured stdout/stderr for the latest run.
+    log_path: String,
+    /// Active clips for this activation, as the miner discovers them.
     clips: Vec<ObservationClipStatus>,
     runtime: RuntimeResponse,
+    /// Latest miner output when the process is not running.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
+// The child-process registry is the single source of truth for status.
 async fn get_bitminer_status(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<BitMinerStatusResponse>> {
-    if !valid_substrate_name(&name) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "invalid substrate name",
-        ));
-    }
+    validate_bitminer_scope(&name, &network)?;
+    ensure_existing_substrate(&name)?;
 
-    if !valid_observation_network_id(&network)
-        || !is_bitcoin_network_id(&network)
-    {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "invalid Bitcoin network identifier",
-        ));
-    }
+    let (running, pid) = bitminer_process_state(&name, activation).await?;
 
-    let substrate_path = ensure_existing_substrate(&name)?;
-    let key = bitminer_commitment(&name, &substrate_path, activation)?;
-
-    let mut processes = bit_miner_processes().lock().await;
-
-    let (running, pid, remove_process) =
-        match processes.get_mut(&key) {
-            Some(child) => match child.try_wait() {
-                Ok(None) => (true, child.id(), false),
-                Ok(Some(_status)) => (false, None, true),
-                Err(io_error) => {
-                    return Err(error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "unable to inspect bit-miner process: {io_error}"
-                        ),
-                    ));
-                }
-            },
-            None => (false, None, false),
-        };
-
-    if remove_process {
-        processes.remove(&key);
-    }
-
-    let active_clips =
-        active_bitminer_clips(&substrate_path, &name, activation);
+    let log_path = bitminer_log_path(&name, activation);
+    let event_path = commands::event_path_at_activation(&name, activation)
+        .map(|path| path.display().to_string());
 
     let last_error = if running {
         None
     } else {
-        bitminer_log_tail(&bitminer_log_path(&name, activation))
+        bitminer_log_tail(&log_path)
     };
 
     Ok(Json(BitMinerStatusResponse {
@@ -2575,10 +2478,82 @@ async fn get_bitminer_status(
         network,
         running,
         pid,
-        path: None,
-        clips: active_clips,
+        path: event_path.clone(),
+        event_path,
+        log_path: log_path.display().to_string(),
+        clips: active_clips(activation),
         runtime: serialize_runtime(SystemTime::now()),
         error: last_error,
+    }))
+}
+
+#[derive(Serialize)]
+struct BitMinerStopResponse {
+    substrate: String,
+    activation: u64,
+    was_running: bool,
+    stopped: bool,
+    pid: Option<u32>,
+    message: String,
+}
+
+// Stops the exact process identified by substrate + activation.
+async fn stop_bitminer(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Json<BitMinerStopResponse>> {
+    validate_bitminer_scope(&name, &network)?;
+    ensure_existing_substrate(&name)?;
+
+    let key = bitminer_key(&name, activation);
+    let mut processes = bit_miner_processes().lock().await;
+
+    let Some(mut child) = processes.remove(&key) else {
+        return Ok(Json(BitMinerStopResponse {
+            substrate: name,
+            activation,
+            was_running: false,
+            stopped: false,
+            pid: None,
+            message: "no bit-miner process is registered for this activation".into(),
+        }));
+    };
+
+    let pid = child.id();
+
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            return Ok(Json(BitMinerStopResponse {
+                substrate: name,
+                activation,
+                was_running: false,
+                stopped: false,
+                pid: None,
+                message: "bit-miner process had already exited".into(),
+            }));
+        }
+        Ok(None) => {}
+        Err(io_error) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect bit-miner process: {io_error}"),
+            ));
+        }
+    }
+
+    child.kill().await.map_err(|io_error| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to stop bit-miner process: {io_error}"),
+        )
+    })?;
+
+    Ok(Json(BitMinerStopResponse {
+        substrate: name,
+        activation,
+        was_running: true,
+        stopped: true,
+        pid,
+        message: "bit-miner process stopped".into(),
     }))
 }
 
@@ -2605,46 +2580,22 @@ async fn list_bitcoin_observations(
     Path((name, activation)): Path<(String, u64)>,
 ) -> ApiResult<Json<BitMinerProcessListResponse>> {
     if !valid_substrate_name(&name) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "invalid substrate name",
-        ));
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
     }
 
-    let substrate_path = ensure_existing_substrate(&name)?;
-    let key = bitminer_commitment(&name, &substrate_path, activation)?;
+    ensure_existing_substrate(&name)?;
 
-    let mut processes = bit_miner_processes().lock().await;
+    let (running, pid) = bitminer_process_state(&name, activation).await?;
 
-    let (entry, remove_process) = match processes.get_mut(&key) {
-        Some(child) => match child.try_wait() {
-            Ok(None) => (
-                Some(BitMinerProcessEntry {
-                    substrate: name.clone(),
-                    activation,
-                    running: true,
-                    pid: child.id(),
-                }),
-                false,
-            ),
-            Ok(Some(_)) => (None, true),
-            Err(io_error) => {
-                return Err(error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "unable to inspect bit-miner process: {io_error}"
-                    ),
-                ));
-            }
-        },
-        None => (None, false),
-    };
-
-    if remove_process {
-        processes.remove(&key);
-    }
-
-    let pipelines = entry.into_iter().collect();
+    let pipelines = running
+        .then(|| BitMinerProcessEntry {
+            substrate: name.clone(),
+            activation,
+            running: true,
+            pid,
+        })
+        .into_iter()
+        .collect();
 
     Ok(Json(BitMinerProcessListResponse {
         substrate: name,
@@ -2657,44 +2608,15 @@ fn build_payload_board(
     name: &str,
     activation: u64,
     network_filter: Option<&str>,
+    miner: (bool, Option<u32>),
 ) -> ApiResult<PayloadBoardResponse> {
     let substrate_path = ensure_existing_substrate(name)?;
     let commitment = read_trim(&substrate_path.join("qtm.commitment"));
+    let (process_running, pid) = miner;
 
-    // Control-plane observation status only — not settlement proof.
-    let (registry_running, listen_port_candidate, path_hint) = {
-        let registry = observation_registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(net) = network_filter {
-            let key = observation_key(name, activation, net);
-            match registry.get(&key).filter(|l| l.status.running) {
-                Some(live) => (
-                    true,
-                    Some(live.status.listen_port),
-                    live.status.path.clone(),
-                ),
-                None => (false, None, None),
-            }
-        } else {
-            match registry.iter().find(|(k, live)| {
-                k.0 == name && k.1 == activation && live.status.running
-            }) {
-                Some((_, live)) => (
-                    true,
-                    Some(live.status.listen_port),
-                    live.status.path.clone(),
-                ),
-                None => (false, None, None),
-            }
-        }
-    };
-
-    // AuthorizedPayload is not synthesized. Until the observation pipeline
-    // (bit_minner) exposes a real SettlementRequest for this context, carried=false.
-    let settlement_payload_carried = false;
-    let electrum_listener_bound = false;
+    // A settlement payload is carried only when its wire packets have really
+    // been persisted. This is independent of whether the miner is running.
+    let wirepackets_persisted = commands::wirepackets_path(name, activation).is_file();
 
     let registered = registered_networks().networks;
     let kind_order = ["bitcoin", "ethereum", "solana", "tron"];
@@ -2725,10 +2647,11 @@ fn build_payload_board(
             None => (None, None, Vec::new()),
         };
 
-        // Do not invent AuthorizedPayload. Report structure only when carried.
+        // Wire packets are Bitcoin settlement artifacts. No AuthorizedPayload,
+        // authorization state or settlement state is ever manufactured here.
         let authorized_payload = if in_scope {
             Some(AuthorizedPayloadView {
-                carried: settlement_payload_carried,
+                carried: kind == "bitcoin" && wirepackets_persisted,
                 request: None,
                 authorization_state: None,
                 settlement_state: None,
@@ -2750,27 +2673,17 @@ fn build_payload_board(
     }
 
     let observation = ObservationControlPlane {
-        registry_running,
-        listen_port_candidate,
-        path_hint,
+        process_running,
+        pid,
         bit_minner_feature: bit_minner_enabled(),
-        electrum_listener_bound,
-        settlement_payload_carried,
+        settlement_payload_carried: wirepackets_persisted,
     };
 
-    let message = if registry_running && !settlement_payload_carried {
-        format!(
-            "payload board open; observation registry active for substrate={name} activation={activation}, but no SettlementRequest is carried yet"
-        )
-    } else if registry_running {
-        format!(
-            "payload board open via observation substrate={name} activation={activation}"
-        )
-    } else {
-        format!(
-            "payload board for substrate={name} activation={activation} (observation registry not running)"
-        )
-    };
+    let message = format!(
+        "substrate={name} activation={activation}: miner process {}; wire packets {}",
+        if process_running { "running" } else { "not running" },
+        if wirepackets_persisted { "persisted" } else { "not persisted" },
+    );
 
     Ok(PayloadBoardResponse {
         substrate: name.to_string(),
@@ -2787,17 +2700,17 @@ fn build_payload_board(
 async fn get_payload_board(
     Path((name, activation)): Path<(String, u64)>,
 ) -> ApiResult<Json<PayloadBoardResponse>> {
+    // Await the process registry before taking the (non-async) substrate lock.
+    let miner = bitminer_process_state(&name, activation).await?;
+
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    Ok(Json(build_payload_board(&name, activation, None)?))
+    Ok(Json(build_payload_board(&name, activation, None, miner)?))
 }
 
 async fn get_payload_board_for_network(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<PayloadBoardResponse>> {
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
     if !valid_observation_network_id(&network) {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -2805,10 +2718,16 @@ async fn get_payload_board_for_network(
         ));
     }
 
+    let miner = bitminer_process_state(&name, activation).await?;
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     Ok(Json(build_payload_board(
         &name,
         activation,
         Some(network.as_str()),
+        miner,
     )?))
 }
 
@@ -2850,6 +2769,7 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     };
 
+    // SettlementError (Backend / Unsupported / Io) displays its real cause.
     let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
         activation,
         &substrate,
@@ -2898,6 +2818,14 @@ fn main() {
 
         if args.get(1).map(String::as_str) == Some("--bit-miner") {
             run_bit_miner(&args[2..]);
+        }
+    }
+
+    #[cfg(not(feature = "bit-miner"))]
+    {
+        if std::env::args().nth(1).as_deref() == Some("--bit-miner") {
+            eprintln!("this qtm-api build does not include the bit-miner feature");
+            std::process::exit(2);
         }
     }
 
@@ -2972,6 +2900,7 @@ async fn serve() {
     "/wallets/:name/activations/:activation/networks/:network/observation",
     get(get_bitminer_status)
         .post(start_bitminer)
+        .delete(stop_bitminer)
         .options(preflight),
 )
 .route(
@@ -2987,6 +2916,10 @@ async fn serve() {
         .route(
             "/wallets/:name/activations/:activation/networks/:network/wirepackets",
             get(get_wirepackets).options(preflight),
+        )
+        .route(
+            "/wallets/:name/activations/:activation/networks/:network/wirepackets/file",
+            get(get_wirepackets_file).options(preflight),
         )
         .route(
             "/wallets/:name/activations/:activation/networks/:network/payload-board",
@@ -3017,15 +2950,9 @@ async fn serve() {
 
                     match read_trim(&commitment_path) {
                         Some(commitment) if !commitment.trim().is_empty() => {
-                            match listen_port_from_commitment(&commitment, None) {
-                                Ok(port) => println!(
-                                    "substrate={substrate} commitment={commitment} \
-                                     electrum_port_candidate={port}"
-                                ),
-                                Err(e) => eprintln!(
-                                    "substrate={substrate} commitment_port_error={e}"
-                                ),
-                            }
+                            println!(
+                                "substrate={substrate} commitment={commitment}"
+                            );
                         }
                         _ => println!(
                             "substrate={substrate} commitment=unavailable"
