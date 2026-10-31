@@ -500,6 +500,51 @@ fn valid_observation_network_id(network: &str) -> bool {
         })
 }
 
+// Active clip rule, identical to bit-miner's Miner::new: a substrate is an
+// active clip for an activation only when its `activation` file holds exactly
+// that number. Pure file read, so it cannot panic like the pipeline can.
+fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
+    read_trim(&substrate_path.join("activation"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+// bit-miner's Miner::submit reads `events/event_<activation>` as a FILE, while
+// qp_hd's persisted records are directories named `event_<activation>_<dimension>`.
+// Accept either so the check matches whichever layout the miner is built for.
+fn stored_event_exists(substrate_path: &FsPath, activation: u64) -> bool {
+    let events = substrate_path.join("events");
+
+    if events.join(format!("event_{activation}")).is_file() {
+        return true;
+    }
+
+    let prefix = format!("event_{activation}_");
+
+    std::fs::read_dir(&events)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry.path().is_dir()
+                    && entry.file_name().to_string_lossy().starts_with(&prefix)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn active_bitminer_clips(
+    substrate_path: &FsPath,
+    substrate: &str,
+    activation: u64,
+) -> Vec<ObservationClipStatus> {
+    match substrate_active_activation(substrate_path) {
+        Some(active) if active == activation => vec![ObservationClipStatus {
+            substrate: substrate.to_string(),
+            active: true,
+            direction: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
 #[allow(dead_code)]
 fn init_bitcoin_observation_clips(
     activation: u64,
@@ -511,6 +556,27 @@ fn init_bitcoin_observation_clips(
 
     #[cfg(feature = "bit-miner")]
     {
+        // Miner::new asserts when no substrate is active at this activation;
+        // verify first so this returns an Err instead of panicking.
+        let substrate_path = ensure_existing_substrate(substrate)
+            .map_err(|(_, Json(body))| body.error)?;
+
+        match substrate_active_activation(&substrate_path) {
+            Some(active) if active == activation => {}
+            Some(active) => {
+                return Err(format!(
+                    "no active clip for activation {activation}: substrate \
+                     '{substrate}' is at activation {active}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "no active clip for activation {activation}: unable to \
+                     read the activation of substrate '{substrate}'"
+                ));
+            }
+        }
+
         let pipeline =
             bit_miner::BitcoinObservationPipeline::new(activation, substrate)
                 .map_err(|error| {
@@ -2280,6 +2346,47 @@ async fn start_bitminer(
     let substrate_path = ensure_existing_substrate(&name)?;
     let key = bitminer_commitment(&name, &substrate_path, activation)?;
 
+    // Mirror the miner's own startup conditions so failures come back as a
+    // clear 409 instead of a panic inside the child process.
+    //   1. Miner::new   -> the substrate's `activation` file must equal the
+    //                      requested activation (the "active clip").
+    //   2. Miner::submit -> events/event_<activation> must be a file.
+    match substrate_active_activation(&substrate_path) {
+        Some(active) if active == activation => {}
+        Some(active) => {
+            return Err(error(
+                StatusCode::CONFLICT,
+                format!(
+                    "No active clip for activation {activation}: substrate '{name}' \
+                     is currently at activation {active}. The miner only runs the \
+                     substrate's active activation — select activation {active}."
+                ),
+            ));
+        }
+        None => {
+            return Err(error(
+                StatusCode::CONFLICT,
+                format!(
+                    "No active clip for activation {activation}: unable to read the \
+                     activation file of substrate '{name}'."
+                ),
+            ));
+        }
+    }
+
+    if !stored_event_exists(&substrate_path, activation) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            format!(
+                "No stored event for substrate '{name}' at activation {activation} \
+                 (looked for {0}/events/event_{activation} or event_{activation}_<dimension>). \
+                 Run a transit first. On Render the disk is wiped on every deploy \
+                 unless a persistent disk is mounted for ~/.qp.",
+                substrate_path.display()
+            ),
+        ));
+    }
+
     let mut processes = bit_miner_processes().lock().await;
 
     if let Some(child) = processes.get_mut(&key) {
@@ -2305,8 +2412,23 @@ async fn start_bitminer(
         }
     }
 
-    let executable = std::env::var_os("BIT_MINER_BIN")
-        .unwrap_or_else(|| "bit-miner".into());
+    // Default: re-run this very binary in miner mode. BIT_MINER_BIN still
+    // overrides it with a standalone bit-miner executable.
+    let (executable, mode_args): (std::ffi::OsString, Vec<&str>) =
+        match std::env::var_os("BIT_MINER_BIN") {
+            Some(bin) => (bin, Vec::new()),
+            None => (
+                std::env::current_exe()
+                    .map_err(|e| {
+                        error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("unable to locate the qtm-api executable: {e}"),
+                        )
+                    })?
+                    .into_os_string(),
+                vec!["--bit-miner"],
+            ),
+        };
 
     let log_path = bitminer_log_path(&name, activation);
 
@@ -2325,6 +2447,7 @@ async fn start_bitminer(
     })?;
 
     let mut child = Command::new(&executable)
+        .args(&mode_args)
         .arg(activation.to_string())
         .arg(&name)
         .stdin(Stdio::null())
@@ -2437,6 +2560,9 @@ async fn get_bitminer_status(
         processes.remove(&key);
     }
 
+    let active_clips =
+        active_bitminer_clips(&substrate_path, &name, activation);
+
     let last_error = if running {
         None
     } else {
@@ -2450,7 +2576,7 @@ async fn get_bitminer_status(
         running,
         pid,
         path: None,
-        clips: Vec::new(),
+        clips: active_clips,
         runtime: serialize_runtime(SystemTime::now()),
         error: last_error,
     }))
@@ -2703,8 +2829,78 @@ fn resolve_home() {
     }
 }
 
+// Miner mode: `qtm-api --bit-miner <activation> <substrate>`.
+// Same logic as bit-miner/src/main.rs, but compiled into this binary so no
+// second executable, PATH entry or BIT_MINER_BIN is needed on the host.
+#[cfg(feature = "bit-miner")]
+fn run_bit_miner(args: &[String]) -> ! {
+    let activation = match args.first().and_then(|v| v.parse::<u64>().ok()) {
+        Some(value) => value,
+        None => {
+            eprintln!("bit-miner: missing or invalid activation");
+            std::process::exit(2);
+        }
+    };
+
+    let substrate = match args.get(1) {
+        Some(value) if !value.trim().is_empty() => value.clone(),
+        _ => {
+            eprintln!("bit-miner: missing substrate");
+            std::process::exit(2);
+        }
+    };
+
+    let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
+        activation,
+        &substrate,
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(e) => {
+            eprintln!(
+                "bit-miner: failed to initialize pipeline for substrate '{substrate}' at activation {activation}: {e}"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let mut windows = Vec::new();
+
+    for clip in pipeline.miner().clips() {
+        windows.push(bit_miner::RenderState::window(clip.substrate.clone()));
+    }
+
+    if windows.is_empty() {
+        eprintln!("bit-miner: pipeline reported no clips for substrate '{substrate}'");
+        std::process::exit(1);
+    }
+
+    eprintln!(
+        "bit-miner: observing substrate '{substrate}' at activation {activation} ({} clip(s))",
+        windows.len()
+    );
+
+    loop {
+        for window in &mut windows {
+            let name = window.substrate.clone();
+            let _ = bit_miner::observestream::refresh(&mut pipeline, &name);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn main() {
     resolve_home();
+
+    #[cfg(feature = "bit-miner")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+
+        if args.get(1).map(String::as_str) == Some("--bit-miner") {
+            run_bit_miner(&args[2..]);
+        }
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
