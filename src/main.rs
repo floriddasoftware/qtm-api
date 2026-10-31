@@ -2183,6 +2183,7 @@ fn collect_depth_for_activation_network(
     }
 }
 
+
 type BitMinerKey = String;
 
 static BIT_MINER_PROCESSES: OnceLock<AsyncMutex<HashMap<BitMinerKey, Child>>> =
@@ -2192,8 +2193,6 @@ fn bit_miner_processes() -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
     BIT_MINER_PROCESSES.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
-// The miner's stdout/stderr go to a per-run log file so a startup failure
-// can be reported over HTTP instead of only living in the process logs.
 fn bitminer_log_path(substrate: &str, activation: u64) -> PathBuf {
     std::env::temp_dir()
         .join(format!("bit-miner-{substrate}-{activation}.log"))
@@ -2230,14 +2229,10 @@ struct BitMinerStartResponse {
     message: String,
 }
 
-// One process per substrate + activation. Start, status, list, stop and the
-// payload board all use this key, so they always agree on which child they mean.
 fn bitminer_key(substrate: &str, activation: u64) -> BitMinerKey {
     format!("{substrate}:{activation}")
 }
 
-// Reap an exited child so the registry never reports a stale `running: true`.
-// Returns (running, pid).
 fn live_bitminer(
     processes: &mut HashMap<BitMinerKey, Child>,
     key: &str,
@@ -2269,7 +2264,10 @@ async fn bitminer_process_state(
 
 fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
     if !valid_substrate_name(name) {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid substrate name",
+        ));
     }
 
     if !valid_observation_network_id(network) || !is_bitcoin_network_id(network) {
@@ -2282,12 +2280,6 @@ fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
     Ok(())
 }
 
-// Failure mapping:
-//   invalid substrate / network      400
-//   substrate not found              404
-//   activation mismatch              409
-//   event or depth unavailable       409
-//   miner startup failure            500
 async fn start_bitminer(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<BitMinerStartResponse>> {
@@ -2295,32 +2287,24 @@ async fn start_bitminer(
 
     let substrate_path = ensure_existing_substrate(&name)?;
 
-    // Miner::new: the substrate's `activation` file must equal the request.
-    match substrate_active_activation(&substrate_path) {
-        Some(active) if active == activation => {}
-        Some(active) => {
-            return Err(error(
+    let active = substrate_active_activation(&substrate_path)
+        .ok_or_else(|| {
+            error(
                 StatusCode::CONFLICT,
                 format!(
-                    "No active clip for activation {activation}: substrate '{name}' \
-                     is currently at activation {active}. The miner only runs the \
-                     substrate's active activation, so select activation {active}."
+                    "unable to read the active clip for substrate '{name}'"
                 ),
-            ));
-        }
-        None => {
-            return Err(error(
-                StatusCode::CONFLICT,
-                format!(
-                    "No active clip for activation {activation}: unable to read the \
-                     activation file of substrate '{name}'."
-                ),
-            ));
-        }
-    }
+            )
+        })?;
 
-    // Miner::submit: the persisted event and its depth must load.
-    resolve_stored_event(&name, activation)?;
+    if active != activation {
+        return Err(error(
+            StatusCode::CONFLICT,
+            format!(
+                "active clip mismatch: substrate='{name}', requested_activation={activation}, active_activation={active}"
+            ),
+        ));
+    }
 
     if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
         return Err(error(
@@ -2344,8 +2328,6 @@ async fn start_bitminer(
         }));
     }
 
-    // Default: re-run this very binary in miner mode. BIT_MINER_BIN still
-    // overrides it with a standalone bit-miner executable.
     let (executable, mode_args): (std::ffi::OsString, Vec<&str>) =
         match std::env::var_os("BIT_MINER_BIN") {
             Some(bin) => (bin, Vec::new()),
@@ -2354,7 +2336,9 @@ async fn start_bitminer(
                     .map_err(|io_error| {
                         error(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("unable to locate the qtm-api executable: {io_error}"),
+                            format!(
+                                "unable to locate the qtm-api executable: {io_error}"
+                            ),
                         )
                     })?
                     .into_os_string(),
@@ -2397,8 +2381,6 @@ async fn start_bitminer(
             )
         })?;
 
-    // A startup failure (bad arguments, pipeline initialisation, a missing
-    // event) exits almost immediately. Catch it and report the real error.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     match child.try_wait() {
@@ -2408,14 +2390,18 @@ async fn start_bitminer(
 
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("bit-miner exited at startup ({status}): {detail}"),
+                format!(
+                    "bit-miner exited at startup ({status}): {detail}"
+                ),
             ));
         }
         Ok(None) => {}
         Err(io_error) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect bit-miner process: {io_error}"),
+                format!(
+                    "unable to inspect bit-miner process: {io_error}"
+                ),
             ));
         }
     }
