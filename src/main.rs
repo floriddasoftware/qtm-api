@@ -2190,6 +2190,35 @@ fn bit_miner_processes() -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
     BIT_MINER_PROCESSES.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
+// The miner's stdout/stderr go to a per-run log file so a startup failure
+// can be reported over HTTP instead of only living in the process logs.
+fn bitminer_log_path(substrate: &str, activation: u64) -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("bit-miner-{substrate}-{activation}.log"))
+}
+
+fn bitminer_log_tail(path: &FsPath) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = lines.len().saturating_sub(12);
+    let tail = lines[start..].join("\n");
+
+    Some(if tail.len() > 2000 {
+        String::from_utf8_lossy(&tail.as_bytes()[tail.len() - 2000..])
+            .into_owned()
+    } else {
+        tail
+    })
+}
+
 #[derive(Serialize)]
 struct BitMinerStartResponse {
     substrate: String,
@@ -2279,20 +2308,62 @@ async fn start_bitminer(
     let executable = std::env::var_os("BIT_MINER_BIN")
         .unwrap_or_else(|| "bit-miner".into());
 
-    let child = Command::new(executable)
+    let log_path = bitminer_log_path(&name, activation);
+
+    let log_file = std::fs::File::create(&log_path).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to create bit-miner log file: {e}"),
+        )
+    })?;
+
+    let log_file_err = log_file.try_clone().map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to open bit-miner log file: {e}"),
+        )
+    })?;
+
+    let mut child = Command::new(&executable)
         .arg(activation.to_string())
         .arg(&name)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to start bit-miner: {e}"),
+                format!(
+                    "failed to start bit-miner ({}): {e}",
+                    executable.to_string_lossy()
+                ),
             )
         })?;
+
+    // A startup failure (bad args, missing substrate files, init panic)
+    // exits almost immediately. Catch it here and report the real error.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            let detail = bitminer_log_tail(&log_path)
+                .unwrap_or_else(|| "no output captured".to_string());
+
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bit-miner exited at startup ({status}): {detail}"),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect bit-miner process: {e}"),
+            ));
+        }
+    }
 
     let pid = child.id();
     processes.insert(key, child);
@@ -2317,6 +2388,8 @@ struct BitMinerStatusResponse {
     path: Option<String>,
     clips: Vec<ObservationClipStatus>,
     runtime: RuntimeResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 async fn get_bitminer_status(
@@ -2364,6 +2437,12 @@ async fn get_bitminer_status(
         processes.remove(&key);
     }
 
+    let last_error = if running {
+        None
+    } else {
+        bitminer_log_tail(&bitminer_log_path(&name, activation))
+    };
+
     Ok(Json(BitMinerStatusResponse {
         substrate: name,
         activation,
@@ -2373,6 +2452,7 @@ async fn get_bitminer_status(
         path: None,
         clips: Vec::new(),
         runtime: serialize_runtime(SystemTime::now()),
+        error: last_error,
     }))
 }
 
