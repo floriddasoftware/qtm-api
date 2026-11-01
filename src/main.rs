@@ -2194,8 +2194,7 @@ fn bit_miner_processes() -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
 }
 
 fn bitminer_log_path(substrate: &str, activation: u64) -> PathBuf {
-    std::env::temp_dir()
-        .join(format!("bit-miner-{substrate}-{activation}.log"))
+    std::env::temp_dir().join(format!("bit-miner-{substrate}-{activation}.log"))
 }
 
 fn bitminer_log_tail(path: &FsPath) -> Option<String> {
@@ -2213,8 +2212,7 @@ fn bitminer_log_tail(path: &FsPath) -> Option<String> {
     let tail = lines[start..].join("\n");
 
     Some(if tail.len() > 2000 {
-        String::from_utf8_lossy(&tail.as_bytes()[tail.len() - 2000..])
-            .into_owned()
+        String::from_utf8_lossy(&tail.as_bytes()[tail.len() - 2000..]).into_owned()
     } else {
         tail
     })
@@ -2401,21 +2399,15 @@ struct BitMinerStatusResponse {
     network: String,
     running: bool,
     pid: Option<u32>,
-    /// Persisted event record the miner loads its depth from, when one exists.
     path: Option<String>,
-    /// Same value as `path`, named for what it is.
     event_path: Option<String>,
-    /// The miner's captured stdout/stderr for the latest run.
     log_path: String,
-    /// Active clips for this activation, as the miner discovers them.
     clips: Vec<ObservationClipStatus>,
     runtime: RuntimeResponse,
-    /// Latest miner output when the process is not running.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
-// The child-process registry is the single source of truth for status.
 async fn get_bitminer_status(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<BitMinerStatusResponse>> {
@@ -2449,6 +2441,17 @@ async fn get_bitminer_status(
     }))
 }
 
+#[cfg(feature = "bit-miner")]
+async fn stream(
+    observation_stream: &mut bit_miner::observestream::MempoolSpaceStream,
+    substrate: &str,
+    pipeline: &mut bit_miner::BitcoinObservationPipeline,
+) -> bit_miner::observestream::ObservationResult<
+    bit_miner::observestream::PipelineOutcome,
+> {
+    observation_stream.stream(substrate, pipeline).await
+}
+
 #[derive(Serialize)]
 struct BitMinerStopResponse {
     substrate: String,
@@ -2459,7 +2462,6 @@ struct BitMinerStopResponse {
     message: String,
 }
 
-// Stops the exact process identified by substrate + activation.
 async fn stop_bitminer(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<BitMinerStopResponse>> {
@@ -2564,6 +2566,121 @@ async fn list_bitcoin_observations(
         activation,
         pipelines,
     }))
+}
+
+// Runs the bit-miner observation stream inside the qtm-api child process.
+#[cfg(feature = "bit-miner")]
+fn run_bit_miner(args: &[String]) -> ! {
+    use bit_miner::observestream::{
+        MempoolSpaceStream,
+        MempoolStreamMode,
+    };
+
+    let activation = match args.first().and_then(|value| value.parse::<u64>().ok()) {
+        Some(value) => value,
+        None => {
+            eprintln!("bit-miner: missing or invalid activation");
+            std::process::exit(2);
+        }
+    };
+
+    let substrate = match args.get(1) {
+        Some(value) if !value.trim().is_empty() => value.clone(),
+        _ => {
+            eprintln!("bit-miner: missing substrate");
+            std::process::exit(2);
+        }
+    };
+
+    let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
+        activation,
+        &substrate,
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            eprintln!(
+                "bit-miner: pipeline initialization failed \
+                 substrate={substrate} activation={activation}: {error}"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("bit-miner: runtime initialization failed: {error}");
+            std::process::exit(1);
+        });
+
+    eprintln!(
+        "bit-miner: starting transaction stream \
+         substrate={substrate} activation={activation}"
+    );
+
+    runtime.block_on(async move {
+        loop {
+            let mut observation_stream = match MempoolSpaceStream::connect(
+                activation,
+                MempoolStreamMode::TransactionIds,
+            )
+            .await
+            {
+                Ok(observation_stream) => {
+                    eprintln!(
+                        "bit-miner: connected to Mempool.space \
+                         substrate={substrate} activation={activation}"
+                    );
+                    observation_stream
+                }
+                Err(error) => {
+                    eprintln!(
+                        "bit-miner: stream connection failed \
+                         substrate={substrate} activation={activation}: {error}"
+                    );
+
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            loop {
+                match stream(
+                    &mut observation_stream,
+                    &substrate,
+                    &mut pipeline,
+                )
+                .await
+                {
+                    Ok(Ok(Some(_outcome))) => {
+                        eprintln!(
+                            "bit-miner: transaction processed \
+                             substrate={substrate} activation={activation}"
+                        );
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "bit-miner: pipeline processing failed \
+                             substrate={substrate} activation={activation}: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "bit-miner: observation stream disconnected \
+                             substrate={substrate} activation={activation}: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+
+    unreachable!("bit-miner stream loop is intentionally persistent");
 }
 
 fn build_payload_board(
