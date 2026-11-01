@@ -2827,66 +2827,6 @@ fn resolve_home() {
     }
 }
 
-// Miner mode: `qtm-api --bit-miner <activation> <substrate>`.
-// Same logic as bit-miner/src/main.rs, but compiled into this binary so no
-// second executable, PATH entry or BIT_MINER_BIN is needed on the host.
-#[cfg(feature = "bit-miner")]
-fn run_bit_miner(args: &[String]) -> ! {
-    let activation = match args.first().and_then(|v| v.parse::<u64>().ok()) {
-        Some(value) => value,
-        None => {
-            eprintln!("bit-miner: missing or invalid activation");
-            std::process::exit(2);
-        }
-    };
-
-    let substrate = match args.get(1) {
-        Some(value) if !value.trim().is_empty() => value.clone(),
-        _ => {
-            eprintln!("bit-miner: missing substrate");
-            std::process::exit(2);
-        }
-    };
-
-    // SettlementError (Backend / Unsupported / Io) displays its real cause.
-    let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
-        activation,
-        &substrate,
-    ) {
-        Ok(pipeline) => pipeline,
-        Err(e) => {
-            eprintln!(
-                "bit-miner: failed to initialize pipeline for substrate '{substrate}' at activation {activation}: {e}"
-            );
-            std::process::exit(1);
-        }
-    };
-
-    let mut windows = Vec::new();
-
-    for clip in pipeline.miner().clips() {
-        windows.push(bit_miner::RenderState::window(clip.substrate.clone()));
-    }
-
-    if windows.is_empty() {
-        eprintln!("bit-miner: pipeline reported no clips for substrate '{substrate}'");
-        std::process::exit(1);
-    }
-
-    eprintln!(
-        "bit-miner: observing substrate '{substrate}' at activation {activation} ({} clip(s))",
-        windows.len()
-    );
-
-    loop {
-        for window in &mut windows {
-            let name = window.substrate.clone();
-            let _ = bit_miner::observestream::refresh(&mut pipeline, &name);
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
 
 fn main() {
     resolve_home();
