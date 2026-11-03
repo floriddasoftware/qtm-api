@@ -1,3 +1,5 @@
+mod payload;
+use payload::EventPayload;
 use axum::{
     extract::Path,
     http::{header, Method, StatusCode},
@@ -14,7 +16,7 @@ use qp_hd::{
     qp44::{Flow, TotalMass},
 };
 use qtm_graph::graph::{
-    frame::{Depth, Direction},
+    frame::{Depth},
     Scale,
 };
 use serde::{Deserialize, Serialize};
@@ -1817,20 +1819,23 @@ async fn transit_wallet(
     // Persist the actual input depth under this event and network.
     write_depth_payload(&record_path, &network_id, &event.depth)?;
 
-    let qtm = QtmResponse {
+        let qtm = QtmResponse {
         commitment: hex::encode(event.qtm.commitment),
         coordinate: hex::encode(event.qtm.coordinate),
         sigma: event.qtm.sigma.to_string(),
         network: event.qtm.net_work.to_string(),
     };
 
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
 
     Ok(Json(direction_response(
-        direction,
+        payload,
         Some(selection),
         qtm,
-        &event.depth,
     )))
 }
 
@@ -1875,9 +1880,15 @@ async fn receive_wallet(
         },
     };
 
-    let event = guarded("receive", || transaction.receive(&name, flow))?;
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
-    let event_response = event_map_response(direction, &event.depth);
+       let event = guarded("receive", || transaction.receive(&name, flow))?;
+
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
+
+    let event_response = EventMapResponse::from(payload);
 
     Ok(Json(ReceiveResponse {
         frame: QuantumTransactionFrame {
