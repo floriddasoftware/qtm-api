@@ -16,7 +16,7 @@ use qp_hd::{
     qp44::{Flow, TotalMass},
 };
 use qtm_graph::graph::{
-    frame::{Depth},
+    frame::{Depth, Direction},
     Scale,
 };
 use serde::{Deserialize, Serialize};
