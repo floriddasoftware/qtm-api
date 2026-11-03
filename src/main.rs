@@ -374,7 +374,7 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 
 #[cfg(feature = "bit-miner")]
 fn start_live_wirepackets(
-    substrate: String,
+    substrate: &String,
     activation: u64,
 ) {
     use bit_miner::broadcast::TcpReceiver;
