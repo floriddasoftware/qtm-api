@@ -19,10 +19,7 @@ bit_miner = {
     git = "https://github.com/floriddasoftware/bit-miner",
     optional = true
 }
-
+quantom_value = { git = "https://github.com/QuantPerm-Labs/Quantom-VALUE" }
 [features]
 default = ["bit-miner"]
 bit-miner = ["dep:bit_miner"]
-quantom_value = {
-    git = "https://github.com/QuantPerm-Labs/Quantom-VALUE"
-}
