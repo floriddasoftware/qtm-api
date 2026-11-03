@@ -368,6 +368,27 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// Live wire-packet TCP ingress
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn start_live_wirepackets() {
+    use bit_miner::broadcast::TcpReceiver;
+
+    let Some(bind) = TcpReceiver::from_env() else {
+        eprintln!(
+            "live_wirepackets=disabled \
+             BIT_MINNER_TCP_BIND is missing or invalid"
+        );
+        return;
+    };
+
+    eprintln!("live_wirepackets=starting addr={bind}");
+
+    TcpReceiver::spawn(bind);
+}
+
 /// Metadata for the persisted wire-packet file. A missing file is reported as
 /// `exists: false`; nothing is fabricated.
 async fn get_wirepackets(
