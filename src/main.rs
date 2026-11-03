@@ -1950,8 +1950,6 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     let substrate_path = ensure_existing_substrate(&name)?;
 
     // Capture network identifiers before qtm_exile consumes the transit record.
-    // qtm_exile locates the transit record through qp_hd's own activation
-    // accessor, so use the same source here.
     let activation = guarded("activation lookup", || commands::load_activation(&name))?;
 
     let transit_path = commands::event_path_at_activation(&name, activation).ok_or_else(|| {
@@ -1962,6 +1960,7 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     })?;
 
     let mut network_ids = Vec::new();
+
     let entries = std::fs::read_dir(&transit_path).map_err(|e| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1978,7 +1977,10 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
         })?;
 
         let payload = entry.path().join("payload");
-        if payload.join("depth.path").is_file() && payload.join("depth.objects").is_file() {
+
+        if payload.join("depth.path").is_file()
+            && payload.join("depth.objects").is_file()
+        {
             network_ids.push(entry.file_name().to_string_lossy().to_string());
         }
     }
@@ -1986,8 +1988,9 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
     network_ids.sort();
     network_ids.dedup();
 
-    // Canonical balance/exile transition: persist resulting heritage and consume transit.
+    // Execute the canonical exile transition and consume the transit record.
     let event = guarded("exile", || commands::qtm_exile(&name))?;
+
     let resulting_activation = event.heritage.state.activations();
     let dimension = event.heritage.state.dimension();
 
@@ -1998,7 +2001,7 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
         u128::from(dimension),
     )?;
 
-    // Event root is canonical output; network payloads are persisted only for input networks.
+    // Persist depth payloads only for networks present in the consumed transit.
     for network_id in &network_ids {
         write_depth_payload(&record_path, network_id, &event.depth)?;
     }
@@ -2010,16 +2013,18 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
         network: event.qtm.net_work.to_string(),
     };
 
-    let direction = Direction::from_heritage(event.heritage, Scale::Local);
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
 
     Ok(Json(direction_response(
-        direction,
+        payload,
         None,
         qtm,
-        &event.depth,
     )))
 }
-
 
 
 
