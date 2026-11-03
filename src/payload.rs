@@ -15,9 +15,6 @@ use quantom_value::Heritage;
 
 pub enum PayloadKind {
     Bitcoin(BitcoinPayload),
-    Ethereum(EthereumPayload),
-    Solana(SolanaPayload),
-    Tron(TronPayload),
 }
 
 pub struct AuthorizedPayload {
