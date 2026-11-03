@@ -474,20 +474,21 @@ fn start_live_wirepackets(
                             stored.extend_from_slice(&length_bytes);
                             stored.extend_from_slice(&bytes);
 
-                            if let Err(e) = persist_live_wirepackets(
-                                &substrate,
-                                activation,
-                                &stored,
-                            ) {
-                                stored.truncate(previous_len);
+                            if let Err((status, _)) = persist_live_wirepackets(
+    &substrate,
+    activation,
+    &stored,
+) {
+    stored.truncate(previous_len);
 
-                                eprintln!(
-                                    "live_wirepackets=persist_failed \
-                                     substrate={substrate} \
-                                     activation={activation} \
-                                     response={e:?}"
-                                );
-                            }
+    eprintln!(
+        "live_wirepackets=persist_failed \
+         substrate={substrate} \
+         activation={activation} \
+         status={}",
+        status.as_u16()
+    );
+}
                         }
                     });
                 }
