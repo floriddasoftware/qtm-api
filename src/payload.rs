@@ -1,7 +1,6 @@
-use bituse bit_miner::{
+use bit_miner::{
     bitcoinpayload::BitcoinPayload,
     sharedtypes::{
-        Authorization,
         AuthorizationState,
         SettlementRequest,
         SettlementState,
