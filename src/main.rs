@@ -2884,6 +2884,11 @@ fn resolve_home() {
 }
 
 
+
+// -----------------------------------------------------------------------------
+// Application entry point
+// -----------------------------------------------------------------------------
+
 fn main() {
     resolve_home();
 
@@ -2911,7 +2916,15 @@ fn main() {
         .block_on(serve());
 }
 
+// -----------------------------------------------------------------------------
+// Axum HTTP server
+// -----------------------------------------------------------------------------
+
 async fn serve() {
+    // Start the bit-miner TCP receiver independently of the HTTP listener.
+    #[cfg(feature = "bit-miner")]
+    start_live_wirepackets();
+
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([
@@ -2972,18 +2985,17 @@ async fn serve() {
             post(exile_wallet).options(preflight),
         )
         .route(
-    "/wallets/:name/activations/:activation/networks/:network/observation",
-    get(get_bitminer_status)
-        .post(start_bitminer)
-        .delete(stop_bitminer)
-        .options(preflight),
-)
-.route(
-    "/wallets/:name/activations/:activation/observations",
-    get(list_bitcoin_observations).options(preflight),
-)
-        // Payload board — exclusive entry into shared payload state (payload.rs).
-        // Opened from Observation; not a second persistence layer.
+            "/wallets/:name/activations/:activation/networks/:network/observation",
+            get(get_bitminer_status)
+                .post(start_bitminer)
+                .delete(stop_bitminer)
+                .options(preflight),
+        )
+        .route(
+            "/wallets/:name/activations/:activation/observations",
+            get(list_bitcoin_observations).options(preflight),
+        )
+        // Payload board — exclusive entry into shared payload state.
         .route(
             "/wallets/:name/activations/:activation/payload-board",
             get(get_payload_board).options(preflight),
@@ -3002,6 +3014,10 @@ async fn serve() {
         )
         .layer(cors);
 
+    // -------------------------------------------------------------------------
+    // Substrate discovery
+    // -------------------------------------------------------------------------
+
     let root = commands::substrate_root();
     println!("substrate_root={}", root.display());
 
@@ -3011,7 +3027,9 @@ async fn serve() {
                 let mut discovered = entries
                     .filter_map(Result::ok)
                     .filter(|entry| entry.path().is_dir())
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .map(|entry| {
+                        entry.file_name().to_string_lossy().into_owned()
+                    })
                     .filter(|name| valid_substrate_name(name))
                     .collect::<Vec<_>>();
 
@@ -3029,9 +3047,11 @@ async fn serve() {
                                 "substrate={substrate} commitment={commitment}"
                             );
                         }
-                        _ => println!(
-                            "substrate={substrate} commitment=unavailable"
-                        ),
+                        _ => {
+                            println!(
+                                "substrate={substrate} commitment=unavailable"
+                            );
+                        }
                     }
                 }
             }
@@ -3044,9 +3064,14 @@ async fn serve() {
         }
     } else {
         println!(
-            "substrates_discovered=0 (root does not exist; startup did not create it)"
+            "substrates_discovered=0 \
+             (root does not exist; startup did not create it)"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // HTTP listener
+    // -------------------------------------------------------------------------
 
     let port = std::env::var("PORT")
         .ok()
@@ -3059,7 +3084,9 @@ async fn serve() {
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .unwrap_or_else(|e| {
-            panic!("failed to bind qtm-api HTTP listener at {address}: {e}");
+            panic!(
+                "failed to bind qtm-api HTTP listener at {address}: {e}"
+            );
         });
 
     let bound_address = listener
