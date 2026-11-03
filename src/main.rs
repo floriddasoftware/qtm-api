@@ -2317,7 +2317,7 @@ async fn start_bitminer(
                         error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!(
-                                "unable to locate the qtm-api executable: {io_error}"
+                                "unable to locate the qtm-api executable: {io_error}",
                             ),
                         )
                     })?
@@ -2342,7 +2342,7 @@ async fn start_bitminer(
         )
     })?;
 
-    let mut child = Command::new(&executable)
+    let child = Command::new(&executable)
         .args(&mode_args)
         .arg(activation.to_string())
         .arg(&name)
@@ -2361,27 +2361,6 @@ async fn start_bitminer(
             )
         })?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            let detail = bitminer_log_tail(&log_path)
-                .unwrap_or_else(|| "no output captured".to_string());
-
-            return Err(error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("bit-miner exited at startup ({status}): {detail}"),
-            ));
-        }
-        Ok(None) => {}
-        Err(io_error) => {
-            return Err(error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect bit-miner process: {io_error}"),
-            ));
-        }
-    }
-
     let pid = child.id();
     processes.insert(key, child);
 
@@ -2393,7 +2372,6 @@ async fn start_bitminer(
         message: "bit-miner process started".into(),
     }))
 }
-
 #[derive(Serialize)]
 struct BitMinerStatusResponse {
     substrate: String,
