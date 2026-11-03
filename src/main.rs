@@ -2032,10 +2032,13 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
  * state; bit-miner owns observation, payload materialization and settlement.
  * The board therefore only reports what exists:
  *   - miner process status comes from the child-process registry,
- *   - depth objects come from persisted event records,
+ *   - the event, its heritage (state + transition) and its depth come from
+ *     the authentic event returned by the QP-HD loader
+ *     (qp_hd::commands::load_event_at_activation), owned by EventPayload,
  *   - a settlement payload counts as carried only when the wire-packet file
  *     (qp_hd::commands::wirepackets_path) has actually been persisted.
- * An AuthorizedPayload or settlement state is never manufactured.
+ * An AuthorizedPayload or settlement state is never manufactured, and no
+ * transition, state, retained mass or depth is recomputed.
  *
  * Routes:
  *   GET /wallets/:name/activations/:activation/payload-board
@@ -2071,6 +2074,43 @@ struct AuthorizedPayloadView {
     settlement_state: Option<String>,
 }
 
+/// Post-transition manifold state, read from the loaded event's heritage.
+#[derive(Serialize, Clone)]
+struct EventStateView {
+    dimension: String,
+    structural_value: String,
+    retained_mass: String,
+    activations: u64,
+}
+
+/// Recorded transition values, read from the loaded event's heritage.
+#[derive(Serialize, Clone)]
+struct EventTransitionView {
+    tau: String,
+    delta: String,
+    gross_work: String,
+    net_work: String,
+    mirror_bytes: String,
+}
+
+#[derive(Serialize, Clone)]
+struct EventHeritageView {
+    state: EventStateView,
+    transition: EventTransitionView,
+}
+
+/// Projection of the authentic event owned by EventPayload.
+#[derive(Serialize, Clone)]
+struct PayloadEventView {
+    /// Event record directory name, e.g. event_<activation>_<dimension>.
+    record: String,
+    activation: u64,
+    scale: String,
+    runtime: RuntimeResponse,
+    heritage: EventHeritageView,
+    depth: DepthResponse,
+}
+
 #[derive(Serialize, Clone)]
 struct PayloadKindEntry {
     /// bitcoin | ethereum | solana | tron  (PayloadKind discriminant)
@@ -2082,7 +2122,7 @@ struct PayloadKindEntry {
     available: bool,
     /// Runtime-carried AuthorizedPayload only; None if not populated by the pipeline.
     authorized_payload: Option<AuthorizedPayloadView>,
-    /// Depth from persisted event records matching this activation + network.
+    /// Kept for UI compatibility; projected from the event's actual depth.
     depth_objects: Vec<DepthObjectResponse>,
     depth_path: Option<String>,
     depth_record: Option<String>,
@@ -2108,6 +2148,9 @@ struct PayloadBoardResponse {
     network: Option<String>,
     observation: ObservationControlPlane,
     commitment: Option<String>,
+    /// The authentic QP-HD event (heritage + depth); None when no event is
+    /// stored at this activation.
+    event: Option<PayloadEventView>,
     /// One entry per PayloadKind — simultaneous view; API remains authoritative.
     kinds: Vec<PayloadKindEntry>,
     runtime: RuntimeResponse,
@@ -2129,70 +2172,63 @@ fn payload_kind_id_for_network(network_id: &str) -> Option<&'static str> {
     }
 }
 
-fn record_matches_activation(record_name: &str, activation: u64) -> bool {
-    // event_{activation}_{dimension} or exile_{activation}_{dimension}
-    let rest = record_name
-        .strip_prefix("event_")
-        .or_else(|| record_name.strip_prefix("exile_"));
-    let Some(rest) = rest else {
-        return false;
+/// Load the authentic event and transfer its heritage and depth into EventPayload.
+fn load_payload_event(
+    name: &str,
+    activation: u64,
+) -> ApiResult<Option<(String, EventPayload)>> {
+    let Some(record_path) = commands::event_path_at_activation(name, activation) else {
+        return Ok(None);
     };
-    let Some((act_str, _)) = rest.split_once('_') else {
-        return false;
+
+    let record = record_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let event = guarded("payload event load", || {
+        commands::load_event_at_activation(name, activation)
+    })?;
+
+    let (heritage, depth) = match event {
+        qp_hd::PersistedEvent::Transit(event) => (event.heritage, event.depth),
+        qp_hd::PersistedEvent::Exile(event) => (event.heritage, event.depth),
     };
-    act_str.parse::<u64>().ok() == Some(activation)
+
+    Ok(Some((
+        record,
+        EventPayload::from_heritage(heritage, depth, Scale::Local),
+    )))
 }
 
-/// Collect persisted depth only from event/exile records for this activation + network.
-fn collect_depth_for_activation_network(
-    substrate_path: &FsPath,
-    activation: u64,
-    network_id: &str,
-) -> (Option<String>, Option<String>, Vec<DepthObjectResponse>) {
-    let events_path = substrate_path.join("events");
-    if !events_path.is_dir() {
-        return (None, None, Vec::new());
-    }
+fn payload_event_view(record: String, payload: &EventPayload) -> PayloadEventView {
+    let event = payload.event();
+    let heritage = event.heritage();
+    let state = &heritage.state;
+    let transition = &heritage.transition;
 
-    let Ok(entries) = std::fs::read_dir(&events_path) else {
-        return (None, None, Vec::new());
-    };
-
-    let mut best: Option<(SystemTime, String, PathBuf)> = None;
-
-    for entry in entries.flatten() {
-        let record_path = entry.path();
-        if !record_path.is_dir() {
-            continue;
-        }
-        let record_name = entry.file_name().to_string_lossy().to_string();
-        if !record_matches_activation(&record_name, activation) {
-            continue;
-        }
-
-        let payload = record_path.join(network_id).join("payload");
-        if !(payload.join("depth.path").is_file() && payload.join("depth.objects").is_file()) {
-            continue;
-        }
-
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(UNIX_EPOCH);
-
-        match &best {
-            Some((t, _, _)) if *t >= modified => {}
-            _ => best = Some((modified, record_name, payload)),
-        }
-    }
-
-    let Some((_, record_name, payload_path)) = best else {
-        return (None, None, Vec::new());
-    };
-
-    match read_persisted_depth(&payload_path) {
-        Ok(depth) => (Some(record_name), Some(depth.path), depth.objects),
-        Err(_) => (Some(record_name), None, Vec::new()),
+    PayloadEventView {
+        record,
+        activation: event.activation(),
+        scale: scale_name(event.scale()).to_string(),
+        runtime: serialize_runtime(event.runtime()),
+        heritage: EventHeritageView {
+            state: EventStateView {
+                dimension: state.dimension().to_string(),
+                structural_value: state.structural_value().to_string(),
+                retained_mass: state.retained_mass().to_string(),
+                activations: state.activations(),
+            },
+            transition: EventTransitionView {
+                tau: transition.tau.to_string(),
+                delta: transition.delta.to_string(),
+                gross_work: transition.gross_work.to_string(),
+                net_work: transition.net_work.to_string(),
+                mirror_bytes: hex::encode(transition.mirror_bytes),
+            },
+        },
+        depth: depth_response(payload.depth()),
     }
 }
 
@@ -2688,6 +2724,19 @@ fn build_payload_board(
     // been persisted. This is independent of whether the miner is running.
     let wirepackets_persisted = commands::wirepackets_path(name, activation).is_file();
 
+    // The authentic event from QP-HD; heritage and depth are never recomputed.
+    let loaded_event = load_payload_event(name, activation)?;
+
+    let (event, depth_record, depth) = match loaded_event {
+        Some((record, payload)) => {
+            let view = payload_event_view(record.clone(), &payload);
+            let depth = depth_response(payload.depth());
+
+            (Some(view), Some(record), Some(depth))
+        }
+        None => (None, None, None),
+    };
+
     let registered = registered_networks().networks;
     let kind_order = ["bitcoin", "ethereum", "solana", "tron"];
 
@@ -2705,29 +2754,16 @@ fn build_payload_board(
         };
 
         let primary = matching.first().copied();
-        let network_id_for_depth = match network_filter {
-            Some(net) if in_scope => Some(net.to_string()),
-            _ => primary.map(|n| n.id.clone()).filter(|_| in_scope),
-        };
 
-        let (depth_record, depth_path, depth_objects) = match &network_id_for_depth {
-            Some(id) => {
-                collect_depth_for_activation_network(&substrate_path, activation, id)
-            }
-            None => (None, None, Vec::new()),
-        };
-
-        // Wire packets are Bitcoin settlement artifacts. No AuthorizedPayload,
-        // authorization state or settlement state is ever manufactured here.
-        let authorized_payload = if in_scope {
-            Some(AuthorizedPayloadView {
-                carried: kind == "bitcoin" && wirepackets_persisted,
-                request: None,
-                authorization_state: None,
-                settlement_state: None,
-            })
-        } else {
-            None
+        // Network entries project the event's actual depth; they no longer
+        // search for separate network payload directories.
+        let (depth_path, depth_objects, record) = match (&depth, in_scope) {
+            (Some(depth), true) => (
+                Some(depth.path.clone()),
+                depth.objects.clone(),
+                depth_record.clone(),
+            ),
+            _ => (None, Vec::new(), None),
         };
 
         kinds.push(PayloadKindEntry {
@@ -2735,10 +2771,13 @@ fn build_payload_board(
             network: primary.cloned(),
             in_scope,
             available: primary.is_some(),
-            authorized_payload,
+
+            // No authorization state is manufactured by the board.
+            authorized_payload: None,
+
             depth_objects,
             depth_path,
-            depth_record,
+            depth_record: record,
         });
     }
 
@@ -2761,6 +2800,7 @@ fn build_payload_board(
         network: network_filter.map(str::to_string),
         observation,
         commitment,
+        event,
         kinds,
         runtime: serialize_runtime(SystemTime::now()),
         message,
