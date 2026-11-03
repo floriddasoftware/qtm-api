@@ -373,6 +373,7 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 // -----------------------------------------------------------------------------
 
 
+
 #[cfg(feature = "bit-miner")]
 fn start_live_wirepackets(
     substrate: &String,
@@ -394,22 +395,12 @@ fn start_live_wirepackets(
     }
 
     let Some(bind) = TcpReceiver::from_env() else {
-        eprintln!(
-            "live_wirepackets=disabled \
-             BIT_MINNER_TCP_BIND is missing or invalid"
-        );
+        eprintln!("live_wirepackets=disabled reason=invalid_bind");
         return;
     };
 
     let substrate = substrate.clone();
     let stored_packets = Arc::new(Mutex::new(Vec::<u8>::new()));
-
-    eprintln!(
-        "live_wirepackets=starting \
-         substrate={substrate} \
-         activation={activation} \
-         addr={bind}"
-    );
 
     thread::spawn(move || {
         let listener = match TcpListener::bind(bind) {
@@ -419,12 +410,6 @@ fn start_live_wirepackets(
                 return;
             }
         };
-
-        eprintln!(
-            "live_wirepackets=listening \
-             substrate={substrate} \
-             activation={activation}"
-        );
 
         for connection in listener.incoming() {
             match connection {
@@ -464,8 +449,7 @@ fn start_live_wirepackets(
                                 break;
                             }
 
-                            // Deserialize and validate using bit-miner's existing helper.
-                            let packet = match WirePacket::deserialize(&bytes) {
+                            let _packet = match WirePacket::deserialize(&bytes) {
                                 Ok(packet) => packet,
                                 Err(e) => {
                                     eprintln!(
@@ -485,39 +469,25 @@ fn start_live_wirepackets(
                                 }
                             };
 
-                            // Preserve the original four-byte TCP frame.
+                            let previous_len = stored.len();
+
                             stored.extend_from_slice(&length_bytes);
                             stored.extend_from_slice(&bytes);
 
-                            // Persist the accumulated packets for this activation.
                             if let Err(e) = persist_live_wirepackets(
                                 &substrate,
                                 activation,
                                 &stored,
                             ) {
-                                stored.truncate(
-                                    stored.len() - length_bytes.len() - bytes.len()
-                                );
+                                stored.truncate(previous_len);
 
                                 eprintln!(
                                     "live_wirepackets=persist_failed \
                                      substrate={substrate} \
                                      activation={activation} \
-                                     error={e}"
+                                     response={e:?}"
                                 );
-                                continue;
                             }
-
-                            eprintln!(
-                                "live_wirepackets=persisted \
-                                 substrate={substrate} \
-                                 activation={activation} \
-                                 txid={} \
-                                 vout={} \
-                                 packet_bytes={length}",
-                                packet.txid(),
-                                packet.vout(),
-                            );
                         }
                     });
                 }
@@ -552,6 +522,7 @@ fn persist_live_wirepackets(
             )
         })
 }
+
 
 /// Metadata for the persisted wire-packet file. A missing file is reported as
 /// `exists: false`; nothing is fabricated.
@@ -2785,6 +2756,7 @@ async fn list_bitcoin_observations(
 }
 
 
+
 /// Runs the bit-miner observation stream inside the qtm-api child process.
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
@@ -2793,7 +2765,6 @@ fn run_bit_miner(args: &[String]) -> ! {
         MempoolStreamMode,
     };
 
-    // Resolve the activation supplied by start_bitminer().
     let activation = match args.first().and_then(|value| value.parse::<u64>().ok()) {
         Some(value) => value,
         None => {
@@ -2802,7 +2773,6 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     };
 
-    // Resolve the substrate supplied by start_bitminer().
     let substrate = match args.get(1) {
         Some(value) if !value.trim().is_empty() => value.clone(),
         _ => {
@@ -2816,7 +2786,6 @@ fn run_bit_miner(args: &[String]) -> ! {
         std::process::exit(2);
     }
 
-    // Initialize the Bitcoin pipeline for this exact substrate and activation.
     let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
         activation,
         &substrate,
@@ -2831,8 +2800,8 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     };
 
-    // Start TCP ingress only after the activation-scoped pipeline is ready.
-    start_live_wirepackets(substrate.clone(), activation);
+    // Start ingress after the activation-scoped pipeline is ready.
+    start_live_wirepackets(&substrate, activation);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2842,11 +2811,6 @@ fn run_bit_miner(args: &[String]) -> ! {
             std::process::exit(1);
         });
 
-    eprintln!(
-        "bit-miner: starting transaction stream \
-         substrate={substrate} activation={activation}"
-    );
-
     runtime.block_on(async move {
         loop {
             let mut observation_stream = match MempoolSpaceStream::connect(
@@ -2855,23 +2819,12 @@ fn run_bit_miner(args: &[String]) -> ! {
             )
             .await
             {
-                Ok(observation_stream) => {
-                    eprintln!(
-                        "bit-miner: connected to Mempool.space \
-                         substrate={substrate} activation={activation}"
-                    );
-                    observation_stream
-                }
+                Ok(observation_stream) => observation_stream,
                 Err(error) => {
                     eprintln!(
                         "bit-miner: stream connection failed \
                          substrate={substrate} activation={activation}: {error}"
                     );
-
-                    tokio::time::sleep(
-                        std::time::Duration::from_secs(2)
-                    ).await;
-
                     continue;
                 }
             };
@@ -2906,15 +2859,12 @@ fn run_bit_miner(args: &[String]) -> ! {
                     }
                 }
             }
-
-            tokio::time::sleep(
-                std::time::Duration::from_secs(2)
-            ).await;
         }
     });
 
     unreachable!("bit-miner stream loop is intentionally persistent");
 }
+
 
 
 fn build_payload_board(
