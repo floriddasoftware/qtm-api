@@ -1132,30 +1132,29 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
     })
 }
 
-fn event_map_response(direction: Direction, depth: &Depth) -> EventMapResponse {
-    let event = direction.into_event();
+fn event_map_response(payload: EventPayload) -> EventMapResponse {
+    let event = payload.direction.into_event();
+
     EventMapResponse {
         scale: scale_name(event.scale).to_string(),
         runtime: serialize_runtime(event.runtime),
-        depth: depth_response(depth),
+        depth: depth_response(&payload.depth),
     }
 }
 
 fn direction_response(
-    direction: Direction,
+    payload: EventPayload,
     selection: Option<TransitSelection>,
     qtm: QtmResponse,
-    depth: &Depth,
 ) -> DirectionResponse {
     DirectionResponse {
         frame: DirectionFrameResponse {
             qtm: qtm_frame(qtm),
-            event: event_map_response(direction, depth),
+            event: event_map_response(payload),
         },
         selection,
     }
 }
-
 /* ---------- Activation/network budget persistence ---------- */
 
 fn budget_directory(substrate_path: &FsPath, activation: u64, network: &str) -> PathBuf {
@@ -1888,7 +1887,7 @@ async fn receive_wallet(
         Scale::Local,
     );
 
-    let event_response = EventMapResponse::from(payload);
+    let event_response = event_map_response(payload);
 
     Ok(Json(ReceiveResponse {
         frame: QuantumTransactionFrame {
