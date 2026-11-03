@@ -1,4 +1,5 @@
-use bit_miner::sharedtypes::{
+use bit_miner::bitcoinpayload::BitcoinPayload,
+sharedtypes::{
     Authorization,
     AuthorizationState,
     SettlementRequest,
