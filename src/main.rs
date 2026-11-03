@@ -373,8 +373,16 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 // -----------------------------------------------------------------------------
 
 #[cfg(feature = "bit-miner")]
-fn start_live_wirepackets() {
+fn start_live_wirepackets(
+    substrate: String,
+    activation: u64,
+) {
     use bit_miner::broadcast::TcpReceiver;
+
+    if !valid_substrate_name(&substrate) {
+        eprintln!("live_wirepackets=disabled reason=invalid_substrate");
+        return;
+    }
 
     let Some(bind) = TcpReceiver::from_env() else {
         eprintln!(
@@ -384,11 +392,37 @@ fn start_live_wirepackets() {
         return;
     };
 
-    eprintln!("live_wirepackets=starting addr={bind}");
+    eprintln!(
+        "live_wirepackets=starting \
+         substrate={substrate} \
+         activation={activation} \
+         addr={bind}"
+    );
 
     TcpReceiver::spawn(bind);
 }
 
+
+fn persist_live_wirepackets(
+    substrate: &str,
+    activation: u64,
+    packets: &[u8],
+) -> ApiResult<()> {
+    if !valid_substrate_name(substrate) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid substrate name",
+        ));
+    }
+
+    commands::persist_wirepackets(substrate, activation, packets)
+        .map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to persist live wirepackets: {e}"),
+            )
+        })
+}
 /// Metadata for the persisted wire-packet file. A missing file is reported as
 /// `exists: false`; nothing is fabricated.
 async fn get_wirepackets(
