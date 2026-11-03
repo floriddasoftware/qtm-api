@@ -2629,6 +2629,43 @@ async fn get_bitminer_status(
     }))
 }
 
+
+const BITMINER_LOG_MAX_BYTES: usize = 1024 * 1024;
+
+async fn get_bitminer_log(
+    Path((name, activation, network)): Path<(String, u64, String)>,
+) -> ApiResult<Response> {
+    validate_bitminer_scope(&name, &network)?;
+    ensure_existing_substrate(&name)?;
+
+    let path = bitminer_log_path(&name, activation);
+
+    let bytes = std::fs::read(&path).map_err(|io_error| {
+        error(
+            if io_error.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            format!("unable to read bit-miner log: {io_error}"),
+        )
+    })?;
+
+    let start = bytes.len().saturating_sub(BITMINER_LOG_MAX_BYTES);
+    let body = String::from_utf8_lossy(&bytes[start..]).into_owned();
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+
 #[cfg(feature = "bit-miner")]
 async fn stream(
     observation_stream: &mut bit_miner::observestream::MempoolSpaceStream,
@@ -3125,6 +3162,12 @@ async fn serve() {
             "/wallets/:name/activations/:activation/observations",
             get(list_bitcoin_observations).options(preflight),
         )
+          
+.route(
+    "/wallets/:name/activations/:activation/networks/:network/observation/log",
+    get(get_bitminer_log).options(preflight),
+)
+
         .route(
             "/wallets/:name/activations/:activation/payload-board",
             get(get_payload_board).options(preflight),
