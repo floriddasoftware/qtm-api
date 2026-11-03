@@ -2972,11 +2972,8 @@ fn main() {
 // Axum HTTP server
 // -----------------------------------------------------------------------------
 
-async fn serve() {
-    // Start the bit-miner TCP receiver independently of the HTTP listener.
-    #[cfg(feature = "bit-miner")]
-    start_live_wirepackets();
 
+async fn serve() {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([
@@ -3047,7 +3044,6 @@ async fn serve() {
             "/wallets/:name/activations/:activation/observations",
             get(list_bitcoin_observations).options(preflight),
         )
-        // Payload board — exclusive entry into shared payload state.
         .route(
             "/wallets/:name/activations/:activation/payload-board",
             get(get_payload_board).options(preflight),
@@ -3066,10 +3062,6 @@ async fn serve() {
         )
         .layer(cors);
 
-    // -------------------------------------------------------------------------
-    // Substrate discovery
-    // -------------------------------------------------------------------------
-
     let root = commands::substrate_root();
     println!("substrate_root={}", root.display());
 
@@ -3079,9 +3071,7 @@ async fn serve() {
                 let mut discovered = entries
                     .filter_map(Result::ok)
                     .filter(|entry| entry.path().is_dir())
-                    .map(|entry| {
-                        entry.file_name().to_string_lossy().into_owned()
-                    })
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
                     .filter(|name| valid_substrate_name(name))
                     .collect::<Vec<_>>();
 
@@ -3120,10 +3110,6 @@ async fn serve() {
              (root does not exist; startup did not create it)"
         );
     }
-
-    // -------------------------------------------------------------------------
-    // HTTP listener
-    // -------------------------------------------------------------------------
 
     let port = std::env::var("PORT")
         .ok()
