@@ -2654,7 +2654,8 @@ async fn list_bitcoin_observations(
     }))
 }
 
-// Runs the bit-miner observation stream inside the qtm-api child process.
+
+/// Runs the bit-miner observation stream inside the qtm-api child process.
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
     use bit_miner::observestream::{
@@ -2662,6 +2663,7 @@ fn run_bit_miner(args: &[String]) -> ! {
         MempoolStreamMode,
     };
 
+    // Resolve the activation supplied by start_bitminer().
     let activation = match args.first().and_then(|value| value.parse::<u64>().ok()) {
         Some(value) => value,
         None => {
@@ -2670,6 +2672,7 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     };
 
+    // Resolve the substrate supplied by start_bitminer().
     let substrate = match args.get(1) {
         Some(value) if !value.trim().is_empty() => value.clone(),
         _ => {
@@ -2678,6 +2681,12 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     };
 
+    if !valid_substrate_name(&substrate) {
+        eprintln!("bit-miner: invalid substrate name");
+        std::process::exit(2);
+    }
+
+    // Initialize the Bitcoin pipeline for this exact substrate and activation.
     let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
         activation,
         &substrate,
@@ -2691,6 +2700,9 @@ fn run_bit_miner(args: &[String]) -> ! {
             std::process::exit(1);
         }
     };
+
+    // Start TCP ingress only after the activation-scoped pipeline is ready.
+    start_live_wirepackets(&substrate, activation);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2726,7 +2738,10 @@ fn run_bit_miner(args: &[String]) -> ! {
                          substrate={substrate} activation={activation}: {error}"
                     );
 
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(
+                        std::time::Duration::from_secs(2)
+                    ).await;
+
                     continue;
                 }
             };
@@ -2762,12 +2777,15 @@ fn run_bit_miner(args: &[String]) -> ! {
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(
+                std::time::Duration::from_secs(2)
+            ).await;
         }
     });
 
     unreachable!("bit-miner stream loop is intentionally persistent");
 }
+
 
 fn build_payload_board(
     name: &str,
