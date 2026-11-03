@@ -372,14 +372,23 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 // Live wire-packet TCP ingress
 // -----------------------------------------------------------------------------
 
+
 #[cfg(feature = "bit-miner")]
 fn start_live_wirepackets(
     substrate: &String,
     activation: u64,
 ) {
-    use bit_miner::broadcast::TcpReceiver;
+    use bit_miner::broadcast::{TcpReceiver, WirePacket};
+    use std::{
+        io::{ErrorKind, Read},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+    };
 
-    if !valid_substrate_name(&substrate) {
+    const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+
+    if !valid_substrate_name(substrate) {
         eprintln!("live_wirepackets=disabled reason=invalid_substrate");
         return;
     }
@@ -392,6 +401,9 @@ fn start_live_wirepackets(
         return;
     };
 
+    let substrate = substrate.clone();
+    let stored_packets = Arc::new(Mutex::new(Vec::<u8>::new()));
+
     eprintln!(
         "live_wirepackets=starting \
          substrate={substrate} \
@@ -399,10 +411,127 @@ fn start_live_wirepackets(
          addr={bind}"
     );
 
-    TcpReceiver::spawn(bind);
+    thread::spawn(move || {
+        let listener = match TcpListener::bind(bind) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("live_wirepackets=bind_failed error={e}");
+                return;
+            }
+        };
+
+        eprintln!(
+            "live_wirepackets=listening \
+             substrate={substrate} \
+             activation={activation}"
+        );
+
+        for connection in listener.incoming() {
+            match connection {
+                Ok(mut stream) => {
+                    let substrate = substrate.clone();
+                    let stored_packets = Arc::clone(&stored_packets);
+
+                    thread::spawn(move || {
+                        loop {
+                            let mut length_bytes = [0u8; 4];
+
+                            if let Err(e) = stream.read_exact(&mut length_bytes) {
+                                if e.kind() != ErrorKind::UnexpectedEof {
+                                    eprintln!(
+                                        "live_wirepackets=frame_read_failed error={e}"
+                                    );
+                                }
+                                break;
+                            }
+
+                            let length =
+                                u32::from_be_bytes(length_bytes) as usize;
+
+                            if length == 0 || length > MAX_FRAME_SIZE {
+                                eprintln!(
+                                    "live_wirepackets=invalid_frame_length length={length}"
+                                );
+                                break;
+                            }
+
+                            let mut bytes = vec![0u8; length];
+
+                            if let Err(e) = stream.read_exact(&mut bytes) {
+                                eprintln!(
+                                    "live_wirepackets=packet_read_failed error={e}"
+                                );
+                                break;
+                            }
+
+                            // Deserialize and validate using bit-miner's existing helper.
+                            let packet = match WirePacket::deserialize(&bytes) {
+                                Ok(packet) => packet,
+                                Err(e) => {
+                                    eprintln!(
+                                        "live_wirepackets=deserialize_failed error={e}"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let mut stored = match stored_packets.lock() {
+                                Ok(stored) => stored,
+                                Err(e) => {
+                                    eprintln!(
+                                        "live_wirepackets=storage_lock_failed error={e}"
+                                    );
+                                    break;
+                                }
+                            };
+
+                            // Preserve the original four-byte TCP frame.
+                            stored.extend_from_slice(&length_bytes);
+                            stored.extend_from_slice(&bytes);
+
+                            // Persist the accumulated packets for this activation.
+                            if let Err(e) = persist_live_wirepackets(
+                                &substrate,
+                                activation,
+                                &stored,
+                            ) {
+                                stored.truncate(
+                                    stored.len() - length_bytes.len() - bytes.len()
+                                );
+
+                                eprintln!(
+                                    "live_wirepackets=persist_failed \
+                                     substrate={substrate} \
+                                     activation={activation} \
+                                     error={e}"
+                                );
+                                continue;
+                            }
+
+                            eprintln!(
+                                "live_wirepackets=persisted \
+                                 substrate={substrate} \
+                                 activation={activation} \
+                                 txid={} \
+                                 vout={} \
+                                 packet_bytes={length}",
+                                packet.txid(),
+                                packet.vout(),
+                            );
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "live_wirepackets=accept_failed error={e}"
+                    );
+                }
+            }
+        }
+    });
 }
 
-
+#[cfg(feature = "bit-miner")]
 fn persist_live_wirepackets(
     substrate: &str,
     activation: u64,
@@ -411,7 +540,7 @@ fn persist_live_wirepackets(
     if !valid_substrate_name(substrate) {
         return Err(error(
             StatusCode::BAD_REQUEST,
-            "invalid substrate name",
+            "invalid substrate name".to_string(),
         ));
     }
 
@@ -423,6 +552,7 @@ fn persist_live_wirepackets(
             )
         })
 }
+
 /// Metadata for the persisted wire-packet file. A missing file is reported as
 /// `exists: false`; nothing is fabricated.
 async fn get_wirepackets(
