@@ -23,3 +23,6 @@ bit_miner = {
 [features]
 default = ["bit-miner"]
 bit-miner = ["dep:bit_miner"]
+quantom_value = {
+    git = "https://github.com/QuantPerm-Labs/Quantom-VALUE"
+}
