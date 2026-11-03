@@ -1,9 +1,11 @@
-use bit_miner::bitcoinpayload::BitcoinPayload,
-sharedtypes::{
-    Authorization,
-    AuthorizationState,
-    SettlementRequest,
-    SettlementState,
+use bituse bit_miner::{
+    bitcoinpayload::BitcoinPayload,
+    sharedtypes::{
+        Authorization,
+        AuthorizationState,
+        SettlementRequest,
+        SettlementState,
+    },
 };
 
 use qtm_graph::graph::{
