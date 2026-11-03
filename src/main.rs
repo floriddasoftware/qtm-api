@@ -2702,7 +2702,7 @@ fn run_bit_miner(args: &[String]) -> ! {
     };
 
     // Start TCP ingress only after the activation-scoped pipeline is ready.
-    start_live_wirepackets(&substrate, activation);
+    start_live_wirepackets(substrate.clone(), activation);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
