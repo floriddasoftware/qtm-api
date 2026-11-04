@@ -3038,6 +3038,11 @@ async fn get_payload_board_for_network(
 
 // qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
 // from USERPROFILE before any thread starts.
+
+// -----------------------------------------------------------------------------
+// Application entry point
+// -----------------------------------------------------------------------------
+
 fn main() {
     resolve_home();
 
@@ -3046,25 +3051,6 @@ fn main() {
         let _ = rustls::crypto::ring::default_provider()
             .install_default();
     }
-
-    #[cfg(feature = "bit-miner")]
-    {
-        let args: Vec<String> = std::env::args().collect();
-
-        if args.get(1).map(String::as_str) == Some("--bit-miner") {
-            run_bit_miner(&args[2..]);
-        }
-    }
-}
-
-
-
-// -----------------------------------------------------------------------------
-// Application entry point
-// -----------------------------------------------------------------------------
-
-fn main() {
-    resolve_home();
 
     #[cfg(feature = "bit-miner")]
     {
@@ -3093,7 +3079,6 @@ fn main() {
 // -----------------------------------------------------------------------------
 // Axum HTTP server
 // -----------------------------------------------------------------------------
-
 
 async fn serve() {
     let cors = CorsLayer::new()
@@ -3166,12 +3151,10 @@ async fn serve() {
             "/wallets/:name/activations/:activation/observations",
             get(list_bitcoin_observations).options(preflight),
         )
-          
-.route(
-    "/wallets/:name/activations/:activation/networks/:network/observation/log",
-    get(get_bitminer_log).options(preflight),
-)
-
+        .route(
+            "/wallets/:name/activations/:activation/networks/:network/observation/log",
+            get(get_bitminer_log).options(preflight),
+        )
         .route(
             "/wallets/:name/activations/:activation/payload-board",
             get(get_payload_board).options(preflight),
@@ -3199,7 +3182,9 @@ async fn serve() {
                 let mut discovered = entries
                     .filter_map(Result::ok)
                     .filter(|entry| entry.path().is_dir())
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .map(|entry| {
+                        entry.file_name().to_string_lossy().into_owned()
+                    })
                     .filter(|name| valid_substrate_name(name))
                     .collect::<Vec<_>>();
 
