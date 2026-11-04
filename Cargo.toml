@@ -1,3 +1,4 @@
+
 [package]
 name = "qtm-api"
 version = "0.1.0"
@@ -14,12 +15,22 @@ qp-hd = { git = "https://github.com/floriddasoftware/QTM" }
 qtm-graph = { git = "https://github.com/floriddasoftware/Quantum-Economies" }
 hex = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
+
 bit_miner = {
     package = "bit-miner",
     git = "https://github.com/floriddasoftware/bit-miner",
     optional = true
 }
+
 quantom_value = { git = "https://github.com/QuantPerm-Labs/Quantom-VALUE" }
+
+rustls = {
+    version = "0.23",
+    default-features = false,
+    features = ["ring", "std", "tls12"],
+    optional = true
+}
+
 [features]
 default = ["bit-miner"]
-bit-miner = ["dep:bit_miner"]
+bit-miner = ["dep:bit_miner", "dep:rustls"]
