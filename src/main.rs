@@ -3036,6 +3036,25 @@ async fn get_payload_board_for_network(
     )?))
 }
 
+// qp_hd::commands::substrate_root() reads HOME.
+// On Windows, derive HOME from USERPROFILE before any thread starts.
+fn resolve_home() {
+    #[cfg(windows)]
+    {
+        let home_exists = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .is_some();
+
+        if !home_exists {
+            if let Some(profile) = std::env::var_os("USERPROFILE") {
+                unsafe {
+                    std::env::set_var("HOME", profile);
+                }
+            }
+        }
+    }
+}
+
 // qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
 // from USERPROFILE before any thread starts.
 
