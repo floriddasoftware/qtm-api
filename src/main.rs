@@ -3038,17 +3038,21 @@ async fn get_payload_board_for_network(
 
 // qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
 // from USERPROFILE before any thread starts.
-fn resolve_home() {
-    if std::env::var_os("HOME").is_some() {
-        return;
+fn main() {
+    resolve_home();
+
+    #[cfg(feature = "bit-miner")]
+    {
+        let _ = rustls::crypto::ring::default_provider()
+            .install_default();
     }
-    match std::env::var_os("USERPROFILE") {
-        // Single-threaded here; `unsafe` is required on edition 2024 only.
-        #[allow(unused_unsafe)]
-        Some(profile) => unsafe { std::env::set_var("HOME", profile) },
-        None => {
-            eprintln!("neither HOME nor USERPROFILE is set; qp_hd cannot resolve ~/.qp/substrates");
-            std::process::exit(1);
+
+    #[cfg(feature = "bit-miner")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+
+        if args.get(1).map(String::as_str) == Some("--bit-miner") {
+            run_bit_miner(&args[2..]);
         }
     }
 }
