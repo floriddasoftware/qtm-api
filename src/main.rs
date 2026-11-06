@@ -372,8 +372,6 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 // Live wire-packet TCP ingress
 // -----------------------------------------------------------------------------
 
-
-
 #[cfg(feature = "bit-miner")]
 fn start_live_wirepackets(
     substrate: &String,
@@ -475,20 +473,17 @@ fn start_live_wirepackets(
                             stored.extend_from_slice(&bytes);
 
                             if let Err((status, _)) = persist_live_wirepackets(
-    &substrate,
-    activation,
-    &stored,
-) {
-    stored.truncate(previous_len);
+                                &substrate,
+                                activation,
+                                &stored,
+                            ) {
+                                stored.truncate(previous_len);
 
-    eprintln!(
-        "live_wirepackets=persist_failed \
-         substrate={substrate} \
-         activation={activation} \
-         status={}",
-        status.as_u16()
-    );
-}
+                                eprintln!(
+                                    "live_wirepackets=persist_failed                                      substrate={substrate}                                      activation={activation}                                      status={}",
+                                    status.as_u16()
+                                );
+                            }
                         }
                     });
                 }
@@ -523,7 +518,6 @@ fn persist_live_wirepackets(
             )
         })
 }
-
 
 /// Metadata for the persisted wire-packet file. A missing file is reported as
 /// `exists: false`; nothing is fabricated.
@@ -698,10 +692,7 @@ fn resolve_stored_event(name: &str, activation: u64) -> ApiResult<PathBuf> {
             error(
                 StatusCode::CONFLICT,
                 format!(
-                    "No stored event for substrate '{name}' at activation {activation} \
-                     (expected {}/events/event_{activation}_<dimension>). Run a transit \
-                     first. On Render the disk is wiped on every deploy unless a \
-                     persistent disk is mounted for ~/.qp.",
+                    "No stored event for substrate '{name}' at activation {activation}                      (expected {}/events/event_{activation}_<dimension>). Run a transit                      first. On Render the disk is wiped on every deploy unless a                      persistent disk is mounted for ~/.qp.",
                     commands::substrate_root().join(name).display()
                 ),
             )
@@ -1061,7 +1052,8 @@ fn write_depth_payload(record_path: &FsPath, network: &str, depth: &Depth) -> Ap
     for object in &response.objects {
         // Hex-encode identifiers so tabs/newlines cannot corrupt the TSV format.
         objects.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}	{}	{}	{}
+",
             object.position,
             hex::encode(object.identifier.as_bytes()),
             object.mass,
@@ -1239,7 +1231,7 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
             continue;
         }
 
-        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        let fields: Vec<&str> = line.splitn(4, '	').collect();
         if fields.len() != 4 {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1459,7 +1451,10 @@ fn persist_network_budget(
     let path = directory.join("budget");
     let temporary_path = directory.join("budget.tmp");
     let contents = format!(
-        "min_events={}\nmax_events={}\nmax_retained_mass={}\n",
+        "min_events={}
+max_events={}
+max_retained_mass={}
+",
         body.min_events, body.max_events, body.max_retained_mass
     );
 
@@ -1975,7 +1970,7 @@ async fn transit_wallet(
     // Persist the actual input depth under this event and network.
     write_depth_payload(&record_path, &network_id, &event.depth)?;
 
-        let qtm = QtmResponse {
+    let qtm = QtmResponse {
         commitment: hex::encode(event.qtm.commitment),
         coordinate: hex::encode(event.qtm.coordinate),
         sigma: event.qtm.sigma.to_string(),
@@ -2036,7 +2031,7 @@ async fn receive_wallet(
         },
     };
 
-       let event = guarded("receive", || transaction.receive(&name, flow))?;
+    let event = guarded("receive", || transaction.receive(&name, flow))?;
 
     let payload = EventPayload::from_heritage(
         event.heritage,
@@ -2182,9 +2177,6 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
         qtm,
     )))
 }
-
-
-
 
 /*
  * Payload board — API entry into shared payload state.
@@ -2393,7 +2385,6 @@ fn payload_event_view(record: String, payload: &EventPayload) -> PayloadEventVie
     }
 }
 
-
 type BitMinerKey = String;
 
 static BIT_MINER_PROCESSES: OnceLock<AsyncMutex<HashMap<BitMinerKey, Child>>> =
@@ -2580,6 +2571,7 @@ async fn start_bitminer(
         message: "bit-miner process started".into(),
     }))
 }
+
 #[derive(Serialize)]
 struct BitMinerStatusResponse {
     substrate: String,
@@ -2629,7 +2621,6 @@ async fn get_bitminer_status(
     }))
 }
 
-
 const BITMINER_LOG_MAX_BYTES: usize = 1024 * 1024;
 
 async fn get_bitminer_log(
@@ -2664,7 +2655,6 @@ async fn get_bitminer_log(
     )
         .into_response())
 }
-
 
 #[cfg(feature = "bit-miner")]
 async fn stream(
@@ -2793,8 +2783,6 @@ async fn list_bitcoin_observations(
     }))
 }
 
-
-
 /// Runs the bit-miner observation stream inside the qtm-api child process.
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
@@ -2803,7 +2791,23 @@ fn run_bit_miner(args: &[String]) -> ! {
         MempoolStreamMode,
     };
 
-    // Keep the existing argument parsing and pipeline initialization here.
+    let activation = args
+        .get(0)
+        .expect("missing activation")
+        .parse::<u64>()
+        .expect("invalid activation");
+
+    let substrate = args
+        .get(1)
+        .expect("missing substrate")
+        .clone();
+
+    let mut pipeline = bit_miner::BitcoinObservationPipeline::new(
+        activation,
+        &substrate,
+    )
+    .expect("failed to initialize Bitcoin observation pipeline");
+
     // Start ingress after the activation-scoped pipeline is ready.
     start_live_wirepackets(&substrate, activation);
 
@@ -2828,9 +2832,7 @@ fn run_bit_miner(args: &[String]) -> ! {
                 Ok(observation_stream) => observation_stream,
                 Err(error) => {
                     eprintln!(
-                        "bit-miner: stream connection failed \
-                         substrate={substrate} \
-                         activation={activation}: {error}"
+                        "bit-miner: stream connection failed                          substrate={substrate}                          activation={activation}: {error}"
                     );
                     continue;
                 }
@@ -2844,48 +2846,20 @@ fn run_bit_miner(args: &[String]) -> ! {
                 )
                 .await
                 {
-                    Ok(Ok(Some((
-                        _finalized,
-                        retained_mass,
-                        commitment,
-                        depth,
-                    )))) => {
-                        let depth = depth_response(&depth);
-
-                        match serde_json::to_string(&depth) {
-                            Ok(depth) => {
-                                eprintln!(
-                                    "bit-miner: transaction processed \
-                                     substrate={substrate} \
-                                     activation={activation} \
-                                     retained_mass={retained_mass} \
-                                     commitment={} \
-                                     depth={depth}",
-                                    hex::encode(commitment),
-                                );
-                            }
-                            Err(error) => {
-                                eprintln!(
-                                    "bit-miner: depth serialization failed \
-                                     substrate={substrate} \
-                                     activation={activation}: {error}"
-                                );
-                            }
-                        }
+                    Ok(Ok(Some(_outcome))) => {
+                        eprintln!(
+                            "bit-miner: transaction processed                              substrate={substrate} activation={activation}"
+                        );
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(error)) => {
                         eprintln!(
-                            "bit-miner: pipeline processing failed \
-                             substrate={substrate} \
-                             activation={activation}: {error}"
+                            "bit-miner: pipeline processing failed                              substrate={substrate} activation={activation}: {error}"
                         );
                     }
                     Err(error) => {
                         eprintln!(
-                            "bit-miner: observation stream disconnected \
-                             substrate={substrate} \
-                             activation={activation}: {error}"
+                            "bit-miner: observation stream disconnected                              substrate={substrate} activation={activation}: {error}"
                         );
                         break;
                     }
@@ -2898,8 +2872,6 @@ fn run_bit_miner(args: &[String]) -> ! {
         "bit-miner stream loop is intentionally persistent"
     );
 }
-
-
 
 fn build_payload_board(
     name: &str,
@@ -3050,9 +3022,6 @@ fn resolve_home() {
         }
     }
 }
-
-// qp_hd::commands::substrate_root() reads only HOME. On Windows, derive it
-// from USERPROFILE before any thread starts.
 
 // -----------------------------------------------------------------------------
 // Application entry point
@@ -3234,8 +3203,7 @@ async fn serve() {
         }
     } else {
         println!(
-            "substrates_discovered=0 \
-             (root does not exist; startup did not create it)"
+            "substrates_discovered=0              (root does not exist; startup did not create it)"
         );
     }
 
