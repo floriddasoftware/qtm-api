@@ -2803,41 +2803,99 @@ fn run_bit_miner(args: &[String]) -> ! {
         MempoolStreamMode,
     };
 
-    let activation = match args.first().and_then(|value| value.parse::<u64>().ok()) {
-        Some(value) => value,
-        None => {
-            eprintln!("bit-miner: missing or invalid activation");
-            std::process::exit(2);
-        }
-    };
+    // Keep the existing argument parsing and pipeline initialization here.
+    // Start ingress after the activation-scoped pipeline is ready.
+    start_live_wirepackets(&substrate, activation);
 
-    let substrate = match args.get(1) {
-        Some(value) if !value.trim().is_empty() => value.clone(),
-        _ => {
-            eprintln!("bit-miner: missing substrate");
-            std::process::exit(2);
-        }
-    };
-
-    if !valid_substrate_name(&substrate) {
-        eprintln!("bit-miner: invalid substrate name");
-        std::process::exit(2);
-    }
-
-    let mut pipeline = match bit_miner::BitcoinObservationPipeline::new(
-        activation,
-        &substrate,
-    ) {
-        Ok(pipeline) => pipeline,
-        Err(error) => {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
             eprintln!(
-                "bit-miner: pipeline initialization failed \
-                 substrate={substrate} activation={activation}: {error}"
+                "bit-miner: runtime initialization failed: {error}"
             );
             std::process::exit(1);
-        }
-    };
+        });
 
+    runtime.block_on(async move {
+        loop {
+            let mut observation_stream = match MempoolSpaceStream::connect(
+                activation,
+                MempoolStreamMode::TransactionIds,
+            )
+            .await
+            {
+                Ok(observation_stream) => observation_stream,
+                Err(error) => {
+                    eprintln!(
+                        "bit-miner: stream connection failed \
+                         substrate={substrate} \
+                         activation={activation}: {error}"
+                    );
+                    continue;
+                }
+            };
+
+            loop {
+                match stream(
+                    &mut observation_stream,
+                    &substrate,
+                    &mut pipeline,
+                )
+                .await
+                {
+                    Ok(Ok(Some((
+                        _finalized,
+                        retained_mass,
+                        commitment,
+                        depth,
+                    )))) => {
+                        let depth = depth_response(&depth);
+
+                        match serde_json::to_string(&depth) {
+                            Ok(depth) => {
+                                eprintln!(
+                                    "bit-miner: transaction processed \
+                                     substrate={substrate} \
+                                     activation={activation} \
+                                     retained_mass={retained_mass} \
+                                     commitment={} \
+                                     depth={depth}",
+                                    hex::encode(commitment),
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "bit-miner: depth serialization failed \
+                                     substrate={substrate} \
+                                     activation={activation}: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "bit-miner: pipeline processing failed \
+                             substrate={substrate} \
+                             activation={activation}: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "bit-miner: observation stream disconnected \
+                             substrate={substrate} \
+                             activation={activation}: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    unreachable!("bit-miner stream loop is intentionally persistent");
+}
     // Start ingress after the activation-scoped pipeline is ready.
     start_live_wirepackets(&substrate, activation);
 
