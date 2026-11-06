@@ -2894,7 +2894,9 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     });
 
-    unreachable!("bit-miner stream loop is intentionally persistent");
+    unreachable!(
+        "bit-miner stream loop is intentionally persistent"
+    );
 }
     // Start ingress after the activation-scoped pipeline is ready.
     start_live_wirepackets(&substrate, activation);
@@ -2958,7 +2960,7 @@ fn run_bit_miner(args: &[String]) -> ! {
         }
     });
 
-    unreachable!("bit-miner stream loop is intentionally persistent");
+    usnreachable!("bit-miner stream loop is intentionally persistent");
 }
 
 
