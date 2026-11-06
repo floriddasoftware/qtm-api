@@ -33,7 +33,7 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 #[cfg(feature = "bit-miner")]
-use bit_miner::broadcast::FinalizedSettlement;
+// use bit_miner::broadcast::FinalizedSettlement;
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
 const MAX_SUBSTRATE_NAME_LENGTH: usize = 64;
@@ -1231,7 +1231,7 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
             continue;
         }
 
-        let fields: Vec<&str> = line.splitn(4, '	').collect();
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
         if fields.len() != 4 {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
