@@ -33,6 +33,14 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 #[cfg(feature = "bit-miner")]
+#[cfg(feature = "bit-miner")]
+use bitcoin::{Amount, OutPoint, TxOut};
+
+#[cfg(feature = "bit-miner")]
+use bit_miner::{
+    bitcoinpsbt::{PrevoutResolver, ResolvedPrevout},
+    broadcast::WirePacket,
+};
 // use bit_miner::broadcast::FinalizedSettlement;
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
@@ -575,6 +583,154 @@ async fn get_wirepackets(
         packets,
     }))
 }
+
+
+#[cfg(feature = "bit-miner")]
+struct WirePacketPrevoutResolver {
+    substrate: String,
+    activation: u64,
+}
+
+#[cfg(feature = "bit-miner")]
+impl WirePacketPrevoutResolver {
+    #[inline(always)]
+    fn new(substrate: &str, activation: u64) -> Self {
+        Self {
+            substrate: substrate.to_owned(),
+            activation,
+        }
+    }
+
+    fn resolve_packet(
+        &self,
+        requested: &OutPoint,
+    ) -> Result<WirePacket, std::io::Error> {
+        use std::io::{Error, ErrorKind};
+
+        let activation_root = commands::substrate_root()
+            .join(&self.substrate)
+            .join("activations");
+
+        let entries = std::fs::read_dir(&activation_root)?;
+
+        let mut activations = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                if !entry.path().is_dir() {
+                    return None;
+                }
+
+                entry.file_name()
+                    .to_str()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .filter(|activation| *activation <= self.activation)
+            .collect::<Vec<_>>();
+
+        activations.sort_unstable();
+
+        for activation in activations.into_iter().rev() {
+            let path = commands::wirepackets_path(
+                &self.substrate,
+                activation,
+            );
+
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            let mut offset = 0usize;
+
+            while offset < bytes.len() {
+                let remaining = bytes.len() - offset;
+
+                if remaining < 4 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "incomplete wire-packet frame: {}",
+                            path.display(),
+                        ),
+                    ));
+                }
+
+                let length = u32::from_be_bytes(
+                    bytes[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| {
+                            Error::new(
+                                ErrorKind::InvalidData,
+                                "invalid wire-packet frame length",
+                            )
+                        })?,
+                ) as usize;
+
+                offset += 4;
+
+                if length == 0
+                    || length > WirePacket::MAX_SIZE
+                    || length > bytes.len().saturating_sub(offset)
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "invalid wire-packet frame in {}",
+                            path.display(),
+                        ),
+                    ));
+                }
+
+                let packet = WirePacket::deserialize(
+                    &bytes[offset..offset + length],
+                )?;
+
+                offset += length;
+
+                if packet.outpoint == *requested {
+                    return Ok(packet);
+                }
+            }
+        }
+
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "previous output not found: {}:{}",
+                requested.txid,
+                requested.vout,
+            ),
+        ))
+    }
+}
+
+#[cfg(feature = "bit-miner")]
+impl PrevoutResolver for WirePacketPrevoutResolver {
+    fn resolve(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<
+        ResolvedPrevout,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let packet = self.resolve_packet(outpoint)?;
+
+        Ok(ResolvedPrevout {
+            output: TxOut {
+                value: Amount::from_sat(packet.value),
+                script_pubkey: packet.script_pubkey,
+            },
+            previous_transaction: None,
+        })
+    }
+}
+
 
 /// Raw bytes of the persisted wire-packet file.
 async fn get_wirepackets_file(
@@ -2661,10 +2817,13 @@ async fn stream(
     observation_stream: &mut bit_miner::observestream::MempoolSpaceStream,
     substrate: &str,
     pipeline: &mut bit_miner::BitcoinObservationPipeline,
+    resolver: &WirePacketPrevoutResolver,
 ) -> bit_miner::observestream::ObservationResult<
     bit_miner::observestream::PipelineOutcome,
 > {
-    observation_stream.stream(substrate, pipeline).await
+    observation_stream
+        .stream(substrate, pipeline, resolver)
+        .await
 }
 
 #[derive(Serialize)]
@@ -2803,14 +2962,17 @@ fn run_bit_miner(args: &[String]) -> ! {
         .clone();
 
     let mut pipeline = bit_miner::BitcoinObservationPipeline::new(
-        activation,
-        &substrate,
-    )
-    .expect("failed to initialize Bitcoin observation pipeline");
+    activation,
+    &substrate,
+)
+.expect("failed to initialize Bitcoin observation pipeline");
 
-    // Start ingress after the activation-scoped pipeline is ready.
-    start_live_wirepackets(&substrate, activation);
+let resolver = WirePacketPrevoutResolver::new(
+    &substrate,
+    activation,
+);
 
+start_live_wirepackets(&substrate, activation);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -2840,12 +3002,13 @@ fn run_bit_miner(args: &[String]) -> ! {
 
             loop {
                 match stream(
-                    &mut observation_stream,
-                    &substrate,
-                    &mut pipeline,
-                )
-                .await
-                {
+    &mut observation_stream,
+    &substrate,
+    &mut pipeline,
+    &resolver,
+)
+.await
+{
                     Ok(Ok(Some(_outcome))) => {
                         eprintln!(
                             "bit-miner: transaction processed                              substrate={substrate} activation={activation}"
