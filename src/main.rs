@@ -3448,12 +3448,17 @@ fn build_payload_board(
 async fn get_payload_board(
     Path((name, activation)): Path<(String, u64)>,
 ) -> ApiResult<Json<PayloadBoardResponse>> {
-    // Await the process registry before taking the (non-async) substrate lock.
-    let miner = bitminer_process_state(&name, activation).await?;
+    let miner = bitminer_process_state_any(&name, activation).await?;
 
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    Ok(Json(build_payload_board(&name, activation, None, miner)?))
+
+    Ok(Json(build_payload_board(
+        &name,
+        activation,
+        None,
+        miner,
+    )?))
 }
 
 async fn get_payload_board_for_network(
@@ -3466,7 +3471,7 @@ async fn get_payload_board_for_network(
         ));
     }
 
-    let miner = bitminer_process_state(&name, activation).await?;
+    let miner = bitminer_process_state(&name, activation, &network).await?;
 
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3478,7 +3483,6 @@ async fn get_payload_board_for_network(
         miner,
     )?))
 }
-
 // qp_hd::commands::substrate_root() reads HOME.
 // On Windows, derive HOME from USERPROFILE before any thread starts.
 fn resolve_home() {
