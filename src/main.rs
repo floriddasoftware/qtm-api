@@ -3050,17 +3050,86 @@ fn run_bit_miner(args: &[String]) -> ! {
         .clone();
 
     let mut pipeline = bit_miner::BitcoinObservationPipeline::new(
-    activation,
-    &substrate,
-)
-.expect("failed to initialize Bitcoin observation pipeline");
+        activation,
+        &substrate,
+    )
+    .expect("failed to initialize Bitcoin observation pipeline");
 
-let resolver = WirePacketPrevoutResolver::new(
-    &substrate,
-    activation,
-);
+    let resolver = WirePacketPrevoutResolver::new(
+        &substrate,
+        activation,
+    );
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "bit-miner: runtime initialization failed: {error}"
+            );
+            std::process::exit(1);
+        });
 
+    runtime.block_on(async move {
+        loop {
+            let mut observation_stream = match MempoolSpaceStream::connect(
+                activation,
+                MempoolStreamMode::TransactionIds,
+            )
+            .await
+            {
+                Ok(observation_stream) => observation_stream,
+                Err(error) => {
+                    eprintln!(
+                        "bit-miner: stream connection failed \
+                         substrate={substrate} \
+                         activation={activation}: {error}"
+                    );
+                    continue;
+                }
+            };
+
+            loop {
+                match stream(
+                    &mut observation_stream,
+                    &substrate,
+                    &mut pipeline,
+                    &resolver,
+                )
+                .await
+                {
+                    Ok(Ok(Some(_outcome))) => {
+                        eprintln!(
+                            "bit-miner: transaction processed \
+                             substrate={substrate} \
+                             activation={activation}"
+                        );
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "bit-miner: pipeline processing failed \
+                             substrate={substrate} \
+                             activation={activation}: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "bit-miner: observation stream disconnected \
+                             substrate={substrate} \
+                             activation={activation}: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    unreachable!(
+        "bit-miner stream loop is intentionally persistent"
+    );
+}
 
 /// Return whether any submission has persisted WirePackets for this activation.
 fn has_persisted_wirepackets(
@@ -3077,29 +3146,35 @@ fn has_persisted_wirepackets(
 
     let entries = match std::fs::read_dir(&event_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+        Err(io_error) if io_error.kind() == ErrorKind::NotFound => {
             return Ok(false);
         }
-        Err(error) => {
+        Err(io_error) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect WirePackets submissions: {error}"),
+                format!(
+                    "unable to inspect WirePackets submissions: {io_error}"
+                ),
             ));
         }
     };
 
     for entry in entries {
-        let entry = entry.map_err(|error| {
+        let entry = entry.map_err(|io_error| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read WirePackets submission entry: {error}"),
+                format!(
+                    "unable to read WirePackets submission entry: {io_error}"
+                ),
             )
         })?;
 
-        let file_type = entry.file_type().map_err(|error| {
+        let file_type = entry.file_type().map_err(|io_error| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect WirePackets submission entry: {error}"),
+                format!(
+                    "unable to inspect WirePackets submission entry: {io_error}"
+                ),
             )
         })?;
 
@@ -3127,11 +3202,13 @@ fn has_persisted_wirepackets(
                 return Ok(true);
             }
             Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
+            Err(io_error) if io_error.kind() == ErrorKind::NotFound => {}
+            Err(io_error) => {
                 return Err(error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect WirePackets file: {error}"),
+                    format!(
+                        "unable to inspect WirePackets file: {io_error}"
+                    ),
                 ));
             }
         }
@@ -3139,7 +3216,6 @@ fn has_persisted_wirepackets(
 
     Ok(false)
 }
-
 fn build_payload_board(
     name: &str,
     activation: u64,
