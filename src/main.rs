@@ -577,14 +577,23 @@ async fn get_wirepackets(
 
     ensure_existing_substrate(&name)?;
 
-    let budget = load_budget(&name, activation).map_err(|io_error| {
-        error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "unable to load budget for substrate {name}, activation {activation}: {io_error}"
-            ),
-        )
-    })?;
+    let budget = load_budget(
+    &name,
+    activation,
+    &network,
+)
+.map_err(|io_error| {
+    error(
+        StatusCode::NOT_FOUND,
+        format!(
+            "unable to load budget for substrate={} activation={} network={}: {}",
+            name,
+            activation,
+            network,
+            io_error,
+        ),
+    )
+})?;
 
     let event_root = commands::substrate_root()
         .join(&name)
@@ -2533,6 +2542,7 @@ fn payload_event_view(
     }
 }
 
+
 type BitMinerKey = String;
 
 static BIT_MINER_PROCESSES: OnceLock<AsyncMutex<HashMap<BitMinerKey, Child>>> =
@@ -2542,12 +2552,27 @@ fn bit_miner_processes() -> &'static AsyncMutex<HashMap<BitMinerKey, Child>> {
     BIT_MINER_PROCESSES.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
-fn bitminer_log_path(substrate: &str, activation: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("bit-miner-{substrate}-{activation}.log"))
+fn bitminer_key(
+    substrate: &str,
+    activation: u64,
+    network: &str,
+) -> BitMinerKey {
+    format!("{substrate}:{activation}:{network}")
+}
+
+fn bitminer_log_path(
+    substrate: &str,
+    activation: u64,
+    network: &str,
+) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "bit-miner-{substrate}-{activation}-{network}.log"
+    ))
 }
 
 fn bitminer_log_tail(path: &FsPath) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
+
     let lines: Vec<&str> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -2561,7 +2586,10 @@ fn bitminer_log_tail(path: &FsPath) -> Option<String> {
     let tail = lines[start..].join("\n");
 
     Some(if tail.len() > 2000 {
-        String::from_utf8_lossy(&tail.as_bytes()[tail.len() - 2000..]).into_owned()
+        String::from_utf8_lossy(
+            &tail.as_bytes()[tail.len() - 2000..],
+        )
+        .into_owned()
     } else {
         tail
     })
@@ -2571,13 +2599,10 @@ fn bitminer_log_tail(path: &FsPath) -> Option<String> {
 struct BitMinerStartResponse {
     substrate: String,
     activation: u64,
+    network: String,
     pid: Option<u32>,
     already_running: bool,
     message: String,
-}
-
-fn bitminer_key(substrate: &str, activation: u64) -> BitMinerKey {
-    format!("{substrate}:{activation}")
 }
 
 fn live_bitminer(
@@ -2596,7 +2621,9 @@ fn live_bitminer(
         }
         Err(io_error) => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to inspect bit-miner process: {io_error}"),
+            format!(
+                "unable to inspect bit-miner process: {io_error}"
+            ),
         )),
     }
 }
@@ -2604,12 +2631,20 @@ fn live_bitminer(
 async fn bitminer_process_state(
     name: &str,
     activation: u64,
+    network: &str,
 ) -> ApiResult<(bool, Option<u32>)> {
     let mut processes = bit_miner_processes().lock().await;
-    live_bitminer(&mut processes, &bitminer_key(name, activation))
+
+    live_bitminer(
+        &mut processes,
+        &bitminer_key(name, activation, network),
+    )
 }
 
-fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
+fn validate_bitminer_scope(
+    name: &str,
+    network: &str,
+) -> ApiResult<()> {
     if !valid_substrate_name(name) {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -2617,7 +2652,9 @@ fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
         ));
     }
 
-    if !valid_observation_network_id(network) || !is_bitcoin_network_id(network) {
+    if !valid_observation_network_id(network)
+        || !is_bitcoin_network_id(network)
+    {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid Bitcoin network identifier",
@@ -2633,66 +2670,90 @@ async fn start_bitminer(
     validate_bitminer_scope(&name, &network)?;
     ensure_existing_substrate(&name)?;
 
-    if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
+    if !bit_minner_enabled()
+        && std::env::var_os("BIT_MINER_BIN").is_none()
+    {
         return Err(error(
             StatusCode::NOT_IMPLEMENTED,
             "this qtm-api build does not include the bit-miner feature and BIT_MINER_BIN is not set",
         ));
     }
 
-    let key = bitminer_key(&name, activation);
+    let key = bitminer_key(
+        &name,
+        activation,
+        &network,
+    );
+
     let mut processes = bit_miner_processes().lock().await;
 
-    let (running, pid) = live_bitminer(&mut processes, &key)?;
+    let (running, pid) = live_bitminer(
+        &mut processes,
+        &key,
+    )?;
 
     if running {
         return Ok(Json(BitMinerStartResponse {
             substrate: name,
             activation,
+            network,
             pid,
             already_running: true,
-            message: "bit-miner process is already running".into(),
+            message: "bit-miner process is already running for this network".into(),
         }));
     }
 
-    let (executable, mode_args): (std::ffi::OsString, Vec<&str>) =
-        match std::env::var_os("BIT_MINER_BIN") {
-            Some(bin) => (bin, Vec::new()),
-            None => (
-                std::env::current_exe()
-                    .map_err(|io_error| {
-                        error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!(
-                                "unable to locate the qtm-api executable: {io_error}",
-                            ),
-                        )
-                    })?
-                    .into_os_string(),
-                vec!["--bit-miner"],
-            ),
-        };
+    let (executable, mode_args): (
+        std::ffi::OsString,
+        Vec<&str>,
+    ) = match std::env::var_os("BIT_MINER_BIN") {
+        Some(bin) => (bin, Vec::new()),
+        None => (
+            std::env::current_exe()
+                .map_err(|io_error| {
+                    error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "unable to locate the qtm-api executable: {io_error}",
+                        ),
+                    )
+                })?
+                .into_os_string(),
+            vec!["--bit-miner"],
+        ),
+    };
 
-    let log_path = bitminer_log_path(&name, activation);
+    let log_path = bitminer_log_path(
+        &name,
+        activation,
+        &network,
+    );
 
-    let log_file = std::fs::File::create(&log_path).map_err(|io_error| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to create bit-miner log file: {io_error}"),
-        )
-    })?;
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|io_error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to create bit-miner log file: {io_error}"
+                ),
+            )
+        })?;
 
-    let log_file_err = log_file.try_clone().map_err(|io_error| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to open bit-miner log file: {io_error}"),
-        )
-    })?;
+    let log_file_err = log_file.try_clone()
+        .map_err(|io_error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to open bit-miner log file: {io_error}"
+                ),
+            )
+        })?;
 
     let child = Command::new(&executable)
         .args(&mode_args)
         .arg(activation.to_string())
         .arg(&name)
+        .arg(&network)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err))
@@ -2709,14 +2770,16 @@ async fn start_bitminer(
         })?;
 
     let pid = child.id();
+
     processes.insert(key, child);
 
     Ok(Json(BitMinerStartResponse {
         substrate: name,
         activation,
+        network,
         pid,
         already_running: false,
-        message: "bit-miner process started".into(),
+        message: "bit-miner network pipeline started".into(),
     }))
 }
 
@@ -2742,11 +2805,24 @@ async fn get_bitminer_status(
     validate_bitminer_scope(&name, &network)?;
     ensure_existing_substrate(&name)?;
 
-    let (running, pid) = bitminer_process_state(&name, activation).await?;
+    let (running, pid) = bitminer_process_state(
+        &name,
+        activation,
+        &network,
+    )
+    .await?;
 
-    let log_path = bitminer_log_path(&name, activation);
-    let event_path = commands::event_path_at_activation(&name, activation)
-        .map(|path| path.display().to_string());
+    let log_path = bitminer_log_path(
+        &name,
+        activation,
+        &network,
+    );
+
+    let event_path = commands::event_path_at_activation(
+        &name,
+        activation,
+    )
+    .map(|path| path.display().to_string());
 
     let last_error = if running {
         None
@@ -2777,21 +2853,36 @@ async fn get_bitminer_log(
     validate_bitminer_scope(&name, &network)?;
     ensure_existing_substrate(&name)?;
 
-    let path = bitminer_log_path(&name, activation);
+    let path = bitminer_log_path(
+        &name,
+        activation,
+        &network,
+    );
 
-    let bytes = std::fs::read(&path).map_err(|io_error| {
-        error(
-            if io_error.kind() == std::io::ErrorKind::NotFound {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            },
-            format!("unable to read bit-miner log: {io_error}"),
-        )
-    })?;
+    let bytes = std::fs::read(&path)
+        .map_err(|io_error| {
+            error(
+                if io_error.kind()
+                    == std::io::ErrorKind::NotFound
+                {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                format!(
+                    "unable to read bit-miner log: {io_error}"
+                ),
+            )
+        })?;
 
-    let start = bytes.len().saturating_sub(BITMINER_LOG_MAX_BYTES);
-    let body = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    let start = bytes
+        .len()
+        .saturating_sub(BITMINER_LOG_MAX_BYTES);
+
+    let body = String::from_utf8_lossy(
+        &bytes[start..],
+    )
+    .into_owned();
 
     Ok((
         StatusCode::OK,
@@ -2804,24 +2895,11 @@ async fn get_bitminer_log(
         .into_response())
 }
 
-#[cfg(feature = "bit-miner")]
-async fn stream(
-    observation_stream: &mut bit_miner::observestream::MempoolSpaceStream,
-    substrate: &str,
-    pipeline: &mut bit_miner::BitcoinObservationPipeline,
-    resolver: &WirePacketPrevoutResolver,
-) -> bit_miner::observestream::ObservationResult<
-    bit_miner::observestream::PipelineOutcome,
-> {
-    observation_stream
-        .stream(substrate, pipeline, resolver)
-        .await
-}
-
 #[derive(Serialize)]
 struct BitMinerStopResponse {
     substrate: String,
     activation: u64,
+    network: String,
     was_running: bool,
     stopped: bool,
     pid: Option<u32>,
@@ -2834,17 +2912,23 @@ async fn stop_bitminer(
     validate_bitminer_scope(&name, &network)?;
     ensure_existing_substrate(&name)?;
 
-    let key = bitminer_key(&name, activation);
+    let key = bitminer_key(
+        &name,
+        activation,
+        &network,
+    );
+
     let mut processes = bit_miner_processes().lock().await;
 
     let Some(mut child) = processes.remove(&key) else {
         return Ok(Json(BitMinerStopResponse {
             substrate: name,
             activation,
+            network,
             was_running: false,
             stopped: false,
             pid: None,
-            message: "no bit-miner process is registered for this activation".into(),
+            message: "no bit-miner process is registered for this network".into(),
         }));
     };
 
@@ -2855,6 +2939,7 @@ async fn stop_bitminer(
             return Ok(Json(BitMinerStopResponse {
                 substrate: name,
                 activation,
+                network,
                 was_running: false,
                 stopped: false,
                 pid: None,
@@ -2865,7 +2950,9 @@ async fn stop_bitminer(
         Err(io_error) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect bit-miner process: {io_error}"),
+                format!(
+                    "unable to inspect bit-miner process: {io_error}"
+                ),
             ));
         }
     }
@@ -2873,19 +2960,23 @@ async fn stop_bitminer(
     child.kill().await.map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to stop bit-miner process: {io_error}"),
+            format!(
+                "unable to stop bit-miner process: {io_error}"
+            ),
         )
     })?;
 
     Ok(Json(BitMinerStopResponse {
         substrate: name,
         activation,
+        network,
         was_running: true,
         stopped: true,
         pid,
-        message: "bit-miner process stopped".into(),
+        message: "bit-miner network pipeline stopped".into(),
     }))
 }
+
 
 fn bit_minner_enabled() -> bool {
     cfg!(feature = "bit-miner")
@@ -2934,6 +3025,7 @@ async fn list_bitcoin_observations(
     }))
 }
 
+
 /// Runs the bit-miner observation stream inside the qtm-api child process.
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
@@ -2953,11 +3045,39 @@ fn run_bit_miner(args: &[String]) -> ! {
         .expect("missing substrate")
         .clone();
 
+    let network = args
+        .get(2)
+        .expect("missing network")
+        .clone();
+
+    if !valid_observation_network_id(&network)
+        || !is_bitcoin_network_id(&network)
+    {
+        eprintln!(
+            "bit-miner: invalid Bitcoin network ID: {network}"
+        );
+        std::process::exit(2);
+    }
+
+    // The child owns one pipeline for this exact
+    // substrate + activation + network scope.
+    //
+    // The pipeline retains its collector, miner, broadcaster,
+    // and render state for the lifetime of this process.
     let mut pipeline = bit_miner::BitcoinObservationPipeline::new(
         activation,
         &substrate,
+        &network,
     )
-    .expect("failed to initialize Bitcoin observation pipeline");
+    .unwrap_or_else(|error| {
+        eprintln!(
+            "bit-miner: pipeline initialization failed \
+             substrate={substrate} \
+             activation={activation} \
+             network={network}: {error}"
+        );
+        std::process::exit(1);
+    });
 
     let resolver = WirePacketPrevoutResolver::new(
         &substrate,
@@ -2987,7 +3107,8 @@ fn run_bit_miner(args: &[String]) -> ! {
                     eprintln!(
                         "bit-miner: stream connection failed \
                          substrate={substrate} \
-                         activation={activation}: {error}"
+                         activation={activation} \
+                         network={network}: {error}"
                     );
                     continue;
                 }
@@ -3006,7 +3127,8 @@ fn run_bit_miner(args: &[String]) -> ! {
                         eprintln!(
                             "bit-miner: transaction processed \
                              substrate={substrate} \
-                             activation={activation}"
+                             activation={activation} \
+                             network={network}"
                         );
                     }
                     Ok(Ok(None)) => {}
@@ -3014,14 +3136,16 @@ fn run_bit_miner(args: &[String]) -> ! {
                         eprintln!(
                             "bit-miner: pipeline processing failed \
                              substrate={substrate} \
-                             activation={activation}: {error}"
+                             activation={activation} \
+                             network={network}: {error}"
                         );
                     }
                     Err(error) => {
                         eprintln!(
                             "bit-miner: observation stream disconnected \
                              substrate={substrate} \
-                             activation={activation}: {error}"
+                             activation={activation} \
+                             network={network}: {error}"
                         );
                         break;
                     }
@@ -3073,14 +3197,18 @@ fn has_persisted_wirepackets(
             )
         })?;
 
-        if !entry.file_type().map_err(|io_error| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "unable to inspect WirePackets submission entry: {io_error}"
-                ),
-            )
-        })?.is_dir() {
+        if !entry
+            .file_type()
+            .map_err(|io_error| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect WirePackets submission entry: {io_error}"
+                    ),
+                )
+            })?
+            .is_dir()
+        {
             continue;
         }
 
