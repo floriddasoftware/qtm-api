@@ -332,21 +332,17 @@ struct WirePacketsResponse {
     substrate: String,
     activation: u64,
     network: String,
-    /// Wire packets are persisted once per activation for Bitcoin settlement.
-    /// The network id only selects that (Bitcoin) scope.
     scope: &'static str,
-    /// Canonical path from qp_hd::commands::wirepackets_path, the same
-    /// resolver bit-miner's persist_wirepackets() writes through.
     path: String,
     exists: bool,
     bytes: Option<u64>,
-    /// Route that returns the raw file; present only when the file exists.
     file_route: Option<String>,
     packets: Vec<WirePacketEntry>,
 }
 
 #[derive(Serialize)]
 struct WirePacketEntry {
+    submission: u64,
     name: String,
     path: String,
     bytes: u64,
@@ -568,10 +564,109 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
     }
 }
 
-/// Raw bytes of one submission's persisted wire-packet file.
+/// Metadata for all persisted WirePackets submissions within the
+/// activation's configured network budget.
+async fn get_wirepackets(
+    Path((name, activation, network)):
+        Path<(String, u64, String)>,
+) -> ApiResult<Json<WirePacketsResponse>> {
+    validate_wirepackets_scope(&name, &network)?;
+
+    let lock = substrate_lock(&name);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let substrate_path = ensure_existing_substrate(&name)?;
+
+    let budget = load_network_budget(
+        &substrate_path,
+        activation,
+        &network,
+    )?;
+
+    let event_root = commands::substrate_root()
+        .join(&name)
+        .join("activations")
+        .join(activation.to_string())
+        .join("event");
+
+    let mut packets = Vec::new();
+    let mut total_bytes = 0u64;
+
+    if let Some(budget) = budget {
+        for submission in 0..budget.max_events {
+            if !has_persisted_wirepackets(
+                &name,
+                activation,
+                submission,
+            )? {
+                continue;
+            }
+
+            let path = commands::wirepackets_path(
+                &name,
+                activation,
+                submission,
+            );
+
+            let metadata = std::fs::metadata(&path).map_err(|io_error| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect WirePackets submission {submission}: {io_error}"
+                    ),
+                )
+            })?;
+
+            if !metadata.is_file() {
+                continue;
+            }
+
+            total_bytes = total_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| {
+                    error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "combined WirePackets size overflow",
+                    )
+                })?;
+
+            packets.push(WirePacketEntry {
+                submission,
+                name: format!("submission_{submission}"),
+                path: path.display().to_string(),
+                bytes: metadata.len(),
+            });
+        }
+    }
+
+    let exists = !packets.is_empty();
+
+    let file_route = exists.then(|| {
+        format!(
+            "/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"
+        )
+    });
+
+    Ok(Json(WirePacketsResponse {
+        substrate: name,
+        activation,
+        network,
+        scope: "activation/submissions/bitcoin",
+        path: event_root.display().to_string(),
+        exists,
+        bytes: exists.then_some(total_bytes),
+        file_route,
+        packets,
+    }))
+}
+
+/// Return the framed WirePackets from every persisted submission
+/// within the configured network budget.
 async fn get_wirepackets_file(
-    Path((name, activation, submission, network)):
-        Path<(String, u64, u64, String)>,
+    Path((name, activation, network)):
+        Path<(String, u64, String)>,
 ) -> ApiResult<Response> {
     validate_wirepackets_scope(&name, &network)?;
 
@@ -580,54 +675,94 @@ async fn get_wirepackets_file(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    ensure_existing_substrate(&name)?;
+    let substrate_path = ensure_existing_substrate(&name)?;
 
-    let path = commands::wirepackets_path(
-        &name,
+    let budget = load_network_budget(
+        &substrate_path,
         activation,
-        submission,
-    );
+        &network,
+    )?
+    .ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            "no WirePackets budget configured for this activation and network",
+        )
+    })?;
 
-    let metadata = std::fs::metadata(&path)
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .ok_or_else(|| {
+    let mut combined = Vec::new();
+
+    for submission in 0..budget.max_events {
+        if !has_persisted_wirepackets(
+            &name,
+            activation,
+            submission,
+        )? {
+            continue;
+        }
+
+        let path = commands::wirepackets_path(
+            &name,
+            activation,
+            submission,
+        );
+
+        let metadata = std::fs::metadata(&path).map_err(|io_error| {
             error(
-                StatusCode::NOT_FOUND,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
-                    "no wire-packets file at {}",
-                    path.display(),
+                    "unable to inspect WirePackets submission {submission}: {io_error}"
                 ),
             )
         })?;
 
-    if metadata.len() > WIREPACKETS_MAX_BYTES {
-        return Err(error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "wire-packets file is {} bytes; the limit is {WIREPACKETS_MAX_BYTES}",
-                metadata.len()
-            ),
-        ));
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let next_size = (combined.len() as u64)
+            .checked_add(metadata.len())
+            .ok_or_else(|| {
+                error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "combined WirePackets size overflow",
+                )
+            })?;
+
+        if next_size > WIREPACKETS_MAX_BYTES {
+            return Err(error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "combined WirePackets file exceeds the {WIREPACKETS_MAX_BYTES}-byte limit"
+                ),
+            ));
+        }
+
+        let bytes = std::fs::read(&path).map_err(|io_error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to read WirePackets submission {submission}: {io_error}"
+                ),
+            )
+        })?;
+
+        combined.extend_from_slice(&bytes);
     }
 
-    let bytes = std::fs::read(&path).map_err(|io_error| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "unable to read wire-packets file: {io_error}"
-            ),
-        )
-    })?;
+    if combined.is_empty() {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            "no persisted WirePackets submissions within the configured budget",
+        ));
+    }
 
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
+        combined,
     )
         .into_response())
 }
-
 
 fn is_bitcoin_network_id(network: &str) -> bool {
     let lower = network.trim().to_ascii_lowercase();
