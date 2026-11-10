@@ -565,7 +565,7 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
 }
 
 /// Metadata for all persisted WirePackets submissions within the
-/// activation's configured network budget.
+/// substrate activation's configured event budget.
 async fn get_wirepackets(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<WirePacketsResponse>> {
@@ -576,13 +576,16 @@ async fn get_wirepackets(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let substrate_path = ensure_existing_substrate(&name)?;
+    ensure_existing_substrate(&name)?;
 
-    let budget = load_network_budget(
-        &substrate_path,
-        activation,
-        &network,
-    )?;
+    let budget = load_budget(&name, activation).map_err(|io_error| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "unable to load budget for substrate {name}, activation {activation}: {io_error}"
+            ),
+        )
+    })?;
 
     let event_root = commands::substrate_root()
         .join(&name)
@@ -593,59 +596,49 @@ async fn get_wirepackets(
     let mut packets = Vec::new();
     let mut total_bytes = 0u64;
 
-    if let Some(budget) = budget {
-        let wirepackets_persisted = has_persisted_wirepackets(
+    for submission in 1..=budget.max_events {
+        let path = commands::wirepackets_path(
             &name,
             activation,
-            Some(budget.max_events),
-        )?;
+            submission,
+        );
 
-        if wirepackets_persisted {
-            for submission in 1..=budget.max_events {
-                let path = commands::wirepackets_path(
-                    &name,
-                    activation,
-                    submission,
-                );
-
-                let metadata = match std::fs::metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(io_error)
-                        if io_error.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        continue;
-                    }
-                    Err(io_error) => {
-                        return Err(error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!(
-                                "unable to inspect WirePackets submission {submission}: {io_error}"
-                            ),
-                        ));
-                    }
-                };
-
-                if !metadata.is_file() {
-                    continue;
-                }
-
-                total_bytes = total_bytes
-                    .checked_add(metadata.len())
-                    .ok_or_else(|| {
-                        error(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "combined WirePackets size overflow",
-                        )
-                    })?;
-
-                packets.push(WirePacketEntry {
-                    submission,
-                    name: format!("submission_{submission}"),
-                    path: path.display().to_string(),
-                    bytes: metadata.len(),
-                });
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(io_error)
+                if io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue;
             }
+            Err(io_error) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect WirePackets submission {submission}: {io_error}"
+                    ),
+                ));
+            }
+        };
+
+        if !metadata.is_file() {
+            continue;
         }
+
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| {
+                error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "combined WirePackets size overflow",
+                )
+            })?;
+
+        packets.push(WirePacketEntry {
+            submission,
+            name: format!("submission_{submission}"),
+            path: path.display().to_string(),
+            bytes: metadata.len(),
+        });
     }
 
     let exists = !packets.is_empty();
@@ -668,7 +661,6 @@ async fn get_wirepackets(
         packets,
     }))
 }
-
 /// Return the framed WirePackets from every persisted submission
 /// within the configured network budget.
 async fn get_wirepackets_file(
