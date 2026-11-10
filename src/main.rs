@@ -2414,8 +2414,16 @@ async fn exile_wallet(Path(name): Path<String>) -> ApiResult<Json<DirectionRespo
  *   - the event, its heritage (state + transition) and its depth come from
  *     the authentic event returned by the QP-HD loader
  *     (qp_hd::commands::load_event_at_activation), owned by EventPayload,
- *   - a settlement payload counts as carried only when the wire-packet file
- *     (qp_hd::commands::wirepackets_path) has actually been persisted.
+ *   - a settlement payload counts as carried only when at least one
+ *     submission-scoped WirePackets file has actually been persisted.
+ *
+ * WirePackets are stored per submission:
+ *   <root>/<substrate>/activations/<activation>/event/<submission>/wirepackets
+ *
+ * The submission identifier belongs to the bit-miner pipeline. The board
+ * must discover persisted submission files rather than inventing a submission
+ * identifier or constructing an activation-wide WirePackets path.
+ *
  * An AuthorizedPayload or settlement state is never manufactured, and no
  * transition, state, retained mass or depth is recomputed.
  *
@@ -2492,7 +2500,7 @@ struct PayloadEventView {
 
 #[derive(Serialize, Clone)]
 struct PayloadKindEntry {
-    /// bitcoin | ethereum | solana | tron  (PayloadKind discriminant)
+    /// bitcoin | ethereum | solana | tron (PayloadKind discriminant).
     kind: String,
     network: Option<NetworkOption>,
     /// Kind is in scope for this board request (network filter / activation-wide).
@@ -2515,8 +2523,8 @@ struct ObservationControlPlane {
     pid: Option<u32>,
     /// Whether this binary can run the miner in-process mode.
     bit_minner_feature: bool,
-    /// True only when the wire-packet file has been persisted for this
-    /// activation. Independent of whether the process is running.
+    /// True only when at least one submission-scoped WirePackets file has
+    /// been persisted for this activation. Independent of process status.
     settlement_payload_carried: bool,
 }
 
@@ -2538,6 +2546,7 @@ struct PayloadBoardResponse {
 
 fn payload_kind_id_for_network(network_id: &str) -> Option<&'static str> {
     let lower = network_id.trim().to_ascii_lowercase();
+
     if lower.contains("bitcoin") || lower == "btc" {
         Some("bitcoin")
     } else if lower.contains("ethereum") || lower == "eth" {
@@ -2556,7 +2565,9 @@ fn load_payload_event(
     name: &str,
     activation: u64,
 ) -> ApiResult<Option<(String, EventPayload)>> {
-    let Some(record_path) = commands::event_path_at_activation(name, activation) else {
+    let Some(record_path) =
+        commands::event_path_at_activation(name, activation)
+    else {
         return Ok(None);
     };
 
@@ -2571,8 +2582,12 @@ fn load_payload_event(
     })?;
 
     let (heritage, depth) = match event {
-        qp_hd::PersistedEvent::Transit(event) => (event.heritage, event.depth),
-        qp_hd::PersistedEvent::Exile(event) => (event.heritage, event.depth),
+        qp_hd::PersistedEvent::Transit(event) => {
+            (event.heritage, event.depth)
+        }
+        qp_hd::PersistedEvent::Exile(event) => {
+            (event.heritage, event.depth)
+        }
     };
 
     Ok(Some((
@@ -2581,7 +2596,10 @@ fn load_payload_event(
     )))
 }
 
-fn payload_event_view(record: String, payload: &EventPayload) -> PayloadEventView {
+fn payload_event_view(
+    record: String,
+    payload: &EventPayload,
+) -> PayloadEventView {
     let event = payload.event();
     let heritage = event.heritage();
     let state = &heritage.state;
@@ -2604,7 +2622,7 @@ fn payload_event_view(record: String, payload: &EventPayload) -> PayloadEventVie
                 delta: transition.delta.to_string(),
                 gross_work: transition.gross_work.to_string(),
                 net_work: transition.net_work.to_string(),
-                mirror_bytes: hex::encode(transition.mirror_bytes),
+                mirror_bytes: hex::encode(&transition.mirror_bytes),
             },
         },
         depth: depth_response(payload.depth()),
