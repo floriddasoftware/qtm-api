@@ -593,10 +593,14 @@ async fn get_wirepackets(
     let mut packets = Vec::new();
     let mut total_bytes = 0u64;
 
-    // This helper checks whether any WirePackets have been persisted
-    // for the activation. The loop below applies the network budget.
     if let Some(budget) = budget {
-        if has_persisted_wirepackets(&name, activation)? {
+        let wirepackets_persisted = has_persisted_wirepackets(
+            &name,
+            activation,
+            Some(budget.max_events),
+        )?;
+
+        if wirepackets_persisted {
             for submission in 0..budget.max_events {
                 let path = commands::wirepackets_path(
                     &name,
@@ -664,7 +668,6 @@ async fn get_wirepackets(
         packets,
     }))
 }
-
 /// Return the framed WirePackets from every persisted submission
 /// within the configured network budget.
 async fn get_wirepackets_file(
