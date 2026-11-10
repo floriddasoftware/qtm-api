@@ -2641,6 +2641,76 @@ async fn bitminer_process_state(
     )
 }
 
+
+
+async fn bitminer_process_state_any(
+    name: &str,
+    activation: u64,
+) -> ApiResult<(bool, Option<u32>)> {
+    let prefix = format!("{name}:{activation}:");
+    let mut processes = bit_miner_processes().lock().await;
+
+    let mut keys = processes
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    keys.sort();
+
+    let mut first_pid = None;
+
+    for key in keys {
+        let (running, pid) = live_bitminer(&mut processes, &key)?;
+
+        if running {
+            first_pid = first_pid.or(pid);
+        }
+    }
+
+    Ok((first_pid.is_some(), first_pid))
+}
+
+async fn bitminer_process_list(
+    name: &str,
+    activation: u64,
+) -> ApiResult<Vec<BitMinerProcessEntry>> {
+    let prefix = format!("{name}:{activation}:");
+    let mut processes = bit_miner_processes().lock().await;
+
+    let mut keys = processes
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    keys.sort();
+
+    let mut pipelines = Vec::new();
+
+    for key in keys {
+        let network = key
+            .strip_prefix(&prefix)
+            .unwrap_or_default()
+            .to_string();
+
+        let (running, pid) = live_bitminer(&mut processes, &key)?;
+
+        if running {
+            pipelines.push(BitMinerProcessEntry {
+                substrate: name.to_owned(),
+                activation,
+                network,
+                running,
+                pid,
+            });
+        }
+    }
+
+    Ok(pipelines)
+}
+
+
 fn validate_bitminer_scope(
     name: &str,
     network: &str,
@@ -2982,10 +3052,12 @@ fn bit_minner_enabled() -> bool {
     cfg!(feature = "bit-miner")
 }
 
+
 #[derive(Serialize)]
 struct BitMinerProcessEntry {
     substrate: String,
     activation: u64,
+    network: String,
     running: bool,
     pid: Option<u32>,
 }
@@ -3001,28 +3073,41 @@ async fn list_bitcoin_observations(
     Path((name, activation)): Path<(String, u64)>,
 ) -> ApiResult<Json<BitMinerProcessListResponse>> {
     if !valid_substrate_name(&name) {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "invalid substrate name",
+        ));
     }
 
     ensure_existing_substrate(&name)?;
 
-    let (running, pid) = bitminer_process_state(&name, activation).await?;
-
-    let pipelines = running
-        .then(|| BitMinerProcessEntry {
-            substrate: name.clone(),
-            activation,
-            running: true,
-            pid,
-        })
-        .into_iter()
-        .collect();
+    let pipelines = bitminer_process_list(
+        &name,
+        activation,
+    )
+    .await?;
 
     Ok(Json(BitMinerProcessListResponse {
         substrate: name,
         activation,
         pipelines,
     }))
+}
+
+
+
+#[cfg(feature = "bit-miner")]
+async fn stream(
+    observation_stream: &mut bit_miner::observestream::MempoolSpaceStream,
+    substrate: &str,
+    pipeline: &mut bit_miner::BitcoinObservationPipeline,
+    resolver: &WirePacketPrevoutResolver,
+) -> bit_miner::observestream::ObservationResult<
+    bit_miner::observestream::PipelineOutcome,
+> {
+    observation_stream
+        .stream(substrate, pipeline, resolver)
+        .await
 }
 
 
