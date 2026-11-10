@@ -601,7 +601,7 @@ async fn get_wirepackets(
         )?;
 
         if wirepackets_persisted {
-            for submission in 0..budget.max_events {
+            for submission in 1..=budget.max_events {
                 let path = commands::wirepackets_path(
                     &name,
                     activation,
@@ -668,6 +668,7 @@ async fn get_wirepackets(
         packets,
     }))
 }
+
 /// Return the framed WirePackets from every persisted submission
 /// within the configured network budget.
 async fn get_wirepackets_file(
@@ -703,7 +704,7 @@ async fn get_wirepackets_file(
     )?;
 
     if wirepackets_persisted {
-        for submission in 0..budget.max_events {
+        for submission in 1..=budget.max_events {
             let path = commands::wirepackets_path(
                 &name,
                 activation,
