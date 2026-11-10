@@ -295,14 +295,12 @@ struct ReceiveRequest {
 struct BudgetRequest {
     min_events: u64,
     max_events: u64,
-    max_retained_mass: u128,
 }
 
 #[derive(Serialize, Clone)]
 struct EventBudget {
     min_events: u64,
     max_events: u64,
-    max_retained_mass: String,
 }
 
 #[derive(Serialize)]
@@ -1474,19 +1472,19 @@ fn validate_budget(body: &BudgetRequest) -> Result<(), String> {
     if body.max_events == 0 {
         return Err("max_events must be greater than zero".to_string());
     }
+
     if body.min_events > body.max_events {
-        return Err("min_events must be less than or equal to max_events".to_string());
+        return Err(
+            "min_events must be less than or equal to max_events".to_string()
+        );
     }
-    if body.max_retained_mass == 0 {
-        return Err("max_retained_mass must be greater than zero".to_string());
-    }
+
     Ok(())
 }
 
 fn parse_budget(contents: &str, path: &FsPath) -> ApiResult<EventBudget> {
     let mut min_events: Option<u64> = None;
     let mut max_events: Option<u64> = None;
-    let mut max_retained_mass: Option<u128> = None;
 
     for line in contents.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -1494,6 +1492,7 @@ fn parse_budget(contents: &str, path: &FsPath) -> ApiResult<EventBudget> {
         };
 
         let value = value.trim();
+
         match key.trim() {
             "min_events" => {
                 min_events = Some(value.parse::<u64>().map_err(|_| {
@@ -1508,14 +1507,6 @@ fn parse_budget(contents: &str, path: &FsPath) -> ApiResult<EventBudget> {
                     error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("invalid max_events in {}", path.display()),
-                    )
-                })?);
-            }
-            "max_retained_mass" => {
-                max_retained_mass = Some(value.parse::<u128>().map_err(|_| {
-                    error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("invalid max_retained_mass in {}", path.display()),
                     )
                 })?);
             }
@@ -1536,23 +1527,9 @@ fn parse_budget(contents: &str, path: &FsPath) -> ApiResult<EventBudget> {
                 format!("budget file is missing max_events: {}", path.display()),
             )
         })?,
-        max_retained_mass: max_retained_mass
-            .ok_or_else(|| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "budget file is missing max_retained_mass: {}",
-                        path.display()
-                    ),
-                )
-            })?
-            .to_string(),
     };
 
-    if budget.max_events == 0
-        || budget.min_events > budget.max_events
-        || budget.max_retained_mass == "0"
-    {
+    if budget.max_events == 0 || budget.min_events > budget.max_events {
         return Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("invalid budget values in {}", path.display()),
@@ -1588,9 +1565,11 @@ fn persist_network_budget(
     network: &str,
     body: &BudgetRequest,
 ) -> ApiResult<EventBudget> {
-    validate_budget(body).map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+    validate_budget(body)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
 
     let directory = budget_directory(substrate_path, activation, network);
+
     std::fs::create_dir_all(&directory).map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1603,12 +1582,11 @@ fn persist_network_budget(
 
     let path = directory.join("budget");
     let temporary_path = directory.join("budget.tmp");
+
     let contents = format!(
-        "min_events={}
-max_events={}
-max_retained_mass={}
-",
-        body.min_events, body.max_events, body.max_retained_mass
+        "min_events={}\nmax_events={}\n",
+        body.min_events,
+        body.max_events,
     );
 
     std::fs::write(&temporary_path, contents).map_err(|io_error| {
@@ -1631,7 +1609,6 @@ max_retained_mass={}
     Ok(EventBudget {
         min_events: body.min_events,
         max_events: body.max_events,
-        max_retained_mass: body.max_retained_mass.to_string(),
     })
 }
 
