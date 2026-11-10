@@ -505,10 +505,12 @@ fn start_live_wirepackets(
     });
 }
 
+
 #[cfg(feature = "bit-miner")]
 fn persist_live_wirepackets(
     substrate: &str,
     activation: u64,
+    submission: u64,
     packets: &[u8],
 ) -> ApiResult<()> {
     if !valid_substrate_name(substrate) {
@@ -518,19 +520,24 @@ fn persist_live_wirepackets(
         ));
     }
 
-    commands::persist_wirepackets(substrate, activation, packets)
-        .map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to persist live wirepackets: {e}"),
-            )
-        })
+    commands::persist_wirepackets(
+        substrate,
+        activation,
+        submission,
+        packets,
+    )
+    .map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to persist live wirepackets: {e}"),
+        )
+    })
 }
 
-/// Metadata for the persisted wire-packet file. A missing file is reported as
-/// `exists: false`; nothing is fabricated.
+/// Metadata for one submission's persisted wire-packet file.
 async fn get_wirepackets(
-    Path((name, activation, network)): Path<(String, u64, String)>,
+    Path((name, activation, submission, network)):
+        Path<(String, u64, u64, String)>,
 ) -> ApiResult<Json<WirePacketsResponse>> {
     validate_wirepackets_scope(&name, &network)?;
 
@@ -541,16 +548,26 @@ async fn get_wirepackets(
 
     ensure_existing_substrate(&name)?;
 
-    let path = commands::wirepackets_path(&name, activation);
+    let path = commands::wirepackets_path(
+        &name,
+        activation,
+        submission,
+    );
 
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) if metadata.is_file() => Some(metadata),
         Ok(_) => None,
-        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(io_error)
+            if io_error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
         Err(io_error) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect wire-packets file: {io_error}"),
+                format!(
+                    "unable to inspect wire-packets file: {io_error}"
+                ),
             ));
         }
     };
@@ -570,20 +587,19 @@ async fn get_wirepackets(
     Ok(Json(WirePacketsResponse {
         file_route: exists.then(|| {
             format!(
-                "/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"
+                "/wallets/{name}/activations/{activation}/submissions/{submission}/networks/{network}/wirepackets/file"
             )
         }),
         substrate: name,
         activation,
         network,
-        scope: "activation/bitcoin",
+        scope: "activation/submission/bitcoin",
         path: path.display().to_string(),
         exists,
         bytes,
         packets,
     }))
 }
-
 
 #[cfg(feature = "bit-miner")]
 struct WirePacketPrevoutResolver {
@@ -611,7 +627,20 @@ impl WirePacketPrevoutResolver {
             .join(&self.substrate)
             .join("activations");
 
-        let entries = std::fs::read_dir(&activation_root)?;
+        let entries = match std::fs::read_dir(&activation_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "previous output not found: {}:{}",
+                        requested.txid,
+                        requested.vout,
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
 
         let mut activations = entries
             .filter_map(Result::ok)
@@ -628,73 +657,104 @@ impl WirePacketPrevoutResolver {
             .filter(|activation| *activation <= self.activation)
             .collect::<Vec<_>>();
 
-        activations.sort_unstable();
+        activations.sort_unstable_by(|a, b| b.cmp(a));
 
-        for activation in activations.into_iter().rev() {
-            let path = commands::wirepackets_path(
-                &self.substrate,
-                activation,
-            );
+        for activation in activations {
+            let event_root = activation_root
+                .join(activation.to_string())
+                .join("event");
 
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error)
-                    if error.kind() == ErrorKind::NotFound =>
-                {
+            let submissions = match std::fs::read_dir(&event_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
                     continue;
                 }
                 Err(error) => return Err(error),
             };
 
-            let mut offset = 0usize;
+            let mut submission_ids = submissions
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    if !entry.path().is_dir() {
+                        return None;
+                    }
 
-            while offset < bytes.len() {
-                let remaining = bytes.len() - offset;
+                    entry.file_name()
+                        .to_str()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .collect::<Vec<_>>();
 
-                if remaining < 4 {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        format!(
-                            "incomplete wire-packet frame: {}",
-                            path.display(),
-                        ),
-                    ));
-                }
+            submission_ids.sort_unstable_by(|a, b| b.cmp(a));
 
-                let length = u32::from_be_bytes(
-                    bytes[offset..offset + 4]
-                        .try_into()
-                        .map_err(|_| {
-                            Error::new(
-                                ErrorKind::InvalidData,
-                                "invalid wire-packet frame length",
-                            )
-                        })?,
-                ) as usize;
+            for submission in submission_ids {
+                let path = commands::wirepackets_path(
+                    &self.substrate,
+                    activation,
+                    submission,
+                );
 
-                offset += 4;
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error)
+                        if error.kind() == ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
 
-                if length == 0
-                    || length > WirePacket::MAX_SIZE
-                    || length > bytes.len().saturating_sub(offset)
-                {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        format!(
-                            "invalid wire-packet frame in {}",
-                            path.display(),
-                        ),
-                    ));
-                }
+                let mut offset = 0usize;
 
-                let packet = WirePacket::deserialize(
-                    &bytes[offset..offset + length],
-                )?;
+                while offset < bytes.len() {
+                    let remaining = bytes.len() - offset;
 
-                offset += length;
+                    if remaining < 4 {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "incomplete wire-packet frame: {}",
+                                path.display(),
+                            ),
+                        ));
+                    }
 
-                if packet.outpoint == *requested {
-                    return Ok(packet);
+                    let length = u32::from_be_bytes(
+                        bytes[offset..offset + 4]
+                            .try_into()
+                            .map_err(|_| {
+                                Error::new(
+                                    ErrorKind::InvalidData,
+                                    "invalid wire-packet frame length",
+                                )
+                            })?,
+                    ) as usize;
+
+                    offset += 4;
+
+                    if length == 0
+                        || length > WirePacket::MAX_SIZE
+                        || length > bytes.len().saturating_sub(offset)
+                    {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "invalid wire-packet frame in {}",
+                                path.display(),
+                            ),
+                        ));
+                    }
+
+                    let packet = WirePacket::deserialize(
+                        &bytes[offset..offset + length],
+                    )?;
+
+                    offset += length;
+
+                    if packet.outpoint == *requested {
+                        return Ok(packet);
+                    }
                 }
             }
         }
@@ -731,10 +791,10 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
     }
 }
 
-
-/// Raw bytes of the persisted wire-packet file.
+/// Raw bytes of one submission's persisted wire-packet file.
 async fn get_wirepackets_file(
-    Path((name, activation, network)): Path<(String, u64, String)>,
+    Path((name, activation, submission, network)):
+        Path<(String, u64, u64, String)>,
 ) -> ApiResult<Response> {
     validate_wirepackets_scope(&name, &network)?;
 
@@ -745,7 +805,11 @@ async fn get_wirepackets_file(
 
     ensure_existing_substrate(&name)?;
 
-    let path = commands::wirepackets_path(&name, activation);
+    let path = commands::wirepackets_path(
+        &name,
+        activation,
+        submission,
+    );
 
     let metadata = std::fs::metadata(&path)
         .ok()
@@ -753,7 +817,10 @@ async fn get_wirepackets_file(
         .ok_or_else(|| {
             error(
                 StatusCode::NOT_FOUND,
-                format!("no wire-packets file at {}", path.display()),
+                format!(
+                    "no wire-packets file at {}",
+                    path.display(),
+                ),
             )
         })?;
 
@@ -770,7 +837,9 @@ async fn get_wirepackets_file(
     let bytes = std::fs::read(&path).map_err(|io_error| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to read wire-packets file: {io_error}"),
+            format!(
+                "unable to read wire-packets file: {io_error}"
+            ),
         )
     })?;
 
@@ -781,6 +850,7 @@ async fn get_wirepackets_file(
     )
         .into_response())
 }
+
 
 fn is_bitcoin_network_id(network: &str) -> bool {
     let lower = network.trim().to_ascii_lowercase();
