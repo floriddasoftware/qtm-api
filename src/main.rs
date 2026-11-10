@@ -696,7 +696,13 @@ async fn get_wirepackets_file(
 
     let mut combined = Vec::new();
 
-    if has_persisted_wirepackets(&name, activation)? {
+    let wirepackets_persisted = has_persisted_wirepackets(
+        &name,
+        activation,
+        Some(budget.max_events),
+    )?;
+
+    if wirepackets_persisted {
         for submission in 0..budget.max_events {
             let path = commands::wirepackets_path(
                 &name,
@@ -778,6 +784,7 @@ async fn get_wirepackets_file(
     )
         .into_response())
 }
+
 fn is_bitcoin_network_id(network: &str) -> bool {
     let lower = network.trim().to_ascii_lowercase();
 
@@ -3157,7 +3164,7 @@ fn build_payload_board(
     // Bit-miner owns WirePackets persistence. The board only checks whether
     // at least one submission file exists for this activation.
     let wirepackets_persisted =
-        has_persisted_wirepackets(name, activation)?;
+    has_persisted_wirepackets(name, activation, None)?;
 
     // Load the authentic QP-HD event; heritage and depth are never recomputed.
     let loaded_event = load_payload_event(name, activation)?;
