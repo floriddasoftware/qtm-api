@@ -3060,68 +3060,84 @@ let resolver = WirePacketPrevoutResolver::new(
     activation,
 );
 
-start_live_wirepackets(&substrate, activation);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "bit-miner: runtime initialization failed: {error}"
-            );
-            std::process::exit(1);
-        });
 
-    runtime.block_on(async move {
-        loop {
-            let mut observation_stream = match MempoolSpaceStream::connect(
-                activation,
-                MempoolStreamMode::TransactionIds,
+
+/// Return whether any submission has persisted WirePackets for this activation.
+fn has_persisted_wirepackets(
+    name: &str,
+    activation: u64,
+) -> ApiResult<bool> {
+    use std::io::ErrorKind;
+
+    let event_root = commands::substrate_root()
+        .join(name)
+        .join("activations")
+        .join(activation.to_string())
+        .join("event");
+
+    let entries = match std::fs::read_dir(&event_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect WirePackets submissions: {error}"),
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read WirePackets submission entry: {error}"),
             )
-            .await
-            {
-                Ok(observation_stream) => observation_stream,
-                Err(error) => {
-                    eprintln!(
-                        "bit-miner: stream connection failed                          substrate={substrate}                          activation={activation}: {error}"
-                    );
-                    continue;
-                }
-            };
+        })?;
 
-            loop {
-                match stream(
-    &mut observation_stream,
-    &substrate,
-    &mut pipeline,
-    &resolver,
-)
-.await
-{
-                    Ok(Ok(Some(_outcome))) => {
-                        eprintln!(
-                            "bit-miner: transaction processed                              substrate={substrate} activation={activation}"
-                        );
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => {
-                        eprintln!(
-                            "bit-miner: pipeline processing failed                              substrate={substrate} activation={activation}: {error}"
-                        );
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "bit-miner: observation stream disconnected                              substrate={substrate} activation={activation}: {error}"
-                        );
-                        break;
-                    }
-                }
+        let file_type = entry.file_type().map_err(|error| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect WirePackets submission entry: {error}"),
+            )
+        })?;
+
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+
+        let Some(submission) = file_name
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+
+        let path = commands::wirepackets_path(
+            name,
+            activation,
+            submission,
+        );
+
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect WirePackets file: {error}"),
+                ));
             }
         }
-    });
+    }
 
-    unreachable!(
-        "bit-miner stream loop is intentionally persistent"
-    );
+    Ok(false)
 }
 
 fn build_payload_board(
@@ -3134,11 +3150,12 @@ fn build_payload_board(
     let commitment = read_trim(&substrate_path.join("qtm.commitment"));
     let (process_running, pid) = miner;
 
-    // A settlement payload is carried only when its wire packets have really
-    // been persisted. This is independent of whether the miner is running.
-    let wirepackets_persisted = commands::wirepackets_path(name, activation).is_file();
+    // Bit-miner owns WirePackets persistence. The board only checks whether
+    // at least one submission file exists for this activation.
+    let wirepackets_persisted =
+        has_persisted_wirepackets(name, activation)?;
 
-    // The authentic event from QP-HD; heritage and depth are never recomputed.
+    // Load the authentic QP-HD event; heritage and depth are never recomputed.
     let loaded_event = load_payload_event(name, activation)?;
 
     let (event, depth_record, depth) = match loaded_event {
@@ -3154,23 +3171,27 @@ fn build_payload_board(
     let registered = registered_networks().networks;
     let kind_order = ["bitcoin", "ethereum", "solana", "tron"];
 
-    let mut kinds = Vec::new();
+    let mut kinds = Vec::with_capacity(kind_order.len());
 
     for kind in kind_order {
         let matching: Vec<&NetworkOption> = registered
             .iter()
-            .filter(|n| payload_kind_id_for_network(&n.id) == Some(kind))
+            .filter(|network| {
+                payload_kind_id_for_network(&network.id) == Some(kind)
+            })
             .collect();
 
         let in_scope = match network_filter {
-            Some(net) => payload_kind_id_for_network(net) == Some(kind),
+            Some(network) => {
+                payload_kind_id_for_network(network) == Some(kind)
+            }
             None => true,
         };
 
         let primary = matching.first().copied();
 
-        // Network entries project the event's actual depth; they no longer
-        // search for separate network payload directories.
+        // Every network kind projects the authentic event's depth.
+        // No separate network payload directory is manufactured or loaded.
         let (depth_path, depth_objects, record) = match (&depth, in_scope) {
             (Some(depth), true) => (
                 Some(depth.path.clone()),
@@ -3186,7 +3207,7 @@ fn build_payload_board(
             in_scope,
             available: primary.is_some(),
 
-            // No authorization state is manufactured by the board.
+            // Authorization is reported only when supplied by the runtime.
             authorized_payload: None,
 
             depth_objects,
@@ -3204,8 +3225,16 @@ fn build_payload_board(
 
     let message = format!(
         "substrate={name} activation={activation}: miner process {}; wire packets {}",
-        if process_running { "running" } else { "not running" },
-        if wirepackets_persisted { "persisted" } else { "not persisted" },
+        if process_running {
+            "running"
+        } else {
+            "not running"
+        },
+        if wirepackets_persisted {
+            "persisted"
+        } else {
+            "not persisted"
+        },
     );
 
     Ok(PayloadBoardResponse {
