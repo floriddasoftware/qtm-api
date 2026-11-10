@@ -14,6 +14,7 @@ use qp_hd::{
     pathsregistry::{CoinType, PathsRegistry},
     purpose::{BIP39Handler, BIP39Language},
     qp44::{Flow, TotalMass},
+    load_budget,
 };
 use qtm_graph::graph::{
     frame::{Depth},
