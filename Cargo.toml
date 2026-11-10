@@ -15,7 +15,7 @@ qp-hd = { git = "https://github.com/floriddasoftware/QTM" }
 qtm-graph = { git = "https://github.com/floriddasoftware/Quantum-Economies" }
 hex = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
-
+bitcoin = "0.32.7"
 bit_miner = {
     package = "bit-miner",
     git = "https://github.com/floriddasoftware/bit-miner",
@@ -34,3 +34,4 @@ rustls = {
 [features]
 default = ["bit-miner"]
 bit-miner = ["dep:bit_miner", "dep:rustls"]
+
