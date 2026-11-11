@@ -554,11 +554,12 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
         let packet = self.resolve_packet(outpoint)?;
 
         Ok(ResolvedPrevout {
+            outpoint: outpoint.clone(),
             output: TxOut {
                 value: Amount::from_sat(packet.value),
                 script_pubkey: packet.script_pubkey,
             },
-            previous_transaction: None,
+            non_witness_utxo: None,
         })
     }
 }
