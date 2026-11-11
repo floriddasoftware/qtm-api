@@ -373,6 +373,7 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 
 
 
+
 #[cfg(feature = "bit-miner")]
 struct WirePacketPrevoutResolver {
     substrate: String,
@@ -392,149 +393,107 @@ impl WirePacketPrevoutResolver {
     fn resolve_packet(
         &self,
         requested: &OutPoint,
+        submission: u64,
+        commitment: [u8; 32],
     ) -> Result<WirePacket, std::io::Error> {
         use std::io::{Error, ErrorKind};
 
-        let activation_root = commands::substrate_root()
-            .join(&self.substrate)
-            .join("activations");
+        let path = commands::wirepackets_path(
+            &self.substrate,
+            self.activation,
+            submission,
+        );
 
-        let entries = match std::fs::read_dir(&activation_root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+        let bytes = std::fs::read(&path).map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!(
+                    "unable to load parent wirepackets: substrate={} activation={} submission={} outpoint={}:{}: {}",
+                    self.substrate,
+                    self.activation,
+                    submission,
+                    requested.txid,
+                    requested.vout,
+                    error,
+                ),
+            )
+        })?;
+
+        let mut offset = 0usize;
+
+        while offset < bytes.len() {
+            let remaining = bytes.len().saturating_sub(offset);
+
+            if remaining < 4 {
                 return Err(Error::new(
-                    ErrorKind::NotFound,
+                    ErrorKind::InvalidData,
                     format!(
-                        "previous output not found: {}:{}",
+                        "incomplete wire-packet frame: {}",
+                        path.display(),
+                    ),
+                ));
+            }
+
+            let length = u32::from_be_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            "invalid wire-packet frame length",
+                        )
+                    })?,
+            ) as usize;
+
+            offset += 4;
+
+            if length == 0
+                || length > WirePacket::MAX_SIZE
+                || length > bytes.len().saturating_sub(offset)
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "invalid wire-packet frame: {}",
+                        path.display(),
+                    ),
+                ));
+            }
+
+            let packet = WirePacket::deserialize(
+                &bytes[offset..offset + length],
+            )?;
+
+            offset += length;
+
+            if packet.outpoint != *requested {
+                continue;
+            }
+
+            if packet.commitment != commitment {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "parent commitment mismatch: substrate={} activation={} submission={} outpoint={}:{}",
+                        self.substrate,
+                        self.activation,
+                        submission,
                         requested.txid,
                         requested.vout,
                     ),
                 ));
             }
-            Err(error) => return Err(error),
-        };
 
-        let mut activations = entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                if !entry.path().is_dir() {
-                    return None;
-                }
-
-                entry.file_name()
-                    .to_str()?
-                    .parse::<u64>()
-                    .ok()
-            })
-            .filter(|activation| *activation <= self.activation)
-            .collect::<Vec<_>>();
-
-        activations.sort_unstable_by(|a, b| b.cmp(a));
-
-        for activation in activations {
-            let event_root = activation_root
-                .join(activation.to_string())
-                .join("event");
-
-            let submissions = match std::fs::read_dir(&event_root) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-
-            let mut submission_ids = submissions
-                .filter_map(Result::ok)
-                .filter_map(|entry| {
-                    if !entry.path().is_dir() {
-                        return None;
-                    }
-
-                    entry.file_name()
-                        .to_str()?
-                        .parse::<u64>()
-                        .ok()
-                })
-                .collect::<Vec<_>>();
-
-            submission_ids.sort_unstable_by(|a, b| b.cmp(a));
-
-            for submission in submission_ids {
-                let path = commands::wirepackets_path(
-                    &self.substrate,
-                    activation,
-                    submission,
-                );
-
-                let bytes = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(error)
-                        if error.kind() == ErrorKind::NotFound =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-
-                let mut offset = 0usize;
-
-                while offset < bytes.len() {
-                    let remaining = bytes.len() - offset;
-
-                    if remaining < 4 {
-                        return Err(Error::new(
-                            ErrorKind::InvalidData,
-                            format!(
-                                "incomplete wire-packet frame: {}",
-                                path.display(),
-                            ),
-                        ));
-                    }
-
-                    let length = u32::from_be_bytes(
-                        bytes[offset..offset + 4]
-                            .try_into()
-                            .map_err(|_| {
-                                Error::new(
-                                    ErrorKind::InvalidData,
-                                    "invalid wire-packet frame length",
-                                )
-                            })?,
-                    ) as usize;
-
-                    offset += 4;
-
-                    if length == 0
-                        || length > WirePacket::MAX_SIZE
-                        || length > bytes.len().saturating_sub(offset)
-                    {
-                        return Err(Error::new(
-                            ErrorKind::InvalidData,
-                            format!(
-                                "invalid wire-packet frame in {}",
-                                path.display(),
-                            ),
-                        ));
-                    }
-
-                    let packet = WirePacket::deserialize(
-                        &bytes[offset..offset + length],
-                    )?;
-
-                    offset += length;
-
-                    if packet.outpoint == *requested {
-                        return Ok(packet);
-                    }
-                }
-            }
+            return Ok(packet);
         }
 
         Err(Error::new(
             ErrorKind::NotFound,
             format!(
-                "previous output not found: {}:{}",
+                "previous output not found in parent submission: substrate={} activation={} submission={} outpoint={}:{}",
+                self.substrate,
+                self.activation,
+                submission,
                 requested.txid,
                 requested.vout,
             ),
@@ -547,21 +506,30 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
     fn resolve(
         &self,
         outpoint: &OutPoint,
+        submission: u64,
+        commitment: [u8; 32],
     ) -> Result<
         ResolvedPrevout,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let packet = self.resolve_packet(outpoint)?;
+        let packet = self.resolve_packet(
+            outpoint,
+            submission,
+            commitment,
+        )?;
 
         Ok(ResolvedPrevout {
-            outpoint: *outpoint,
+            outpoint: packet.outpoint,
             output: TxOut {
                 value: Amount::from_sat(packet.value),
                 script_pubkey: packet.script_pubkey,
             },
+            submission,
+            commitment: packet.commitment,
         })
     }
 }
+
 
 /// Metadata for all persisted WirePackets submissions within the
 /// substrate activation's configured event budget.
