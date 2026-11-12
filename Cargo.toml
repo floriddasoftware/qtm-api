@@ -35,3 +35,4 @@ rustls = {
 default = ["bit-miner"]
 bit-miner = ["dep:bit_miner", "dep:rustls"]
 
+
