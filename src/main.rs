@@ -20,6 +20,7 @@ qp44::{Flow, TotalMass},
 };
 use qtm_graph::graph::{frame::Depth, Scale};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
 collections::HashMap,
 convert::Infallible,
@@ -1185,6 +1186,76 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
         })
     }
 }
+
+
+fn electrum_port() -> u16 {
+    std::env::var("ELECTRUM_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(50001)
+}
+
+fn route_electrum_method(
+    method: &str,
+    params: &Value,
+) -> Result<Value, Value> {
+    match method {
+        "server.ping" => Ok(Value::Null),
+
+        "qtm.wirepackets.get" => {
+            let args = params.as_array().ok_or_else(|| {
+                json!({
+                    "code": -32602,
+                    "message": "expected [substrate, activation, network]"
+                })
+            })?;
+
+            if args.len() != 3 {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "expected [substrate, activation, network]"
+                }));
+            }
+
+            let name = args[0].as_str().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid substrate"})
+            })?;
+
+            let activation = args[1].as_u64().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid activation"})
+            })?;
+
+            let network = args[2].as_str().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid network"})
+            })?;
+
+            let response = load_wirepackets(name, activation, network)
+                .map_err(|response| {
+                    json!({
+                        "code": -32000,
+                        "message": format!(
+                            "WirePackets request failed: HTTP {}",
+                            response.status().as_u16()
+                        )
+                    })
+                })?;
+
+            serde_json::to_value(response).map_err(|e| {
+                json!({
+                    "code": -32603,
+                    "message": format!("unable to serialize WirePackets: {e}")
+                })
+            })
+        }
+
+        _ => Err(json!({
+            "code": -32601,
+            "message": format!("method not found: {method}")
+        })),
+    }
+}
+
 
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
     read_trim(&substrate_path.join("activation"))
