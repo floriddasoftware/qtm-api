@@ -34,13 +34,17 @@ net::TcpListener,
 process::{Child, Command},
 sync::Mutex as AsyncMutex,
 };
+
 #[cfg(feature = "bit-miner")]
 use bitcoin::{Amount, OutPoint, TxOut};
+
 #[cfg(feature = "bit-miner")]
 use bit_miner::{
-bitcoinpsbt::{PrevoutResolver, ResolvedPrevout},
-broadcast::WirePacket,
+    bitcoinpsbt::{PrevoutResolver, ResolvedPrevout},
+    broadcast::WirePacket,
+    observestream::decode_wirepackets,
 };
+
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
 const MAX_SUBSTRATE_NAME_LENGTH: usize = 64;
