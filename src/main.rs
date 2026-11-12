@@ -753,48 +753,98 @@ std::fs::rename(&temporary, path)
 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to persist {}: {e}", path.display())))
 }
 fn latest_record_path(substrate_path: &FsPath, prefix: &str) -> ApiResult<PathBuf> {
-let events_path = substrate_path.join("events");
-let entries = std::fs::read_dir(&events_path)
-.map_err(|e| error(StatusCode::NOT_FOUND, format!("event store is unavailable at {}: {e}", events_path.display())))?;
-let mut records: Vec<(SystemTime, PathBuf)> = Vec::new();
-for entry in entries {
-let entry = entry.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read entry: {e}")))?;
-let path = entry.path();
-let name = entry.file_name().to_string_lossy().to_string();
-if !path.is_dir() || !name.starts_with(prefix) {
-continue;
-}
-let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
-records.push((modified, path));
-}
-records.sort_by(|a, b| b.0.cmp(&a.0));
-records
-.into_iter()
-.map(|(, p)| p)
-.next()
-.ok_or_else(|| error(StatusCode::NOT_FOUND, format!("no {prefix} record exists in the event store")))
+    let events_path = substrate_path.join("events");
+    let entries = std::fs::read_dir(&events_path).map_err(|e| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!("event store is unavailable at {}: {e}", events_path.display()),
+        )
+    })?;
+
+    let mut records = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read entry: {e}"),
+            )
+        })?;
+
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if path.is_dir() && name.starts_with(prefix) {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+
+            records.push((modified, path));
+        }
+    }
+
+    records.sort_by(|a, b| b.0.cmp(&a.0));
+
+    records
+        .into_iter()
+        .map(|(_, path)| path)
+        .next()
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                format!("no {prefix} record exists in the event store"),
+            )
+        })
 }
 fn parse_record_identity(record: &str) -> Option<(u64, u128)> {
-let rest = record.strip_prefix("event").or_else(|| record.strip_prefix("exile_"))?;
-let (activation, dimension) = rest.split_once('')?;
-Some((activation.parse().ok()?, dimension.parse().ok()?))
+    let rest = record
+        .strip_prefix("event_")
+        .or_else(|| record.strip_prefix("exile_"))?;
+
+    let (activation, dimension) = rest.split_once('_')?;
+
+    Some((activation.parse().ok()?, dimension.parse().ok()?))
 }
-fn canonical_record_path(substrate_path: &FsPath, kind: &str, activation: u64, dimension: u128) -> ApiResult<PathBuf> {
-let prefix = match kind {
-"transit" => "event",
-"exile" => "exile",
-_ => return Err(error(StatusCode::BAD_REQUEST, "record kind must be transit or exile")),
-};
-let path = substrate_path.join("events").join(format!("{prefix}{activation}{dimension}"));
-if !path.is_dir() {
-return Err(error(StatusCode::NOT_FOUND, format!("canonical {kind} record does not exist: {}", path.display())));
-}
-Ok(path)
+fn canonical_record_path(
+    substrate_path: &FsPath,
+    kind: &str,
+    activation: u64,
+    dimension: u128,
+) -> ApiResult<PathBuf> {
+    let prefix = match kind {
+        "transit" => "event",
+        "exile" => "exile",
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "record kind must be transit or exile",
+            ));
+        }
+    };
+
+    let path = substrate_path
+        .join("events")
+        .join(format!("{prefix}_{activation}_{dimension}"));
+
+    if !path.is_dir() {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "canonical {kind} record does not exist: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(path)
 }
 fn valid_record_name(record: &str) -> bool {
-(record.starts_with("event") || record.starts_with("exile_"))
-&& record.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'' || b == b'-')
-&& parse_record_identity(record).is_some()
+    (record.starts_with("event_") || record.starts_with("exile_"))
+        && record
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && parse_record_identity(record).is_some()
 }
 fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
 let path_file = payload_path.join("depth.path");
@@ -842,7 +892,7 @@ frame: DirectionFrameResponse { qtm: qtm_frame(qtm), event: event_map_response(p
 selection,
 }
 }
-/ ---------- Activation/Network Budget Persistence ---------- /
+// ---------- Activation/Network Budget Persistence ---------- /
 fn budget_directory(substrate_path: &FsPath, activation: u64, network: &str) -> PathBuf {
 substrate_path.join("event").join(activation.to_string()).join(network)
 }
