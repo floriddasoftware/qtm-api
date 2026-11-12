@@ -2136,211 +2136,354 @@ network: event.qtm.net_work.to_string(),
 let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
 json_response(StatusCode::OK, &direction_response(payload, None, qtm))
 }
-fn handle_get_wirepackets(name: String, activation: u64, network: String) -> HttpResponse {
-if let Err(e) = validate_wirepackets_scope(&name, &network) {
-return e;
+
+fn load_wirepackets(
+    name: &str,
+    activation: u64,
+    network: &str,
+) -> Result<WirePacketsResponse, HttpResponse> {
+    if let Err(e) = validate_wirepackets_scope(name, network) {
+        return Err(e);
+    }
+
+    let lock = substrate_lock(name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    if let Err(e) = ensure_existing_substrate(name) {
+        return Err(e);
+    }
+
+    let budget = load_budget(name, activation, network).map_err(|e| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "unable to load budget for substrate={name} activation={activation} network={network}: {e}"
+            ),
+        )
+    })?;
+
+    let event_root = commands::substrate_root()
+        .join(name)
+        .join("activations")
+        .join(activation.to_string())
+        .join("event");
+
+    let mut packets = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for submission in 1..=budget.max_events {
+        let path = commands::wirepackets_path(name, activation, submission);
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect submission {submission}: {e}"),
+                ));
+            }
+        };
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+            error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "combined WirePackets size overflow",
+            )
+        })?;
+
+        #[cfg(feature = "bit-miner")]
+        let (packet_count, decoded) = {
+            let bytes = std::fs::read(&path).map_err(|e| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to read submission {submission}: {e}"),
+                )
+            })?;
+
+            match decode_wirepackets(&bytes) {
+                Ok(wirepackets) => {
+                    let entries = wire_packet_value_entries(&wirepackets);
+                    (entries.len(), entries)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "wirepackets decode failed substrate={name} activation={activation} submission={submission}: {e}"
+                    );
+                    (0, Vec::new())
+                }
+            }
+        };
+
+        #[cfg(not(feature = "bit-miner"))]
+        let (packet_count, decoded) = (0usize, Vec::new());
+
+        packets.push(WirePacketEntry {
+            submission,
+            name: format!("submission{submission}"),
+            path: path.display().to_string(),
+            bytes: metadata.len(),
+            packet_count,
+            packets: decoded,
+        });
+    }
+
+    let exists = !packets.is_empty();
+
+    Ok(WirePacketsResponse {
+        substrate: name.to_string(),
+        activation,
+        network: network.to_string(),
+        scope: "activation/submissions/bitcoin",
+        path: event_root.display().to_string(),
+        exists,
+        bytes: exists.then_some(total_bytes),
+        file_route: exists.then(|| {
+            format!(
+                "/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"
+            )
+        }),
+        packets,
+    })
 }
-let lock = substrate_lock(&name);
-let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
+
+fn handle_get_wirepackets(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
+    match load_wirepackets(&name, activation, &network) {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(response) => response,
+    }
 }
-let budget = match load_budget(&name, activation, &network) {
-Ok(b) => b,
-Err(e) => {
-return error(
-StatusCode::NOT_FOUND,
-format!("unable to load budget for substrate={name} activation={activation} network={network}: {e}"),
-)
+
+fn handle_get_wirepackets_file(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
+    if let Err(e) = validate_wirepackets_scope(&name, &network) {
+        return e;
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    let budget = match load_network_budget(&substrate_path, activation, &network) {
+        Ok(Some(budget)) => budget,
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "no WirePackets budget configured for this activation and network",
+            );
+        }
+        Err(e) => return e,
+    };
+
+    let persisted = match has_persisted_wirepackets(
+        &name,
+        activation,
+        Some(budget.max_events),
+    ) {
+        Ok(persisted) => persisted,
+        Err(e) => return e,
+    };
+
+    let mut combined = Vec::new();
+
+    if persisted {
+        for submission in 1..=budget.max_events {
+            let path = commands::wirepackets_path(&name, activation, submission);
+
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unable to inspect submission {submission}: {e}"),
+                    );
+                }
+            };
+
+            if !metadata.is_file() {
+                continue;
+            }
+
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unable to read submission {submission}: {e}"),
+                    );
+                }
+            };
+
+            let next_size = match (combined.len() as u64)
+                .checked_add(bytes.len() as u64)
+            {
+                Some(size) => size,
+                None => {
+                    return error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "combined WirePackets size overflow",
+                    );
+                }
+            };
+
+            if next_size > WIREPACKETS_MAX_BYTES {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
+                    ),
+                );
+            }
+
+            combined.extend_from_slice(&bytes);
+        }
+    }
+
+    if combined.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            "no persisted WirePackets submissions within configured budget",
+        );
+    }
+
+    bytes_response(
+        StatusCode::OK,
+        "application/octet-stream",
+        combined,
+    )
 }
-};
-let event_root = commands::substrate_root()
-.join(&name)
-.join("activations")
-.join(activation.to_string())
-.join("event");
-let mut packets = Vec::new();
-let mut total_bytes = 0u64;
-for submission in 1..=budget.max_events {
-let path = commands::wirepackets_path(&name, activation, submission);
-let metadata = match std::fs::metadata(&path) {
-Ok(m) => m,
-Err(e) if e.kind() == ErrorKind::NotFound => continue,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect submission {submission}: {e}")),
-};
-if !metadata.is_file() {
-continue;
+
+async fn handle_start_bitminer(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
+    if let Err(e) = validate_bitminer_scope(&name, &network) {
+        return e;
+    }
+
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "bit-miner feature not enabled and BIT_MINER_BIN not set",
+        );
+    }
+
+    let key = bitminer_key(&name, activation, &network);
+    let mut processes = bit_miner_processes().lock().await;
+
+    let (running, pid) = match live_bitminer(&mut processes, &key) {
+        Ok(state) => state,
+        Err(e) => return e,
+    };
+
+    if running {
+        return json_response(
+            StatusCode::OK,
+            &BitMinerStartResponse {
+                substrate: name,
+                activation,
+                network,
+                pid,
+                already_running: true,
+                message: "bit-miner process is already running for this network".into(),
+            },
+        );
+    }
+
+    let (executable, mode_args): (std::ffi::OsString, Vec<&str>) =
+        match std::env::var_os("BIT_MINER_BIN") {
+            Some(bin) => (bin, Vec::new()),
+            None => match std::env::current_exe() {
+                Ok(exe) => (exe.into_os_string(), vec!["--bit-miner"]),
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unable to locate executable: {e}"),
+                    );
+                }
+            },
+        };
+
+    let log_path = bitminer_log_path(&name, activation, &network);
+
+    let log_file = match std::fs::File::create(&log_path) {
+        Ok(file) => file,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to create log file: {e}"),
+            );
+        }
+    };
+
+    let log_file_err = match log_file.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to open log file: {e}"),
+            );
+        }
+    };
+
+    let child = match Command::new(&executable)
+        .args(&mode_args)
+        .arg(activation.to_string())
+        .arg(&name)
+        .arg(&network)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start bit-miner: {e}"),
+            );
+        }
+    };
+
+    let pid = child.id();
+    processes.insert(key, child);
+
+    json_response(
+        StatusCode::OK,
+        &BitMinerStartResponse {
+            substrate: name,
+            activation,
+            network,
+            pid,
+            already_running: false,
+            message: "bit-miner network pipeline started".into(),
+        },
+    )
 }
-total_bytes = match total_bytes.checked_add(metadata.len()) {
-Some(b) => b,
-None => return error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size overflow"),
-};
-#[cfg(feature = "bit-miner")]
-let (packet_count, decoded) = match std::fs::read(&path) {
-Ok(bytes) => match decode_wirepackets(&bytes) {
-Ok(wp) => {
-let entries = wire_packet_value_entries(&wp);
-(entries.len(), entries)
-}
-Err(decode_error) => {
-eprintln!("wirepackets decode failed substrate={name} activation={activation} submission={submission}: {decode_error}");
-(0, Vec::new())
-}
-},
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read submission {submission}: {e}")),
-};
-#[cfg(not(feature = "bit-miner"))]
-let (packet_count, decoded) = (0usize, Vec::new());
-packets.push(WirePacketEntry {
-submission,
-name: format!("submission{submission}"),
-path: path.display().to_string(),
-bytes: metadata.len(),
-packet_count,
-packets: decoded,
-});
-}
-let exists = !packets.is_empty();
-let file_route = exists.then(|| format!("/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"));
-json_response(
-StatusCode::OK,
-&WirePacketsResponse {
-substrate: name,
-activation,
-network,
-scope: "activation/submissions/bitcoin",
-path: event_root.display().to_string(),
-exists,
-bytes: exists.then_some(total_bytes),
-file_route,
-packets,
-},
-)
-}
-fn handle_get_wirepackets_file(name: String, activation: u64, network: String) -> HttpResponse {
-if let Err(e) = validate_wirepackets_scope(&name, &network) {
-return e;
-}
-let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-let substrate_path = match ensure_existing_substrate(&name) {
-Ok(p) => p,
-Err(e) => return e,
-};
-let budget = match load_network_budget(&substrate_path, activation, &network) {
-Ok(Some(b)) => b,
-Ok(None) => return error(StatusCode::NOT_FOUND, "no WirePackets budget configured for this activation and network"),
-Err(e) => return e,
-};
-let persisted = match has_persisted_wirepackets(&name, activation, Some(budget.max_events)) {
-Ok(p) => p,
-Err(e) => return e,
-};
-let mut combined = Vec::new();
-if persisted {
-for submission in 1..=budget.max_events {
-let path = commands::wirepackets_path(&name, activation, submission);
-let metadata = match std::fs::metadata(&path) {
-Ok(m) => m,
-Err(e) if e.kind() == ErrorKind::NotFound => continue,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect submission {submission}: {e}")),
-};
-if !metadata.is_file() {
-continue;
-}
-let bytes = match std::fs::read(&path) {
-Ok(b) => b,
-Err(e) if e.kind() == ErrorKind::NotFound => continue,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read submission {submission}: {e}")),
-};
-let next_size = match (combined.len() as u64).checked_add(bytes.len() as u64) {
-Some(s) => s,
-None => return error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size overflow"),
-};
-if next_size > WIREPACKETS_MAX_BYTES {
-return error(StatusCode::PAYLOAD_TOO_LARGE, format!("combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"));
-}
-combined.extend_from_slice(&bytes);
-}
-}
-if combined.is_empty() {
-return error(StatusCode::NOT_FOUND, "no persisted WirePackets submissions within configured budget");
-}
-bytes_response(StatusCode::OK, "application/octet-stream", combined)
-}
-async fn handle_start_bitminer(name: String, activation: u64, network: String) -> HttpResponse {
-if let Err(e) = validate_bitminer_scope(&name, &network) {
-return e;
-}
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
-}
-if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
-return error(StatusCode::NOT_IMPLEMENTED, "bit-miner feature not enabled and BIT_MINER_BIN not set");
-}
-let key = bitminer_key(&name, activation, &network);
-let mut processes = bit_miner_processes().lock().await;
-let (running, pid) = match live_bitminer(&mut processes, &key) {
-Ok(state) => state,
-Err(e) => return e,
-};
-if running {
-return json_response(
-StatusCode::OK,
-&BitMinerStartResponse {
-substrate: name,
-activation,
-network,
-pid,
-already_running: true,
-message: "bit-miner process is already running for this network".into(),
-},
-);
-}
-let (executable, mode_args): (std::ffi::OsString, Vec<&str>) = match std::env::var_os("BIT_MINER_BIN") {
-Some(bin) => (bin, Vec::new()),
-None => match std::env::current_exe() {
-Ok(exe) => (exe.into_os_string(), vec!["--bit-miner"]),
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to locate executable: {e}")),
-},
-};
-let log_path = bitminer_log_path(&name, activation, &network);
-let log_file = match std::fs::File::create(&log_path) {
-Ok(f) => f,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to create log file: {e}")),
-};
-let log_file_err = match log_file.try_clone() {
-Ok(f) => f,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to open log file: {e}")),
-};
-let child = match Command::new(&executable)
-.args(&mode_args)
-.arg(activation.to_string())
-.arg(&name)
-.arg(&network)
-.stdin(Stdio::null())
-.stdout(Stdio::from(log_file))
-.stderr(Stdio::from(log_file_err))
-.kill_on_drop(true)
-.spawn()
-{
-Ok(c) => c,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start bit-miner: {e}")),
-};
-let pid = child.id();
-processes.insert(key, child);
-json_response(
-StatusCode::OK,
-&BitMinerStartResponse {
-substrate: name,
-activation,
-network,
-pid,
-already_running: false,
-message: "bit-miner network pipeline started".into(),
-},
-)
-}
+
 async fn handle_get_bitminer_status(
     name: String,
     activation: u64,
