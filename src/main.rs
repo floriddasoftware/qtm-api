@@ -572,25 +572,29 @@ _ => Err("unsupported BIP39 language".to_string()),
 }
 }
 fn parse_indices(raw: &str) -> Result<[u16; NUM_INDICES], String> {
-let parsed = raw
-.split(',')
-.map(|part| {
-let value = part
-.trim()
-.parse::<u16>()
-.map_err(|| "indices must contain exactly 12 integers from 0 to 2047".to_string())?;
-if value >= DOMAIN_SIZE {
-return Err("each index must be in the range 0..2048".to_string());
-}
-Ok(value)
-})
-.collect::<Result<Vec<u16>, String>>()?;
-if parsed.len() != NUM_INDICES {
-return Err("indices must contain exactly 12 comma-separated integers".to_string());
-}
-parsed
-.try_into()
-.map_err(|| "indices must contain exactly 12 comma-separated integers".to_string())
+    let parsed = raw
+        .split(',')
+        .map(|part| {
+            let value = part
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| "indices must contain exactly 12 integers from 0 to 2047".to_string())?;
+
+            if value >= DOMAIN_SIZE {
+                return Err("each index must be in the range 0..2048".to_string());
+            }
+
+            Ok(value)
+        })
+        .collect::<Result<Vec<u16>, String>>()?;
+
+    if parsed.len() != NUM_INDICES {
+        return Err("indices must contain exactly 12 comma-separated integers".to_string());
+    }
+
+    parsed
+        .try_into()
+        .map_err(|_| "indices must contain exactly 12 comma-separated integers".to_string())
 }
 fn substrate_json(name: &str) -> ApiResult<SubstrateResponse> {
 let path = commands::substrate_root().join(name);
@@ -657,35 +661,53 @@ activations: read_trim(&path.join("activation")).unwrap_or_else(|| "0".to_string
 substrates.sort_by(|a, b| a.name.cmp(&b.name));
 Ok(SubstrateListResponse { substrates })
 }
-fn network_option(id: &str, name: &str, coin: CoinType, purpose: u64, path: &str) -> NetworkOption {
-NetworkOption {
-id: id.to_string(),
-name: name.to_string(),
-coin: coin.retained_mass() as u64,
-purpose,
-path: path.to_string(),
+fn network_option(
+    id: &str,
+    name: &str,
+    coin: CoinType,
+    purpose: u64,
+    path: &str,
+) -> NetworkOption {
+    NetworkOption {
+        id: id.to_string(),
+        name: name.to_string(),
+        coin: coin.retained_mass() as u64,
+        purpose,
+        path: path.to_string(),
+    }
 }
-}
+
 fn registered_networks() -> NetworkListResponse {
-let mut networks = Vec::new();
-for coin in CoinType::all() {
-let id = match coin {
-CoinType::Bitcoin => "bitcoin-legacy",
-CoinType::Ethereum => "ethereum",
-CoinType::Solana => "solana",
-CoinType::Tron => "tron",
-};
-networks.push(network_option(id, coin.name(), *coin, 44, PathsRegistry::get_path(coin)));
-}
-networks.push(network_option(
-"bitcoin-native-segwit",
-"Bitcoin · Native SegWit (BIP 84)",
-CoinType::Bitcoin,
-84,
-"m/84'/0'/0'/0/0",
-));
-networks.sort_by(|a, b| a.id.cmp(&b.id));
-NetworkListResponse { networks }
+    let mut networks = CoinType::all()
+        .iter()
+        .map(|coin| {
+            let id = match coin {
+                CoinType::Bitcoin => "bitcoin-legacy",
+                CoinType::Ethereum => "ethereum",
+                CoinType::Solana => "solana",
+                CoinType::Tron => "tron",
+            };
+
+            network_option(
+                id,
+                coin.name(),
+                *coin,
+                44,
+                PathsRegistry::get_path(*coin),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    networks.push(network_option(
+        "bitcoin-native-segwit",
+        "Bitcoin · Native SegWit (BIP 84)",
+        CoinType::Bitcoin,
+        84,
+        "m/84'/0'/0'/0/0",
+    ));
+
+    networks.sort_by(|a, b| a.id.cmp(&b.id));
+    NetworkListResponse { networks }
 }
 fn selected_network(id: &str) -> Option<NetworkOption> {
 registered_networks().networks.into_iter().find(|n| n.id == id)
@@ -2099,139 +2121,209 @@ message: "bit-miner network pipeline started".into(),
 },
 )
 }
-async fn handle_get_bitminer_status(name: String, activation: u64, network: String) -> HttpResponse {
-if let Err(e) = validate_bitminer_scope(&name, &network) {
-return e;
+async fn handle_get_bitminer_status(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
+    if let Err(e) = validate_bitminer_scope(&name, &network) {
+        return e;
+    }
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    let (running, pid) = match bitminer_process_state(&name, activation, &network).await {
+        Ok(state) => state,
+        Err(e) => return e,
+    };
+
+    let log_path = bitminer_log_path(&name, activation, &network);
+    let event_path = commands::event_path_at_activation(&name, activation)
+        .map(|path| path.display().to_string());
+    let last_error = if running {
+        None
+    } else {
+        bitminer_log_tail(&log_path)
+    };
+
+    json_response(
+        StatusCode::OK,
+        &BitMinerStatusResponse {
+            substrate: name,
+            activation,
+            network,
+            running,
+            pid,
+            path: event_path.clone(),
+            event_path,
+            log_path: log_path.display().to_string(),
+            clips: active_clips(activation),
+            runtime: serialize_runtime(SystemTime::now()),
+            error: last_error,
+        },
+    )
 }
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
+
+async fn handle_stop_bitminer(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
+    if let Err(e) = validate_bitminer_scope(&name, &network) {
+        return e;
+    }
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    let key = bitminer_key(&name, activation, &network);
+    let mut processes = bit_miner_processes().lock().await;
+
+    let Some(mut child) = processes.remove(&key) else {
+        return json_response(
+            StatusCode::OK,
+            &BitMinerStopResponse {
+                substrate: name,
+                activation,
+                network,
+                was_running: false,
+                stopped: false,
+                pid: None,
+                message: "no bit-miner process is registered for this network".into(),
+            },
+        );
+    };
+
+    let pid = child.id();
+
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            return json_response(
+                StatusCode::OK,
+                &BitMinerStopResponse {
+                    substrate: name,
+                    activation,
+                    network,
+                    was_running: false,
+                    stopped: false,
+                    pid: None,
+                    message: "bit-miner process had already exited".into(),
+                },
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect bit-miner process: {e}"),
+            );
+        }
+    }
+
+    if let Err(e) = child.kill().await {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to stop bit-miner process: {e}"),
+        );
+    }
+
+    json_response(
+        StatusCode::OK,
+        &BitMinerStopResponse {
+            substrate: name,
+            activation,
+            network,
+            was_running: true,
+            stopped: true,
+            pid,
+            message: "bit-miner network pipeline stopped".into(),
+        },
+    )
 }
-let (running, pid) = match bitminer_process_state(&name, activation, &network).await {
-Ok(s) => s,
-Err(e) => return e,
-};
-let log_path = bitminer_log_path(&name, activation, &network);
-let event_path = commands::event_path_at_activation(&name, activation).map(|p| p.display().to_string());
-let last_error = if running { None } else { bitminer_log_tail(&log_path) };
-json_response(
-StatusCode::OK,
-&BitMinerStatusResponse {
-substrate: name,
-activation,
-network,
-running,
-pid,
-path: event_path.clone(),
-event_path,
-log_path: log_path.display().to_string(),
-clips: active_clips(activation),
-runtime: serialize_runtime(SystemTime::now()),
-error: last_error,
-},
-)
+
+fn handle_get_bitminer_log(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
+    if let Err(e) = validate_bitminer_scope(&name, &network) {
+        return e;
+    }
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    let path = bitminer_log_path(&name, activation, &network);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let status = if e.kind() == ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+
+            return error(status, format!("unable to read bit-miner log: {e}"));
+        }
+    };
+
+    let start = bytes.len().saturating_sub(BITMINER_LOG_MAX_BYTES);
+    let body = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    let mut response = bytes_response(
+        StatusCode::OK,
+        "text/plain; charset=utf-8",
+        body,
+    );
+
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+
+    response
 }
-async fn handle_stop_bitminer(name: String, activation: u64, network: String) -> HttpResponse {
-if let Err(e) = validate_bitminer_scope(&name, &network) {
-return e;
+
+async fn handle_list_bitcoin_observations(
+    name: String,
+    activation: u64,
+) -> HttpResponse {
+    if !valid_substrate_name(&name) {
+        return error(StatusCode::BAD_REQUEST, "invalid substrate name");
+    }
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    match bitminer_process_list(&name, activation).await {
+        Ok(pipelines) => json_response(
+            StatusCode::OK,
+            &BitMinerProcessListResponse {
+                substrate: name,
+                activation,
+                pipelines,
+            },
+        ),
+        Err(e) => e,
+    }
 }
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
-}
-let key = bitminer_key(&name, activation, &network);
-let mut processes = bit_miner_processes().lock().await;
-let Some(mut child) = processes.remove(&key) else {
-return json_response(
-StatusCode::OK,
-&BitMinerStopResponse {
-substrate: name,
-activation,
-network,
-was_running: false,
-stopped: false,
-pid: None,
-message: "no bit-miner process is registered for this network".into(),
-},
-);
-};
-let pid = child.id();
-match child.try_wait() {
-Ok(Some()) => {
-return json_response(
-StatusCode::OK,
-&BitMinerStopResponse {
-substrate: name,
-activation,
-network,
-was_running: false,
-stopped: false,
-pid: None,
-message: "bit-miner process had already exited".into(),
-},
-);
-}
-Ok(None) => {}
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect bit-miner process: {e}")),
-}
-if let Err(e) = child.kill().await {
-return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to stop bit-miner process: {e}"));
-}
-json_response(
-StatusCode::OK,
-&BitMinerStopResponse {
-substrate: name,
-activation,
-network,
-was_running: true,
-stopped: true,
-pid,
-message: "bit-miner network pipeline stopped".into(),
-},
-)
-}
-fn handle_get_bitminer_log(name: String, activation: u64, network: String) -> HttpResponse {
-if let Err(e) = validate_bitminer_scope(&name, &network) {
-return e;
-}
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
-}
-let path = bitminer_log_path(&name, activation, &network);
-let bytes = match std::fs::read(&path) {
-Ok(b) => b,
-Err(e) => {
-let status = if e.kind() == ErrorKind::NotFound { StatusCode::NOT_FOUND } else { StatusCode::INTERNAL_SERVER_ERROR };
-return error(status, format!("unable to read bit-miner log: {e}"));
-}
-};
-let start = bytes.len().saturating_sub(BITMINER_LOG_MAX_BYTES);
-let body = String::from_utf8_lossy(&bytes[start..]).into_owned();
-let mut res = bytes_response(StatusCode::OK, "text/plain; charset=utf-8", body);
-res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-res
-}
-async fn handle_list_bitcoin_observations(name: String, activation: u64) -> HttpResponse {
-if !valid_substrate_name(&name) {
-return error(StatusCode::BAD_REQUEST, "invalid substrate name");
-}
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
-}
-match bitminer_process_list(&name, activation).await {
-Ok(pipelines) => json_response(StatusCode::OK, &BitMinerProcessListResponse { substrate: name, activation, pipelines }),
-Err(e) => e,
-}
-}
-async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse {
-let miner = match bitminer_process_state_any(&name, activation).await {
-Ok(m) => m,
-Err(e) => return e,
-};
-let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-match build_payload_board(&name, activation, None, miner) {
-Ok(board) => json_response(StatusCode::OK, &board),
-Err(e) => e,
-}
+
+async fn handle_get_payload_board(
+    name: String,
+    activation: u64,
+) -> HttpResponse {
+    let miner = match bitminer_process_state_any(&name, activation).await {
+        Ok(miner) => miner,
+        Err(e) => return e,
+    };
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    match build_payload_board(&name, activation, None, miner) {
+        Ok(board) => json_response(StatusCode::OK, &board),
+        Err(e) => e,
+    }
 }
 async fn handle_get_payload_board_for_network(name: String, activation: u64, network: String) -> HttpResponse {
 if !valid_observation_network_id(&network) {
