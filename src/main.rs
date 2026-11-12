@@ -958,7 +958,7 @@ std::fs::rename(&temporary_path, &path)
 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to persist {}: {e}", path.display())))?;
 Ok(EventBudget { min_events: body.min_events, max_events: body.max_events })
 }
-/ ---------- WirePackets & Bit-Miner Integration ---------- /
+// ---------- WirePackets & Bit-Miner Integration ---------- /
 fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 if !valid_substrate_name(name) {
 return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
@@ -1340,7 +1340,7 @@ runtime: serialize_runtime(SystemTime::now()),
 message,
 })
 }
-/ ---------- Endpoint Handlers (Adapted for Hyper) ---------- /
+// ---------- Endpoint Handlers (Adapted for Hyper) ---------- /
 fn handle_health() -> HttpResponse {
 bytes_response(StatusCode::OK, "text/plain; charset=utf-8", "ok")
 }
@@ -2298,7 +2298,7 @@ Err(e) => e,
 _ => error(StatusCode::NOT_FOUND, format!("route not found: {raw_path}")),
 }
 }
-/ ---------- Bit-Miner Child Worker ---------- */
+//---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
 use bit_miner::observestream::{MempoolSpaceStream, MempoolStreamMode};
