@@ -483,49 +483,78 @@ fn parse_u64_param(raw: &str, label: &str) -> ApiResult<u64> {
 raw.parse::<u64>()
 .map_err(|_| error(StatusCode::BAD_REQUEST, format!("invalid {label}: {raw}")))
 }
-/ ---------- Synchronization & Core Substrate Helpers ---------- */
-static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+// ---------- Synchronization & Core Substrate Helpers ----------
+
+static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
-let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-Arc::clone(registry.entry(name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+    let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    Arc::clone(
+        registry
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
 }
+
 fn guarded<T>(label: &str, operation: impl FnOnce() -> T) -> ApiResult<T> {
-std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
-let detail = payload
-.downcast_ref::<&str>()
-.map(|m| m.to_string())
-.or_else(|| payload.downcast_ref::<String>().cloned())
-.unwrap_or_else(|| "unknown failure".to_string());
-error(StatusCode::INTERNAL_SERVER_ERROR, format!("{label} failed in qp_hd: {detail}"))
-})
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown failure".to_string());
+
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{label} failed in qp_hd: {detail}"),
+        )
+    })
 }
+
 fn read_trim(path: &FsPath) -> Option<String> {
-std::fs::read_to_string(path).ok().map(|v| v.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
 }
+
 fn required_file(path: &FsPath) -> ApiResult<String> {
-read_trim(path).ok_or_else(|| {
-error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read substrate file: {}", path.display()))
-})
+    read_trim(path).ok_or_else(|| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to read substrate file: {}", path.display()),
+        )
+    })
 }
+
 fn valid_substrate_name(name: &str) -> bool {
-!name.is_empty()
-&& name.len() <= MAX_SUBSTRATE_NAME_LENGTH
-&& name != "."
-&& name != ".."
-&& name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'')
+    !name.is_empty()
+        && name.len() <= MAX_SUBSTRATE_NAME_LENGTH
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+
 fn valid_observation_network_id(network: &str) -> bool {
-!network.is_empty()
-&& network.len() <= 64
-&& network != "."
-&& network != ".."
-&& network.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'')
+    !network.is_empty()
+        && network.len() <= 64
+        && network != "."
+        && network != ".."
+        && network
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+
 fn is_bitcoin_network_id(network: &str) -> bool {
-let lower = network.trim().to_ascii_lowercase();
-matches!(lower.as_str(), "bitcoin-legacy" | "bitcoin-native-segwit" | "bitcoin" | "btc")
-|| lower.contains("bitcoin")
+    let lower = network.trim().to_ascii_lowercase();
+
+    matches!(
+        lower.as_str(),
+        "bitcoin-legacy" | "bitcoin-native-segwit" | "bitcoin" | "btc"
+    ) || lower.contains("bitcoin")
 }
 fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
 match value.trim().to_ascii_lowercase().as_str() {
