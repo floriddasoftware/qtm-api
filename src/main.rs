@@ -470,7 +470,7 @@ fn bytes_response(
 
 fn empty_response(status: StatusCode) -> HttpResponse {
 let mut res = Response::new(Full::new(Bytes::new()));
-res.status_mut() = status;
+*res.status_mut() = status;
 attach_cors(&mut res);
 res
 }
@@ -2019,7 +2019,7 @@ sigma: transaction.qtm.sigma.to_string(),
 network: transaction.qtm.net_work.to_string(),
 }),
 constant: match &transaction.constant {
-qp_hd::PersistedEvent::Transit() => "transit".to_string(),
+qp_hd::PersistedEvent::Transit(..) => "transit".to_string(),
 qp_hd::PersistedEvent::Exile(..) => "exile".to_string(),
 },
 };
@@ -2177,7 +2177,7 @@ None => return error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size o
 };
 #[cfg(feature = "bit-miner")]
 let (packet_count, decoded) = match std::fs::read(&path) {
-Ok(bytes) => match decode_wirepackets_file(&bytes) {
+Ok(bytes) => match decode_wirepackets(&bytes) {
 Ok(wp) => {
 let entries = wire_packet_value_entries(&wp);
 (entries.len(), entries)
@@ -2222,7 +2222,7 @@ if let Err(e) = validate_wirepackets_scope(&name, &network) {
 return e;
 }
 let lock = substrate_lock(&name);
-let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 let substrate_path = match ensure_existing_substrate(&name) {
 Ok(p) => p,
 Err(e) => return e,
