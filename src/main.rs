@@ -34,7 +34,6 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 #[cfg(feature = "bit-miner")]
-#[cfg(feature = "bit-miner")]
 use bitcoin::{Amount, OutPoint, TxOut};
 
 #[cfg(feature = "bit-miner")]
@@ -42,7 +41,7 @@ use bit_miner::{
     bitcoinpsbt::{PrevoutResolver, ResolvedPrevout},
     broadcast::WirePacket,
 };
-// use bit_miner::broadcast::FinalizedSettlement;
+
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
 const MAX_SUBSTRATE_NAME_LENGTH: usize = 64;
@@ -183,7 +182,6 @@ struct PersistedEventSummary {
     structural_value: String,
     depth_objects: usize,
     retained_mass: String,
-    // Persisted transition window; never recomputed by the API.
     delta: String,
     tau: String,
     gross_work: String,
@@ -281,16 +279,6 @@ struct ReceiveRequest {
     flow: String,
 }
 
-/*
- * Activation/network budget API
- *
- * Canonical path:
- *   <substrate_root>/<substrate>/event/<activation>/<network>/budget
- *
- * Each file belongs to exactly one substrate, activation, and registered
- * network. Budget files use a simple key=value format to avoid requiring
- * an additional JSON persistence format.
- */
 #[derive(Deserialize)]
 struct BudgetRequest {
     min_events: u64,
@@ -326,6 +314,16 @@ struct ObservationClipStatus {
     direction: Option<String>,
 }
 
+/// One decoded QTMGSP02 packet value for the frontend dropdown.
+#[derive(Serialize, Clone)]
+struct WirePacketValueEntry {
+    txid: String,
+    vout: u32,
+    value_sat: u64,
+    script_pubkey: String,
+    commitment: String,
+}
+
 #[derive(Serialize)]
 struct WirePacketsResponse {
     substrate: String,
@@ -345,6 +343,8 @@ struct WirePacketEntry {
     name: String,
     path: String,
     bytes: u64,
+    packet_count: usize,
+    packets: Vec<WirePacketValueEntry>,
 }
 
 const WIREPACKETS_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -371,8 +371,106 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// Decode a framed QTMGSP02 wire-packet file.
+///
+/// Framing matches bit-miner/observestream::decode_wirepackets and
+/// WirePacketPrevoutResolver::resolve_packet:
+///   [4-byte BE length][WirePacket payload]...
+/// Payload is decoded with the public WirePacket::deserialize (QTMGSP02).
+#[cfg(feature = "bit-miner")]
+fn decode_wirepackets_file(
+    bytes: &[u8],
+) -> Result<Vec<WirePacket>, std::io::Error> {
+    use std::io::{Error, ErrorKind};
 
+    if bytes.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "persisted wire-packet file is empty",
+        ));
+    }
 
+    let mut offset = 0usize;
+    let mut packets = Vec::new();
+
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(4).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "wire-packet frame offset overflow",
+            )
+        })?;
+
+        if header_end > bytes.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "truncated wire-packet frame header",
+            ));
+        }
+
+        let frame_len = u32::from_be_bytes(
+            bytes[offset..header_end]
+                .try_into()
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "invalid wire-packet frame header",
+                    )
+                })?,
+        ) as usize;
+
+        offset = header_end;
+
+        if !(WirePacket::MIN_SIZE..=WirePacket::MAX_SIZE).contains(&frame_len)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid wire-packet frame length={frame_len}"),
+            ));
+        }
+
+        let frame_end = offset.checked_add(frame_len).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "wire-packet frame length overflow",
+            )
+        })?;
+
+        if frame_end > bytes.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "truncated wire-packet frame payload",
+            ));
+        }
+
+        let packet = WirePacket::deserialize(&bytes[offset..frame_end])?;
+        packets.push(packet);
+        offset = frame_end;
+    }
+
+    if packets.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "persisted wire-packet file contains no packets",
+        ));
+    }
+
+    Ok(packets)
+}
+
+#[cfg(feature = "bit-miner")]
+fn wire_packet_value_entries(packets: &[WirePacket]) -> Vec<WirePacketValueEntry> {
+    packets
+        .iter()
+        .map(|packet| WirePacketValueEntry {
+            txid: packet.txid().to_string(),
+            vout: packet.vout(),
+            value_sat: packet.value,
+            script_pubkey: hex::encode(packet.script_pubkey.as_bytes()),
+            commitment: hex::encode(packet.commitment),
+        })
+        .collect()
+}
 
 #[cfg(feature = "bit-miner")]
 struct WirePacketPrevoutResolver {
@@ -419,53 +517,9 @@ impl WirePacketPrevoutResolver {
             )
         })?;
 
-        let mut offset = 0usize;
+        let packets = decode_wirepackets_file(&bytes)?;
 
-        while offset < bytes.len() {
-            let remaining = bytes.len().saturating_sub(offset);
-
-            if remaining < 4 {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "incomplete wire-packet frame: {}",
-                        path.display(),
-                    ),
-                ));
-            }
-
-            let length = u32::from_be_bytes(
-                bytes[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| {
-                        Error::new(
-                            ErrorKind::InvalidData,
-                            "invalid wire-packet frame length",
-                        )
-                    })?,
-            ) as usize;
-
-            offset += 4;
-
-            if length == 0
-                || length > WirePacket::MAX_SIZE
-                || length > bytes.len().saturating_sub(offset)
-            {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "invalid wire-packet frame: {}",
-                        path.display(),
-                    ),
-                ));
-            }
-
-            let packet = WirePacket::deserialize(
-                &bytes[offset..offset + length],
-            )?;
-
-            offset += length;
-
+        for packet in packets {
             if packet.outpoint != *requested {
                 continue;
             }
@@ -530,9 +584,8 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
     }
 }
 
-
-/// Metadata for all persisted WirePackets submissions within the
-/// substrate activation's configured event budget.
+/// Metadata + decoded packet values for all persisted WirePackets
+/// submissions within the substrate activation's configured event budget.
 async fn get_wirepackets(
     Path((name, activation, network)): Path<(String, u64, String)>,
 ) -> ApiResult<Json<WirePacketsResponse>> {
@@ -545,23 +598,15 @@ async fn get_wirepackets(
 
     ensure_existing_substrate(&name)?;
 
-    let budget = load_budget(
-    &name,
-    activation,
-    &network,
-)
-.map_err(|io_error| {
-    error(
-        StatusCode::NOT_FOUND,
-        format!(
-            "unable to load budget for substrate={} activation={} network={}: {}",
-            name,
-            activation,
-            network,
-            io_error,
-        ),
-    )
-})?;
+    let budget = load_budget(&name, activation, &network).map_err(|io_error| {
+        error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "unable to load budget for substrate={} activation={} network={}: {}",
+                name, activation, network, io_error,
+            ),
+        )
+    })?;
 
     let event_root = commands::substrate_root()
         .join(&name)
@@ -573,17 +618,11 @@ async fn get_wirepackets(
     let mut total_bytes = 0u64;
 
     for submission in 1..=budget.max_events {
-        let path = commands::wirepackets_path(
-            &name,
-            activation,
-            submission,
-        );
+        let path = commands::wirepackets_path(&name, activation, submission);
 
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
-            Err(io_error)
-                if io_error.kind() == std::io::ErrorKind::NotFound =>
-            {
+            Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
                 continue;
             }
             Err(io_error) => {
@@ -600,20 +639,52 @@ async fn get_wirepackets(
             continue;
         }
 
-        total_bytes = total_bytes
-            .checked_add(metadata.len())
-            .ok_or_else(|| {
-                error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "combined WirePackets size overflow",
-                )
-            })?;
+        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+            error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "combined WirePackets size overflow",
+            )
+        })?;
+
+        // Decode framed packets for this submission (QTMGSP02 via WirePacket::deserialize).
+        #[cfg(feature = "bit-miner")]
+        let (packet_count, decoded) = {
+            match std::fs::read(&path) {
+                Ok(bytes) => match decode_wirepackets_file(&bytes) {
+                    Ok(wire_packets) => {
+                        let entries = wire_packet_value_entries(&wire_packets);
+                        (entries.len(), entries)
+                    }
+                    Err(decode_error) => {
+                        // File exists but is not valid framed packets — report metadata only.
+                        eprintln!(
+                            "wirepackets decode failed substrate={} activation={} submission={}: {decode_error}",
+                            name, activation, submission,
+                        );
+                        (0, Vec::new())
+                    }
+                },
+                Err(io_error) => {
+                    return Err(error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "unable to read WirePackets submission {submission}: {io_error}"
+                        ),
+                    ));
+                }
+            }
+        };
+
+        #[cfg(not(feature = "bit-miner"))]
+        let (packet_count, decoded) = (0usize, Vec::new());
 
         packets.push(WirePacketEntry {
             submission,
             name: format!("submission_{submission}"),
             path: path.display().to_string(),
             bytes: metadata.len(),
+            packet_count,
+            packets: decoded,
         });
     }
 
@@ -637,6 +708,7 @@ async fn get_wirepackets(
         packets,
     }))
 }
+
 /// Return the framed WirePackets from every persisted submission
 /// within the configured network budget.
 async fn get_wirepackets_file(
@@ -651,39 +723,26 @@ async fn get_wirepackets_file(
 
     let substrate_path = ensure_existing_substrate(&name)?;
 
-    let budget = load_network_budget(
-        &substrate_path,
-        activation,
-        &network,
-    )?
-    .ok_or_else(|| {
-        error(
-            StatusCode::NOT_FOUND,
-            "no WirePackets budget configured for this activation and network",
-        )
-    })?;
+    let budget = load_network_budget(&substrate_path, activation, &network)?
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "no WirePackets budget configured for this activation and network",
+            )
+        })?;
 
     let mut combined = Vec::new();
 
-    let wirepackets_persisted = has_persisted_wirepackets(
-        &name,
-        activation,
-        Some(budget.max_events),
-    )?;
+    let wirepackets_persisted =
+        has_persisted_wirepackets(&name, activation, Some(budget.max_events))?;
 
     if wirepackets_persisted {
         for submission in 1..=budget.max_events {
-            let path = commands::wirepackets_path(
-                &name,
-                activation,
-                submission,
-            );
+            let path = commands::wirepackets_path(&name, activation, submission);
 
             let metadata = match std::fs::metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(io_error)
-                    if io_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
                     continue;
                 }
                 Err(io_error) => {
@@ -702,9 +761,7 @@ async fn get_wirepackets_file(
 
             let bytes = match std::fs::read(&path) {
                 Ok(bytes) => bytes,
-                Err(io_error)
-                    if io_error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
                     continue;
                 }
                 Err(io_error) => {
@@ -776,16 +833,11 @@ fn valid_observation_network_id(network: &str) -> bool {
         })
 }
 
-// Active clip rule, identical to bit-miner's Miner::new: a substrate is an
-// active clip for an activation only when its `activation` file holds exactly
-// that number. Pure file reads, so nothing here can panic like the miner can.
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
     read_trim(&substrate_path.join("activation"))
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
-// Every active clip for an activation, in name order, exactly as the miner
-// discovers them under substrate_root().
 fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
     let mut names: Vec<String> = std::fs::read_dir(commands::substrate_root())
         .into_iter()
@@ -810,21 +862,18 @@ fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
         .collect()
 }
 
-// Resolve the persisted event with the same resolver bit-miner uses
-// (qp_hd::commands::event_path_at_activation) and confirm its depth loads
-// (qp_hd::commands::load_depth), so the API never accepts an event layout the
-// miner cannot actually load.
 fn resolve_stored_event(name: &str, activation: u64) -> ApiResult<PathBuf> {
-    let stored = commands::event_path_at_activation(name, activation)
-        .ok_or_else(|| {
-            error(
-                StatusCode::CONFLICT,
-                format!(
-                    "No stored event for substrate '{name}' at activation {activation}                      (expected {}/events/event_{activation}_<dimension>). Run a transit                      first. On Render the disk is wiped on every deploy unless a                      persistent disk is mounted for ~/.qp.",
-                    commands::substrate_root().join(name).display()
-                ),
-            )
-        })?;
+    let stored = commands::event_path_at_activation(name, activation).ok_or_else(|| {
+        error(
+            StatusCode::CONFLICT,
+            format!(
+                "No stored event for substrate '{name}' at activation {activation} \
+                 (expected {}/events/event_{activation}_<dimension>). Run a transit first. \
+                 On Render the disk is wiped on every deploy unless a persistent disk is mounted for ~/.qp.",
+                commands::substrate_root().join(name).display()
+            ),
+        )
+    })?;
 
     if !stored.is_dir() {
         return Err(error(
@@ -833,17 +882,15 @@ fn resolve_stored_event(name: &str, activation: u64) -> ApiResult<PathBuf> {
         ));
     }
 
-    guarded("depth load", || commands::load_depth(&stored))?.map_err(
-        |io_error| {
-            error(
-                StatusCode::CONFLICT,
-                format!(
-                    "Depth unavailable for stored event {}: {io_error}",
-                    stored.display()
-                ),
-            )
-        },
-    )?;
+    guarded("depth load", || commands::load_depth(&stored))?.map_err(|io_error| {
+        error(
+            StatusCode::CONFLICT,
+            format!(
+                "Depth unavailable for stored event {}: {io_error}",
+                stored.display()
+            ),
+        )
+    })?;
 
     Ok(stored)
 }
@@ -873,8 +920,6 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Ap
     )
 }
 
-// qp_hd reports failures by panicking (expect/panic!). Convert that into a
-// JSON 500 so the client sees the cause instead of a dropped connection.
 fn guarded<T>(label: &str, operation: impl FnOnce() -> T) -> ApiResult<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
         let detail = payload
@@ -913,6 +958,7 @@ fn valid_substrate_name(name: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
+
 
 fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
     match value.trim().to_ascii_lowercase().as_str() {
