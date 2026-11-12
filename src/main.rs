@@ -457,7 +457,7 @@ res
 }
 fn empty_response(status: StatusCode) -> HttpResponse {
 let mut res = Response::new(Full::new(Bytes::new()));
-*res.status_mut() = status;
+res.status_mut() = status;
 attach_cors(&mut res);
 res
 }
@@ -483,7 +483,7 @@ fn parse_u64_param(raw: &str, label: &str) -> ApiResult<u64> {
 raw.parse::<u64>()
 .map_err(|_| error(StatusCode::BAD_REQUEST, format!("invalid {label}: {raw}")))
 }
-/* ---------- Synchronization & Core Substrate Helpers ---------- */
+/ ---------- Synchronization & Core Substrate Helpers ---------- */
 static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
 let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -513,14 +513,14 @@ fn valid_substrate_name(name: &str) -> bool {
 && name.len() <= MAX_SUBSTRATE_NAME_LENGTH
 && name != "."
 && name != ".."
-&& name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+&& name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'')
 }
 fn valid_observation_network_id(network: &str) -> bool {
 !network.is_empty()
 && network.len() <= 64
 && network != "."
 && network != ".."
-&& network.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+&& network.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'')
 }
 fn is_bitcoin_network_id(network: &str) -> bool {
 let lower = network.trim().to_ascii_lowercase();
@@ -549,7 +549,7 @@ let parsed = raw
 let value = part
 .trim()
 .parse::<u16>()
-.map_err(|_| "indices must contain exactly 12 integers from 0 to 2047".to_string())?;
+.map_err(|| "indices must contain exactly 12 integers from 0 to 2047".to_string())?;
 if value >= DOMAIN_SIZE {
 return Err("each index must be in the range 0..2048".to_string());
 }
@@ -561,7 +561,7 @@ return Err("indices must contain exactly 12 comma-separated integers".to_string(
 }
 parsed
 .try_into()
-.map_err(|_| "indices must contain exactly 12 comma-separated integers".to_string())
+.map_err(|| "indices must contain exactly 12 comma-separated integers".to_string())
 }
 fn substrate_json(name: &str) -> ApiResult<SubstrateResponse> {
 let path = commands::substrate_root().join(name);
@@ -646,7 +646,7 @@ CoinType::Ethereum => "ethereum",
 CoinType::Solana => "solana",
 CoinType::Tron => "tron",
 };
-networks.push(network_option(id, coin.name(), *coin, 44, PathsRegistry::get_path(*coin)));
+networks.push(network_option(id, coin.name(), *coin, 44, PathsRegistry::get_path(coin)));
 }
 networks.push(network_option(
 "bitcoin-native-segwit",
@@ -741,13 +741,13 @@ records.push((modified, path));
 records.sort_by(|a, b| b.0.cmp(&a.0));
 records
 .into_iter()
-.map(|(_, p)| p)
+.map(|(, p)| p)
 .next()
 .ok_or_else(|| error(StatusCode::NOT_FOUND, format!("no {prefix} record exists in the event store")))
 }
 fn parse_record_identity(record: &str) -> Option<(u64, u128)> {
-let rest = record.strip_prefix("event_").or_else(|| record.strip_prefix("exile_"))?;
-let (activation, dimension) = rest.split_once('_')?;
+let rest = record.strip_prefix("event").or_else(|| record.strip_prefix("exile_"))?;
+let (activation, dimension) = rest.split_once('')?;
 Some((activation.parse().ok()?, dimension.parse().ok()?))
 }
 fn canonical_record_path(substrate_path: &FsPath, kind: &str, activation: u64, dimension: u128) -> ApiResult<PathBuf> {
@@ -763,8 +763,8 @@ return Err(error(StatusCode::NOT_FOUND, format!("canonical {kind} record does no
 Ok(path)
 }
 fn valid_record_name(record: &str) -> bool {
-(record.starts_with("event_") || record.starts_with("exile_"))
-&& record.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+(record.starts_with("event") || record.starts_with("exile_"))
+&& record.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'' || b == b'-')
 && parse_record_identity(record).is_some()
 }
 fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
@@ -789,7 +789,7 @@ let position = fields[0]
 let identifier_bytes = hex::decode(fields[1])
 .map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid depth identifier at line {}", idx + 1)))?;
 let identifier = String::from_utf8(identifier_bytes)
-.map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, format!("depth identifier not UTF-8 at line {}", idx + 1)))?;
+.map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("depth identifier not UTF-8 at line {}", idx + 1)))?;
 objects.push(DepthObjectResponse {
 position,
 identifier,
@@ -813,7 +813,7 @@ frame: DirectionFrameResponse { qtm: qtm_frame(qtm), event: event_map_response(p
 selection,
 }
 }
-/* ---------- Activation/Network Budget Persistence ---------- */
+/ ---------- Activation/Network Budget Persistence ---------- /
 fn budget_directory(substrate_path: &FsPath, activation: u64, network: &str) -> PathBuf {
 substrate_path.join("event").join(activation.to_string()).join(network)
 }
@@ -879,7 +879,7 @@ std::fs::rename(&temporary_path, &path)
 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to persist {}: {e}", path.display())))?;
 Ok(EventBudget { min_events: body.min_events, max_events: body.max_events })
 }
-/* ---------- WirePackets & Bit-Miner Integration ---------- */
+/ ---------- WirePackets & Bit-Miner Integration ---------- /
 fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
 if !valid_substrate_name(name) {
 return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
@@ -910,7 +910,7 @@ return Err(Error::new(ErrorKind::InvalidData, "truncated wire-packet frame heade
 let frame_len = u32::from_be_bytes(
 bytes[offset..header_end]
 .try_into()
-.map_err(|_| Error::new(ErrorKind::InvalidData, "invalid wire-packet frame header"))?,
+.map_err(|| Error::new(ErrorKind::InvalidData, "invalid wire-packet frame header"))?,
 ) as usize;
 offset = header_end;
 if !(WirePacket::MIN_SIZE..=WirePacket::MAX_SIZE).contains(&frame_len) {
@@ -1107,7 +1107,7 @@ return Ok((false, None));
 };
 match child.try_wait() {
 Ok(None) => Ok((true, child.id())),
-Ok(Some(_)) => {
+Ok(Some()) => {
 processes.remove(key);
 Ok((false, None))
 }
@@ -1121,7 +1121,7 @@ live_bitminer(&mut processes, &bitminer_key(name, activation, network))
 async fn bitminer_process_state_any(name: &str, activation: u64) -> ApiResult<(bool, Option<u32>)> {
 let prefix = format!("{name}:{activation}:");
 let mut processes = bit_miner_processes().lock().await;
-let mut keys: Vec<_> = processes.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+let mut keys: Vec<> = processes.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
 keys.sort();
 let mut first_pid = None;
 for key in keys {
@@ -1135,7 +1135,7 @@ Ok((first_pid.is_some(), first_pid))
 async fn bitminer_process_list(name: &str, activation: u64) -> ApiResult<Vec<BitMinerProcessEntry>> {
 let prefix = format!("{name}:{activation}:");
 let mut processes = bit_miner_processes().lock().await;
-let mut keys: Vec<_> = processes.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+let mut keys: Vec<> = processes.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
 keys.sort();
 let mut pipelines = Vec::new();
 for key in keys {
@@ -1261,7 +1261,7 @@ runtime: serialize_runtime(SystemTime::now()),
 message,
 })
 }
-/* ---------- Endpoint Handlers (Adapted for Hyper) ---------- */
+/ ---------- Endpoint Handlers (Adapted for Hyper) ---------- /
 fn handle_health() -> HttpResponse {
 bytes_response(StatusCode::OK, "text/plain; charset=utf-8", "ok")
 }
@@ -1406,7 +1406,7 @@ continue;
 let record = entry.file_name().to_string_lossy().to_string();
 let kind = if record.starts_with("exile") {
 "exile"
-} else if record.starts_with("event_") {
+} else if record.starts_with("event") {
 "transit"
 } else {
 continue;
@@ -1457,7 +1457,7 @@ runtime: serialize_runtime(SystemTime::now()),
 }
 fn handle_list_event_payloads(name: String, record: String) -> HttpResponse {
 let lock = substrate_lock(&name);
-let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 let substrate_path = match ensure_existing_substrate(&name) {
 Ok(p) => p,
 Err(e) => return e,
@@ -1637,7 +1637,7 @@ Ok(b) => b,
 Err(e) => return e,
 };
 let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 if let Err(e) = ensure_existing_substrate(&name) {
 return e;
 }
@@ -1662,7 +1662,7 @@ sigma: transaction.qtm.sigma.to_string(),
 network: transaction.qtm.net_work.to_string(),
 }),
 constant: match &transaction.constant {
-qp_hd::PersistedEvent::Transit(_) => "transit".to_string(),
+qp_hd::PersistedEvent::Transit() => "transit".to_string(),
 qp_hd::PersistedEvent::Exile(..) => "exile".to_string(),
 },
 };
@@ -1684,7 +1684,7 @@ event: event_map_response(payload),
 /// GET /wallets/:name/exile/depth
 fn handle_exile_depth(name: String) -> HttpResponse {
 let lock = substrate_lock(&name);
-let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 let substrate_path = match ensure_existing_substrate(&name) {
 Ok(p) => p,
 Err(e) => return e,
@@ -1784,7 +1784,7 @@ if let Err(e) = validate_wirepackets_scope(&name, &network) {
 return e;
 }
 let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 if let Err(e) = ensure_existing_substrate(&name) {
 return e;
 }
@@ -1836,7 +1836,7 @@ Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to rea
 let (packet_count, decoded) = (0usize, Vec::new());
 packets.push(WirePacketEntry {
 submission,
-name: format!("submission_{submission}"),
+name: format!("submission{submission}"),
 path: path.display().to_string(),
 bytes: metadata.len(),
 packet_count,
@@ -1865,7 +1865,7 @@ if let Err(e) = validate_wirepackets_scope(&name, &network) {
 return e;
 }
 let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 let substrate_path = match ensure_existing_substrate(&name) {
 Ok(p) => p,
 Err(e) => return e,
@@ -2040,7 +2040,7 @@ message: "no bit-miner process is registered for this network".into(),
 };
 let pid = child.id();
 match child.try_wait() {
-Ok(Some(_)) => {
+Ok(Some()) => {
 return json_response(
 StatusCode::OK,
 &BitMinerStopResponse {
@@ -2133,7 +2133,7 @@ Ok(board) => json_response(StatusCode::OK, &board),
 Err(e) => e,
 }
 }
-/* ---------- Hyper Route Dispatcher ---------- */
+/ ---------- Hyper Route Dispatcher ---------- */
 async fn dispatch(req: Request<Incoming>) -> HttpResponse {
 let method = req.method().clone();
 if method == Method::OPTIONS {
@@ -2212,14 +2212,14 @@ Err(e) => e,
 }
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "payload-board"]) => {
 match parse_u64_param(act, "activation") {
-Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (*net).to_string()).await,
+Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (net).to_string()).await,
 Err(e) => e,
 }
 }
 _ => error(StatusCode::NOT_FOUND, format!("route not found: {raw_path}")),
 }
 }
-/* ---------- Bit-Miner Child Worker ---------- */
+/ ---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
 use bit_miner::observestream::{MempoolSpaceStream, MempoolStreamMode};
@@ -2250,7 +2250,7 @@ continue;
 };
 loop {
 match observation_stream.stream(&substrate, &mut pipeline, &resolver).await {
-Ok(Ok(Some(_))) => eprintln!("bit-miner: transaction processed substrate={substrate} activation={activation}"),
+Ok(Ok(Some())) => eprintln!("bit-miner: transaction processed substrate={substrate} activation={activation}"),
 Ok(Ok(None)) => {}
 Ok(Err(e)) => eprintln!("bit-miner: pipeline error: {e}"),
 Err(e) => {
@@ -2303,7 +2303,7 @@ let root = commands::substrate_root();
 println!("substrate_root={}", root.display());
 if root.is_dir() {
 if let Ok(entries) = std::fs::read_dir(&root) {
-let mut discovered: Vec<_> = entries
+let mut discovered: Vec<> = entries
 .filter_map(Result::ok)
 .filter(|e| e.path().is_dir())
 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -2343,7 +2343,7 @@ continue;
 let io = TokioIo::new(stream);
 tokio::spawn(async move {
 let service = service_fn(|req: Request<Incoming>| async move {
-Ok::<, Infallible>(dispatch(req).await)
+Ok::<_, Infallible>(dispatch(req).await)
 });
 if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
 eprintln!("HTTP/1 connection error: {e}");
