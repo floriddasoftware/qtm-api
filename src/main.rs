@@ -448,13 +448,22 @@ HeaderValue::from_static("GET, HEAD, POST, PUT, DELETE, OPTIONS"),
 );
 h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static(""));
 }
-fn bytes_response(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> HttpResponse {
-let mut res = Response::new(Full::new(body.into()));
-*res.status_mut() = status;
-res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-attach_cors(&mut res);
-res
+
+fn bytes_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Bytes>,
+) -> HttpResponse {
+    let mut res = Response::new(Full::new(body.into()));
+    *res.status_mut() = status;
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    attach_cors(&mut res);
+    res
 }
+
 fn empty_response(status: StatusCode) -> HttpResponse {
 let mut res = Response::new(Full::new(Bytes::new()));
 res.status_mut() = status;
@@ -868,38 +877,70 @@ fn valid_record_name(record: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         && parse_record_identity(record).is_some()
 }
+
 fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
-let path_file = payload_path.join("depth.path");
-let objects_file = payload_path.join("depth.objects");
-let path = std::fs::read_to_string(&path_file)
-.map_err(|e| error(StatusCode::NOT_FOUND, format!("persisted depth path unavailable at {}: {e}", path_file.display())))?;
-let contents = std::fs::read_to_string(&objects_file)
-.map_err(|e| error(StatusCode::NOT_FOUND, format!("persisted depth objects unavailable at {}: {e}", objects_file.display())))?;
-let mut objects = Vec::new();
-for (idx, line) in contents.lines().enumerate() {
-if line.trim().is_empty() {
-continue;
+    let path_file = payload_path.join("depth.path");
+    let objects_file = payload_path.join("depth.objects");
+
+    let path = std::fs::read_to_string(&path_file)
+        .map_err(|e| error(
+            StatusCode::NOT_FOUND,
+            format!("persisted depth path unavailable at {}: {e}", path_file.display()),
+        ))?;
+
+    let contents = std::fs::read_to_string(&objects_file)
+        .map_err(|e| error(
+            StatusCode::NOT_FOUND,
+            format!("persisted depth objects unavailable at {}: {e}", objects_file.display()),
+        ))?;
+
+    let mut objects = Vec::new();
+
+    for (idx, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.splitn(4, '\t').collect();
+        if fields.len() != 4 {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid depth object at {}:{}", objects_file.display(), idx + 1),
+            ));
+        }
+
+        let position = fields[0].parse::<usize>()
+            .map_err(|_| error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid depth position at line {}", idx + 1),
+            ))?;
+
+        let identifier_bytes = hex::decode(fields[1])
+            .map_err(|_| error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid depth identifier at line {}", idx + 1),
+            ))?;
+
+        let identifier = String::from_utf8(identifier_bytes)
+            .map_err(|_| error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("depth identifier not UTF-8 at line {}", idx + 1),
+            ))?;
+
+        objects.push(DepthObjectResponse {
+            position,
+            identifier,
+            mass: fields[2].to_string(),
+            from: fields[3].to_string(),
+        });
+    }
+
+    Ok(DepthResponse {
+        path: path.trim().to_string(),
+        objects,
+    })
 }
-let fields: Vec<&str> = line.splitn(4, '\t').collect();
-if fields.len() != 4 {
-return Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid depth object at {}:{}", objects_file.display(), idx + 1)));
-}
-let position = fields[0]
-.parse::<usize>()
-.map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid depth position at line {}", idx + 1)))?;
-let identifier_bytes = hex::decode(fields[1])
-.map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid depth identifier at line {}", idx + 1)))?;
-let identifier = String::from_utf8(identifier_bytes)
-.map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("depth identifier not UTF-8 at line {}", idx + 1)))?;
-objects.push(DepthObjectResponse {
-position,
-identifier,
-mass: fields[2].to_string(),
-from: fields[3].to_string(),
-});
-}
-Ok(DepthResponse { path: path.trim().to_string(), objects })
-}
+
 fn event_map_response(payload: EventPayload) -> EventMapResponse {
 let event = payload.direction.into_event();
 EventMapResponse {
@@ -927,36 +968,60 @@ return Err("min_events must be less than or equal to max_events".to_string());
 }
 Ok(())
 }
+
 fn parse_budget(contents: &str, path: &FsPath) -> ApiResult<EventBudget> {
-let mut min_events = None;
-let mut max_events = None;
-for line in contents.lines() {
-let Some((key, value)) = line.split_once('=') else { continue };
-match key.trim() {
-"min_events" => {
-min_events = Some(
-value.trim().parse::<u64>()
-.map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid min_events in {}", path.display())))?,
-);
+    let mut min_events = None;
+    let mut max_events = None;
+
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        match key.trim() {
+            "min_events" => {
+                min_events = Some(
+                    value.trim().parse::<u64>()
+                        .map_err(|_| error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("invalid min_events in {}", path.display()),
+                        ))?,
+                );
+            }
+            "max_events" => {
+                max_events = Some(
+                    value.trim().parse::<u64>()
+                        .map_err(|_| error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("invalid max_events in {}", path.display()),
+                        ))?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let budget = EventBudget {
+        min_events: min_events.ok_or_else(|| error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("missing min_events in {}", path.display()),
+        ))?,
+        max_events: max_events.ok_or_else(|| error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("missing max_events in {}", path.display()),
+        ))?,
+    };
+
+    if budget.max_events == 0 || budget.min_events > budget.max_events {
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid budget values in {}", path.display()),
+        ));
+    }
+
+    Ok(budget)
 }
-"max_events" => {
-max_events = Some(
-value.trim().parse::<u64>()
-.map_err(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid max_events in {}", path.display())))?,
-);
-}
-_ => {}
-}
-}
-let budget = EventBudget {
-min_events: min_events.ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("missing min_events in {}", path.display())))?,
-max_events: max_events.ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, format!("missing max_events in {}", path.display())))?,
-};
-if budget.max_events == 0 || budget.min_events > budget.max_events {
-return Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid budget values in {}", path.display())));
-}
-Ok(budget)
-}
+
 fn load_network_budget(substrate_path: &FsPath, activation: u64, network: &str) -> ApiResult<Option<EventBudget>> {
 let path = budget_directory(substrate_path, activation, network).join("budget");
 if !path.exists() {
@@ -1202,52 +1267,104 @@ String::from_utf8_lossy(&tail.as_bytes()[tail.len() - 2000..]).into_owned()
 tail
 })
 }
-fn live_bitminer(processes: &mut HashMap<BitMinerKey, Child>, key: &str) -> ApiResult<(bool, Option<u32>)> {
-let Some(child) = processes.get_mut(key) else {
-return Ok((false, None));
-};
-match child.try_wait() {
-Ok(None) => Ok((true, child.id())),
-Ok(Some()) => {
-processes.remove(key);
-Ok((false, None))
+
+fn live_bitminer(
+    processes: &mut HashMap<BitMinerKey, Child>,
+    key: &str,
+) -> ApiResult<(bool, Option<u32>)> {
+    let Some(child) = processes.get_mut(key) else {
+        return Ok((false, None));
+    };
+
+    match child.try_wait() {
+        Ok(None) => Ok((true, child.id())),
+        Ok(Some(_)) => {
+            processes.remove(key);
+            Ok((false, None))
+        }
+        Err(e) => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to inspect bit-miner process: {e}"),
+        )),
+    }
 }
-Err(e) => Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect bit-miner process: {e}"))),
+
+
+async fn bitminer_process_state(
+    name: &str,
+    activation: u64,
+    network: &str,
+) -> ApiResult<(bool, Option<u32>)> {
+    let mut processes = bit_miner_processes().lock().await;
+    live_bitminer(
+        &mut processes,
+        &bitminer_key(name, activation, network),
+    )
 }
+
+async fn bitminer_process_state_any(
+    name: &str,
+    activation: u64,
+) -> ApiResult<(bool, Option<u32>)> {
+    let prefix = format!("{name}:{activation}:");
+    let mut processes = bit_miner_processes().lock().await;
+
+    let mut keys: Vec<String> = processes.keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+
+    keys.sort();
+
+    let mut first_pid = None;
+
+    for key in keys {
+        let (running, pid) = live_bitminer(&mut processes, &key)?;
+        if running {
+            first_pid = first_pid.or(pid);
+        }
+    }
+
+    Ok((first_pid.is_some(), first_pid))
 }
-async fn bitminer_process_state(name: &str, activation: u64, network: &str) -> ApiResult<(bool, Option<u32>)> {
-let mut processes = bit_miner_processes().lock().await;
-live_bitminer(&mut processes, &bitminer_key(name, activation, network))
+
+async fn bitminer_process_list(
+    name: &str,
+    activation: u64,
+) -> ApiResult<Vec<BitMinerProcessEntry>> {
+    let prefix = format!("{name}:{activation}:");
+    let mut processes = bit_miner_processes().lock().await;
+
+    let mut keys: Vec<String> = processes.keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+
+    keys.sort();
+
+    let mut pipelines = Vec::new();
+
+    for key in keys {
+        let network = key.strip_prefix(&prefix)
+            .unwrap_or_default()
+            .to_string();
+
+        let (running, pid) = live_bitminer(&mut processes, &key)?;
+
+        if running {
+            pipelines.push(BitMinerProcessEntry {
+                substrate: name.to_owned(),
+                activation,
+                network,
+                running,
+                pid,
+            });
+        }
+    }
+
+    Ok(pipelines)
 }
-async fn bitminer_process_state_any(name: &str, activation: u64) -> ApiResult<(bool, Option<u32>)> {
-let prefix = format!("{name}:{activation}:");
-let mut processes = bit_miner_processes().lock().await;
-let mut keys: Vec<> = processes.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
-keys.sort();
-let mut first_pid = None;
-for key in keys {
-let (running, pid) = live_bitminer(&mut processes, &key)?;
-if running {
-first_pid = first_pid.or(pid);
-}
-}
-Ok((first_pid.is_some(), first_pid))
-}
-async fn bitminer_process_list(name: &str, activation: u64) -> ApiResult<Vec<BitMinerProcessEntry>> {
-let prefix = format!("{name}:{activation}:");
-let mut processes = bit_miner_processes().lock().await;
-let mut keys: Vec<> = processes.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
-keys.sort();
-let mut pipelines = Vec::new();
-for key in keys {
-let network = key.strip_prefix(&prefix).unwrap_or_default().to_string();
-let (running, pid) = live_bitminer(&mut processes, &key)?;
-if running {
-pipelines.push(BitMinerProcessEntry { substrate: name.to_owned(), activation, network, running, pid });
-}
-}
-Ok(pipelines)
-}
+
 fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
 if !valid_substrate_name(name) {
 return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
@@ -1384,79 +1501,155 @@ Ok(_) => empty_response(StatusCode::OK),
 Err(err) => err,
 }
 }
+
 async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
-let body: CreateRequest = match parse_json_body(req).await {
-Ok(b) => b,
-Err(e) => return e,
-};
-let name = body.name.trim();
-if !valid_substrate_name(name) {
-return error(StatusCode::BAD_REQUEST, "name must contain 1-64 ASCII letters, digits, hyphens, or underscores");
+    let body: CreateRequest = match parse_json_body(req).await {
+        Ok(body) => body,
+        Err(e) => return e,
+    };
+
+    let name = body.name.trim();
+
+    if !valid_substrate_name(name) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "name must contain 1-64 ASCII letters, digits, hyphens, or underscores",
+        );
+    }
+
+    let (indices, entropy) = match body
+        .seed_source
+        .as_deref()
+        .unwrap_or("persistent")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "persistent" | "custom" => {
+            let Some(raw_indices) = body.indices.as_deref() else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "indices are required for persistent creation",
+                );
+            };
+
+            let parsed = match parse_indices(raw_indices) {
+                Ok(indices) => indices,
+                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            };
+
+            let Some(entropy) = body.entropy.as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "non-empty entropy is required",
+                );
+            };
+
+            (
+                parsed.iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                entropy.to_string(),
+            )
+        }
+        "bip39" => {
+            let Some(phrase) = body.phrase.as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "a BIP39 phrase is required",
+                );
+            };
+
+            let Some(lang_name) = body.language.as_deref() else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "select a BIP39 language in the UI",
+                );
+            };
+
+            let language = match parse_bip39_language(lang_name) {
+                Ok(language) => language,
+                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            };
+
+            let indices = match BIP39Handler::mnemonic_indices(phrase, language) {
+                Ok(indices) => indices,
+                Err(e) => return error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid BIP39 mnemonic: {e}"),
+                ),
+            };
+
+            let entropy = match BIP39Handler::mnemonic_entropy(
+                phrase,
+                language,
+                body.passphrase.as_deref(),
+            ) {
+                Ok(entropy) => entropy,
+                Err(e) => return error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unable to derive BIP39 entropy: {e}"),
+                ),
+            };
+
+            (
+                indices.iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                hex::encode(entropy),
+            )
+        }
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "seed_source must be persistent, custom, or bip39",
+            );
+        }
+    };
+
+    let lock = substrate_lock(name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let root = commands::substrate_root();
+
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to access substrate root: {e}"),
+        );
+    }
+
+    if root.join(name).exists() {
+        return error(
+            StatusCode::CONFLICT,
+            format!("substrate already exists: {name}"),
+        );
+    }
+
+    if let Err(e) = guarded("substrate creation", || {
+        commands::qtm_create(name.to_string(), Some(indices), Some(entropy))
+    }) {
+        return e;
+    }
+
+    if let Err(e) = ensure_existing_substrate(name) {
+        return e;
+    }
+
+    match substrate_json(name) {
+        Ok(response) => json_response(StatusCode::CREATED, &response),
+        Err(e) => e,
+    }
 }
-let (indices, entropy) = match body
-.seed_source
-.as_deref()
-.unwrap_or("persistent")
-.trim()
-.to_ascii_lowercase()
-.as_str()
-{
-"persistent" | "custom" => {
-let Some(raw_indices) = body.indices.as_deref() else {
-return error(StatusCode::BAD_REQUEST, "indices are required for persistent creation");
-};
-let parsed = match parse_indices(raw_indices) {
-Ok(p) => p,
-Err(m) => return error(StatusCode::BAD_REQUEST, m),
-};
-let Some(ent) = body.entropy.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
-return error(StatusCode::BAD_REQUEST, "non-empty entropy is required");
-};
-(parsed.iter().map(u16::to_string).collect::<Vec<>>().join(","), ent.to_string())
-}
-"bip39" => {
-let Some(phrase) = body.phrase.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
-return error(StatusCode::BAD_REQUEST, "a BIP39 phrase is required");
-};
-let Some(lang_name) = body.language.as_deref() else {
-return error(StatusCode::BAD_REQUEST, "select a BIP39 language in the UI");
-};
-let language = match parse_bip39_language(lang_name) {
-Ok(l) => l,
-Err(m) => return error(StatusCode::BAD_REQUEST, m),
-};
-let indices = match BIP39Handler::mnemonic_indices(phrase, language) {
-Ok(i) => i,
-Err(e) => return error(StatusCode::BAD_REQUEST, format!("invalid BIP39 mnemonic: {e}")),
-};
-let entropy = match BIP39Handler::mnemonic_entropy(phrase, language, body.passphrase.as_deref()) {
-Ok(ent) => ent,
-Err(e) => return error(StatusCode::BAD_REQUEST, format!("unable to derive BIP39 entropy: {e}")),
-};
-(indices.iter().map(u16::to_string).collect::<Vec<>>().join(","), hex::encode(entropy))
-}
-_ => return error(StatusCode::BAD_REQUEST, "seed_source must be persistent, custom, or bip39"),
-};
-let lock = substrate_lock(name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-let root = commands::substrate_root();
-if let Err(e) = std::fs::create_dir_all(&root) {
-return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to access substrate root: {e}"));
-}
-if root.join(name).exists() {
-return error(StatusCode::CONFLICT, format!("substrate already exists: {name}"));
-}
-if let Err(e) = guarded("substrate creation", || commands::qtm_create(name.to_string(), Some(indices), Some(entropy))) {
-return e;
-}
-if let Err(e) = ensure_existing_substrate(name) {
-return e;
-}
-match substrate_json(name) {
-Ok(res) => json_response(StatusCode::CREATED, &res),
-Err(e) => e,
-}
-}
+
 fn handle_open_wallet(name: String) -> HttpResponse {
 let lock = substrate_lock(&name);
 let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -2428,48 +2621,78 @@ _ => error(StatusCode::NOT_FOUND, format!("route not found: {raw_path}")),
 }
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
+
+#[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
-use bit_miner::observestream::{MempoolSpaceStream, MempoolStreamMode};
-let activation = args.first().expect("missing activation").parse::<u64>().expect("invalid activation");
-let substrate = args.get(1).expect("missing substrate").clone();
-let network = args.get(2).expect("missing network").clone();
-if !valid_observation_network_id(&network) || !is_bitcoin_network_id(&network) {
-eprintln!("bit-miner: invalid Bitcoin network ID: {network}");
-std::process::exit(2);
+    use bit_miner::observestream::{
+        MempoolSpaceStream,
+        MempoolStreamMode,
+    };
+
+    let activation = args.first()
+        .expect("missing activation")
+        .parse::<u64>()
+        .expect("invalid activation");
+
+    let substrate = args.get(1).expect("missing substrate").clone();
+    let network = args.get(2).expect("missing network").clone();
+
+    if !valid_observation_network_id(&network) || !is_bitcoin_network_id(&network) {
+        eprintln!("bit-miner: invalid Bitcoin network ID: {network}");
+        std::process::exit(2);
+    }
+
+    let mut pipeline =
+        bit_miner::BitcoinObservationPipeline::new(activation, &substrate, &network)
+            .unwrap_or_else(|e| {
+                eprintln!("bit-miner: pipeline initialization failed: {e}");
+                std::process::exit(1);
+            });
+
+    let resolver = WirePacketPrevoutResolver::new(&substrate, activation);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("bit-miner runtime initialization failed");
+
+    runtime.block_on(async move {
+        loop {
+            let mut observation_stream = match MempoolSpaceStream::connect(
+                activation,
+                MempoolStreamMode::TransactionIds,
+            ).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    eprintln!("bit-miner: stream connection failed: {e}");
+                    continue;
+                }
+            };
+
+            loop {
+                match observation_stream
+                    .stream(&substrate, &mut pipeline, &resolver)
+                    .await
+                {
+                    Ok(Ok(Some(_))) => {
+                        eprintln!(
+                            "bit-miner: transaction processed substrate={substrate} activation={activation}"
+                        );
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => eprintln!("bit-miner: pipeline error: {e}"),
+                    Err(e) => {
+                        eprintln!("bit-miner: stream disconnected: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    unreachable!("bit-miner stream loop is intentionally persistent");
 }
-let mut pipeline = bit_miner::BitcoinObservationPipeline::new(activation, &substrate, &network).unwrap_or_else(|e| {
-eprintln!("bit-miner: pipeline initialization failed: {e}");
-std::process::exit(1);
-});
-let resolver = WirePacketPrevoutResolver::new(&substrate, activation);
-let runtime = tokio::runtime::Builder::new_multi_thread()
-.enable_all()
-.build()
-.expect("bit-miner runtime initialization failed");
-runtime.block_on(async move {
-loop {
-let mut observation_stream = match MempoolSpaceStream::connect(activation, MempoolStreamMode::TransactionIds).await {
-Ok(s) => s,
-Err(e) => {
-eprintln!("bit-miner: stream connection failed: {e}");
-continue;
-}
-};
-loop {
-match observation_stream.stream(&substrate, &mut pipeline, &resolver).await {
-Ok(Ok(Some())) => eprintln!("bit-miner: transaction processed substrate={substrate} activation={activation}"),
-Ok(Ok(None)) => {}
-Ok(Err(e)) => eprintln!("bit-miner: pipeline error: {e}"),
-Err(e) => {
-eprintln!("bit-miner: stream disconnected: {e}");
-break;
-}
-}
-}
-}
-});
-unreachable!("bit-miner stream loop is intentionally persistent");
-}
+
 fn resolve_home() {
 #[cfg(windows)]
 {
@@ -2505,56 +2728,82 @@ tokio::runtime::Builder::new_multi_thread()
 .expect("failed to build tokio runtime")
 .block_on(serve());
 }
+
 async fn serve() {
-let root = commands::substrate_root();
-println!("substrate_root={}", root.display());
-if root.is_dir() {
-if let Ok(entries) = std::fs::read_dir(&root) {
-let mut discovered: Vec<> = entries
-.filter_map(Result::ok)
-.filter(|e| e.path().is_dir())
-.map(|e| e.file_name().to_string_lossy().into_owned())
-.filter(|n| valid_substrate_name(n))
-.collect();
-discovered.sort();
-println!("substrates_discovered={}", discovered.len());
-for substrate in discovered {
-let commitment = read_trim(&root.join(&substrate).join("qtm.commitment"))
-.filter(|c| !c.is_empty())
-.unwrap_or_else(|| "unavailable".to_string());
-println!("substrate={substrate} commitment={commitment}");
-}
-}
-} else {
-println!("substrates_discovered=0 (root does not exist; startup did not create it)");
-}
-let port = std::env::var("PORT")
-.ok()
-.and_then(|v| v.parse::<u16>().ok())
-.filter(|p| *p != 0)
-.unwrap_or(8080);
-let address = format!("0.0.0.0:{port}");
-let listener = TcpListener::bind(&address)
-.await
-.unwrap_or_else(|e| panic!("failed to bind qtm-api HTTP listener at {address}: {e}"));
-let bound_address = listener.local_addr().expect("failed to obtain listener address");
-println!("qtm-api Hyper HTTP/1 listener bound at {bound_address}");
-loop {
-let (stream, ) = match listener.accept().await {
-Ok(conn) => conn,
-Err(e) => {
-eprintln!("accept error: {e}");
-continue;
-}
-};
-let io = TokioIo::new(stream);
-tokio::spawn(async move {
-let service = service_fn(|req: Request<Incoming>| async move {
-Ok::<_, Infallible>(dispatch(req).await)
-});
-if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-eprintln!("HTTP/1 connection error: {e}");
-}
-});
-}
+    let root = commands::substrate_root();
+    println!("substrate_root={}", root.display());
+
+    if root.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            let mut discovered: Vec<String> = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| valid_substrate_name(name))
+                .collect();
+
+            discovered.sort();
+
+            println!("substrates_discovered={}", discovered.len());
+
+            for substrate in discovered {
+                let commitment = read_trim(
+                    &root.join(&substrate).join("qtm.commitment"),
+                )
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unavailable".to_string());
+
+                println!("substrate={substrate} commitment={commitment}");
+            }
+        }
+    } else {
+        println!(
+            "substrates_discovered=0 (root does not exist; startup did not create it)"
+        );
+    }
+
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(8080);
+
+    let address = format!("0.0.0.0:{port}");
+
+    let listener = TcpListener::bind(&address)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("failed to bind qtm-api HTTP listener at {address}: {e}")
+        });
+
+    let bound_address = listener
+        .local_addr()
+        .expect("failed to obtain listener address");
+
+    println!("qtm-api Hyper HTTP/1 listener bound at {bound_address}");
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
+        };
+
+        let io = TokioIo::new(stream);
+
+        tokio::spawn(async move {
+            let service = service_fn(|req: Request<Incoming>| async move {
+                Ok::<_, Infallible>(dispatch(req).await)
+            });
+
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, service)
+                .await
+            {
+                eprintln!("HTTP/1 connection error: {e}");
+            }
+        });
+    }
 }
