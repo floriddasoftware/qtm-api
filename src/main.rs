@@ -1256,6 +1256,111 @@ fn route_electrum_method(
     }
 }
 
+async fn handle_electrum_connection<S>(stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("electrum read error: {e}");
+                break;
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(request) => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let params = request
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+
+                let result = tokio::task::spawn_blocking(move || {
+                    route_electrum_method(&method, &params)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(value)) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": value,
+                    }),
+                    Ok(Err(error)) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": error,
+                    }),
+                    Err(e) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32603,
+                            "message": format!("Electrum request failed: {e}"),
+                        },
+                    }),
+                }
+            }
+            Err(e) => json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32700,
+                    "message": format!("parse error: {e}"),
+                },
+            }),
+        };
+
+        let mut output = match serde_json::to_vec(&response) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("electrum serialization error: {e}");
+                continue;
+            }
+        };
+
+        output.push(b'\n');
+
+        if let Err(e) = writer.write_all(&output).await {
+            eprintln!("electrum write error: {e}");
+            break;
+        }
+    }
+}
+
+
+async fn serve_electrum(listener: TcpListener) -> std::io::Result<()> {
+    println!(
+        "qtm-api Electrum TCP listener bound at {}",
+        listener.local_addr()?
+    );
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+
+        tokio::spawn(async move {
+            handle_electrum_connection(stream).await;
+            eprintln!("electrum session closed peer={peer}");
+        });
+    }
+}
 
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
     read_trim(&substrate_path.join("activation"))
@@ -2984,7 +3089,6 @@ async fn serve() {
                 .collect();
 
             discovered.sort();
-
             println!("substrates_discovered={}", discovered.len());
 
             for substrate in discovered {
@@ -2998,9 +3102,7 @@ async fn serve() {
             }
         }
     } else {
-        println!(
-            "substrates_discovered=0 (root does not exist; startup did not create it)"
-        );
+        println!("substrates_discovered=0 (root does not exist; startup did not create it)");
     }
 
     let port = std::env::var("PORT")
@@ -3009,32 +3111,50 @@ async fn serve() {
         .filter(|port| *port != 0)
         .unwrap_or(8080);
 
-    let address = format!("0.0.0.0:{port}");
+    let electrum = electrum_port();
 
-    let listener = TcpListener::bind(&address)
+    if port == electrum {
+        panic!("HTTP and Electrum cannot share port {port}");
+    }
+
+    let http_address = format!("0.0.0.0:{port}");
+    let electrum_address = format!("0.0.0.0:{electrum}");
+
+    let listener = TcpListener::bind(&http_address)
         .await
         .unwrap_or_else(|e| {
-            panic!("failed to bind qtm-api HTTP listener at {address}: {e}")
+            panic!("failed to bind qtm-api HTTP listener at {http_address}: {e}")
         });
 
-    let bound_address = listener
-        .local_addr()
-        .expect("failed to obtain listener address");
+    let electrum_listener = TcpListener::bind(&electrum_address)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("failed to bind qtm-api Electrum listener at {electrum_address}: {e}")
+        });
 
-    println!("qtm-api Hyper HTTP/1 listener bound at {bound_address}");
+    println!(
+        "qtm-api Hyper HTTP/1 listener bound at {}",
+        listener.local_addr().expect("HTTP listener address unavailable")
+    );
+
+    tokio::spawn(async move {
+        if let Err(e) = serve_electrum(electrum_listener).await {
+            eprintln!("Electrum listener stopped: {e}");
+        }
+    });
 
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(connection) => connection,
             Err(e) => {
-                eprintln!("accept error: {e}");
+                eprintln!("HTTP accept error: {e}");
                 continue;
             }
         };
 
-        let io = TokioIo::new(stream);
-
         tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+
             let service = service_fn(|req: Request<Incoming>| async move {
                 Ok::<_, Infallible>(dispatch(req).await)
             });
