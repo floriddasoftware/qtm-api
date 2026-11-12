@@ -1049,163 +1049,186 @@ std::fs::rename(&temporary_path, &path)
 .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to persist {}: {e}", path.display())))?;
 Ok(EventBudget { min_events: body.min_events, max_events: body.max_events })
 }
-// ---------- WirePackets & Bit-Miner Integration ---------- /
+// ---------- WirePackets & Bit-Miner Integration ----------
+
 fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
-if !valid_substrate_name(name) {
-return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    if !valid_substrate_name(name) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    }
+    if !valid_observation_network_id(network) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid network identifier"));
+    }
+    if !is_bitcoin_network_id(network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "wire packets are persisted for Bitcoin settlement only",
+        ));
+    }
+    Ok(())
 }
-if !valid_observation_network_id(network) {
-return Err(error(StatusCode::BAD_REQUEST, "invalid network identifier"));
-}
-if !is_bitcoin_network_id(network) {
-return Err(error(StatusCode::BAD_REQUEST, "wire packets are persisted for Bitcoin settlement only"));
-}
-Ok(())
-}
-#[cfg(feature = "bit-miner")]
-fn decode_wirepackets_file(bytes: &[u8]) -> Result<Vec<WirePacket>, std::io::Error> {
-use std::io::{Error, ErrorKind};
-if bytes.is_empty() {
-return Err(Error::new(ErrorKind::InvalidData, "persisted wire-packet file is empty"));
-}
-let mut offset = 0usize;
-let mut packets = Vec::new();
-while offset < bytes.len() {
-let header_end = offset
-.checked_add(4)
-.ok_or_else(|| Error::new(ErrorKind::InvalidData, "wire-packet frame offset overflow"))?;
-if header_end > bytes.len() {
-return Err(Error::new(ErrorKind::InvalidData, "truncated wire-packet frame header"));
-}
-let frame_len = u32::from_be_bytes(
-bytes[offset..header_end]
-.try_into()
-.map_err(|| Error::new(ErrorKind::InvalidData, "invalid wire-packet frame header"))?,
-) as usize;
-offset = header_end;
-if !(WirePacket::MIN_SIZE..=WirePacket::MAX_SIZE).contains(&frame_len) {
-return Err(Error::new(ErrorKind::InvalidData, format!("invalid wire-packet frame length={frame_len}")));
-}
-let frame_end = offset
-.checked_add(frame_len)
-.ok_or_else(|| Error::new(ErrorKind::InvalidData, "wire-packet frame length overflow"))?;
-if frame_end > bytes.len() {
-return Err(Error::new(ErrorKind::InvalidData, "truncated wire-packet frame payload"));
-}
-packets.push(WirePacket::deserialize(&bytes[offset..frame_end])?);
-offset = frame_end;
-}
-if packets.is_empty() {
-return Err(Error::new(ErrorKind::InvalidData, "persisted wire-packet file contains no packets"));
-}
-Ok(packets)
-}
+
 #[cfg(feature = "bit-miner")]
 fn wire_packet_value_entries(packets: &[WirePacket]) -> Vec<WirePacketValueEntry> {
-packets
-.iter()
-.map(|p| WirePacketValueEntry {
-txid: p.txid().to_string(),
-vout: p.vout(),
-value_sat: p.value,
-script_pubkey: hex::encode(p.script_pubkey.as_bytes()),
-commitment: hex::encode(p.commitment),
-})
-.collect()
+    packets
+        .iter()
+        .map(|p| WirePacketValueEntry {
+            txid: p.txid().to_string(),
+            vout: p.vout(),
+            value_sat: p.value,
+            script_pubkey: hex::encode(p.script_pubkey.as_bytes()),
+            commitment: hex::encode(p.commitment),
+        })
+        .collect()
 }
+
 #[cfg(feature = "bit-miner")]
 struct WirePacketPrevoutResolver {
-substrate: String,
-activation: u64,
+    substrate: String,
+    activation: u64,
 }
+
 #[cfg(feature = "bit-miner")]
 impl WirePacketPrevoutResolver {
-fn new(substrate: &str, activation: u64) -> Self {
-Self { substrate: substrate.to_owned(), activation }
+    fn new(substrate: &str, activation: u64) -> Self {
+        Self {
+            substrate: substrate.to_owned(),
+            activation,
+        }
+    }
+
+    fn resolve_packet(
+        &self,
+        requested: &OutPoint,
+        submission: u64,
+        commitment: [u8; 32],
+    ) -> Result<WirePacket, std::io::Error> {
+        use std::io::{Error, ErrorKind};
+
+        let path = commands::wirepackets_path(
+            &self.substrate,
+            self.activation,
+            submission,
+        );
+
+        let bytes = std::fs::read(&path).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!(
+                    "unable to load parent wirepackets: substrate={} activation={} submission={} outpoint={}:{}: {e}",
+                    self.substrate,
+                    self.activation,
+                    submission,
+                    requested.txid,
+                    requested.vout,
+                ),
+            )
+        })?;
+
+        let packets = decode_wirepackets(&bytes).map_err(|e| {
+            Error::new(ErrorKind::InvalidData, e.to_string())
+        })?;
+
+        for packet in packets {
+            if packet.outpoint != *requested {
+                continue;
+            }
+
+            if packet.commitment != commitment {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "parent commitment mismatch: substrate={} activation={} submission={} outpoint={}:{}",
+                        self.substrate,
+                        self.activation,
+                        submission,
+                        requested.txid,
+                        requested.vout,
+                    ),
+                ));
+            }
+
+            return Ok(packet);
+        }
+
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "previous output not found: substrate={} activation={} submission={} outpoint={}:{}",
+                self.substrate,
+                self.activation,
+                submission,
+                requested.txid,
+                requested.vout,
+            ),
+        ))
+    }
 }
-fn resolve_packet(&self, requested: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<WirePacket, std::io::Error> {
-use std::io::{Error, ErrorKind};
-let path = commands::wirepackets_path(&self.substrate, self.activation, submission);
-let bytes = std::fs::read(&path).map_err(|e| {
-Error::new(
-e.kind(),
-format!(
-"unable to load parent wirepackets: substrate={} activation={} submission={} outpoint={}:{}: {e}",
-self.substrate, self.activation, submission, requested.txid, requested.vout
-),
-)
-})?;
-for packet in decode_wirepackets_file(&bytes)? {
-if packet.outpoint != *requested {
-continue;
-}
-if packet.commitment != commitment {
-return Err(Error::new(
-ErrorKind::InvalidData,
-format!(
-"parent commitment mismatch: substrate={} activation={} submission={} outpoint={}:{}",
-self.substrate, self.activation, submission, requested.txid, requested.vout
-),
-));
-}
-return Ok(packet);
-}
-Err(Error::new(
-ErrorKind::NotFound,
-format!(
-"previous output not found: substrate={} activation={} submission={} outpoint={}:{}",
-self.substrate, self.activation, submission, requested.txid, requested.vout
-),
-))
-}
-}
+
 #[cfg(feature = "bit-miner")]
 impl PrevoutResolver for WirePacketPrevoutResolver {
-fn resolve(
-&self,
-outpoint: &OutPoint,
-submission: u64,
-commitment: [u8; 32],
-) -> Result<ResolvedPrevout, Box<dyn std::error::Error + Send + Sync>> {
-let packet = self.resolve_packet(outpoint, submission, commitment)?;
-Ok(ResolvedPrevout {
-outpoint: packet.outpoint,
-output: TxOut { value: Amount::from_sat(packet.value), script_pubkey: packet.script_pubkey },
-submission,
-commitment: packet.commitment,
-})
+    fn resolve(
+        &self,
+        outpoint: &OutPoint,
+        submission: u64,
+        commitment: [u8; 32],
+    ) -> Result<ResolvedPrevout, Box<dyn std::error::Error + Send + Sync>> {
+        let packet = self.resolve_packet(outpoint, submission, commitment)?;
+
+        Ok(ResolvedPrevout {
+            outpoint: packet.outpoint,
+            output: TxOut {
+                value: Amount::from_sat(packet.value),
+                script_pubkey: packet.script_pubkey,
+            },
+            submission,
+            commitment: packet.commitment,
+        })
+    }
 }
-}
+
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
-read_trim(&substrate_path.join("activation")).and_then(|v| v.trim().parse::<u64>().ok())
+    read_trim(&substrate_path.join("activation"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
 }
+
 fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
-let mut names: Vec<String> = std::fs::read_dir(commands::substrate_root())
-.into_iter()
-.flatten()
-.flatten()
-.filter(|e| e.path().is_dir() && substrate_active_activation(&e.path()) == Some(activation))
-.filter_map(|e| e.file_name().into_string().ok())
-.collect();
-names.sort();
-names
-.into_iter()
-.map(|substrate| ObservationClipStatus { substrate, active: true, direction: None })
-.collect()
+    let mut names: Vec<String> = std::fs::read_dir(commands::substrate_root())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.path().is_dir()
+                && substrate_active_activation(&e.path()) == Some(activation)
+        })
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    names.sort();
+
+    names
+        .into_iter()
+        .map(|substrate| ObservationClipStatus {
+            substrate,
+            active: true,
+            direction: None,
+        })
+        .collect()
 }
+
 fn payload_kind_id_for_network(network_id: &str) -> Option<&'static str> {
-let lower = network_id.trim().to_ascii_lowercase();
-if lower.contains("bitcoin") || lower == "btc" {
-Some("bitcoin")
-} else if lower.contains("ethereum") || lower == "eth" {
-Some("ethereum")
-} else if lower.contains("solana") || lower == "sol" {
-Some("solana")
-} else if lower.contains("tron") || lower == "trx" {
-Some("tron")
-} else {
-None
-}
+    let lower = network_id.trim().to_ascii_lowercase();
+
+    if lower.contains("bitcoin") || lower == "btc" {
+        Some("bitcoin")
+    } else if lower.contains("ethereum") || lower == "eth" {
+        Some("ethereum")
+    } else if lower.contains("solana") || lower == "sol" {
+        Some("solana")
+    } else if lower.contains("tron") || lower == "trx" {
+        Some("tron")
+    } else {
+        None
+    }
 }
 fn load_payload_event(name: &str, activation: u64) -> ApiResult<Option<(String, EventPayload)>> {
 let Some(record_path) = commands::event_path_at_activation(name, activation) else {
