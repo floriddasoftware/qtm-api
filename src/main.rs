@@ -1450,89 +1450,125 @@ Err(e) => e,
 }
 }
 fn handle_list_events(name: String) -> HttpResponse {
-let lock = substrate_lock(&name);
-let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-let substrate_path = match ensure_existing_substrate(&name) {
-Ok(p) => p,
-Err(e) => return e,
-};
-let events_path = substrate_path.join("events");
-let mut events = Vec::new();
-if events_path.is_dir() {
-let entries = match std::fs::read_dir(&events_path) {
-Ok(entries) => entries,
-Err(err) => {
-return error(
-StatusCode::INTERNAL_SERVER_ERROR,
-format!("unable to list events: {err}"),
-);
-}
-};
-for entry in entries {
-let entry = match entry {
-Ok(entry) => entry,
-Err(err) => {
-return error(
-StatusCode::INTERNAL_SERVER_ERROR,
-format!("unable to read event entry: {err}"),
-);
-}
-};
-let record_path = entry.path();
-if !record_path.is_dir() {
-continue;
-}
-let record = entry.file_name().to_string_lossy().to_string();
-let kind = if record.starts_with("exile") {
-"exile"
-} else if record.starts_with("event") {
-"transit"
-} else {
-continue;
-};
-let activation = read_trim(&record_path.join("manifold.activations"))
-.or_else(|| parse_record_identity(&record).map(|(a, )| a.to_string()))
-.unwrap_or_else(|| "unknown".to_string());
-let dimension = read_trim(&record_path.join("manifold.dimension"))
-.or_else(|| parse_record_identity(&record).map(|(, d)| d.to_string()))
-.unwrap_or_else(|| "unknown".to_string());
-let depth_objects = read_trim(&record_path.join("depth.objects"))
-.map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
-.unwrap_or(0);
-events.push(PersistedEventSummary {
-kind: kind.to_string(),
-record,
-activation,
-dimension,
-structural_value: read_trim(&record_path.join("manifold.structural_value")).unwrap_or_else(|| "unknown".to_string()),
-depth_objects,
-retained_mass: read_trim(&record_path.join("manifold.retained_mass")).unwrap_or_else(|| "unknown".to_string()),
-delta: read_trim(&record_path.join("transition.delta")).unwrap_or_else(|| "unknown".to_string()),
-tau: read_trim(&record_path.join("transition.tau")).unwrap_or_else(|| "unknown".to_string()),
-gross_work: read_trim(&record_path.join("transition.gross_work")).unwrap_or_else(|| "unknown".to_string()),
-net_work: read_trim(&record_path.join("transition.net_work")).unwrap_or_else(|| "unknown".to_string()),
-commitment: read_trim(&record_path.join("qtm.commitment")).unwrap_or_else(|| "unknown".to_string()),
-coordinate: read_trim(&record_path.join("qtm.coordinate")).unwrap_or_else(|| "unknown".to_string()),
-});
-}
-}
-events.sort_by(|a, b| {
-a.activation
-.parse::<u64>()
-.unwrap_or(0)
-.cmp(&b.activation.parse::<u64>().unwrap_or(0))
-.then_with(|| a.record.cmp(&b.record))
-});
-json_response(
-StatusCode::OK,
-&EventStoreResponse {
-substrate: name,
-directory: substrate_path.display().to_string(),
-events_directory: events_path.display().to_string(),
-events,
-runtime: serialize_runtime(SystemTime::now()),
-},
-)
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let events_path = substrate_path.join("events");
+    let mut events = Vec::new();
+
+    if events_path.is_dir() {
+        let entries = match std::fs::read_dir(&events_path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to list events: {err}"),
+                );
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unable to read event entry: {err}"),
+                    );
+                }
+            };
+
+            let record_path = entry.path();
+            if !record_path.is_dir() {
+                continue;
+            }
+
+            let record = entry.file_name().to_string_lossy().to_string();
+
+            let kind = if record.starts_with("exile_") {
+                "exile"
+            } else if record.starts_with("event_") {
+                "transit"
+            } else {
+                continue;
+            };
+
+            let identity = parse_record_identity(&record);
+
+            let activation = read_trim(&record_path.join("manifold.activations"))
+                .or_else(|| {
+                    identity.map(|(activation, _)| activation.to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let dimension = read_trim(&record_path.join("manifold.dimension"))
+                .or_else(|| {
+                    identity.map(|(_, dimension)| dimension.to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let depth_objects = read_trim(&record_path.join("depth.objects"))
+                .map(|contents| {
+                    contents
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count()
+                })
+                .unwrap_or(0);
+
+            events.push(PersistedEventSummary {
+                kind: kind.to_string(),
+                record,
+                activation,
+                dimension,
+                structural_value: read_trim(
+                    &record_path.join("manifold.structural_value"),
+                )
+                .unwrap_or_else(|| "unknown".to_string()),
+                depth_objects,
+                retained_mass: read_trim(
+                    &record_path.join("manifold.retained_mass"),
+                )
+                .unwrap_or_else(|| "unknown".to_string()),
+                delta: read_trim(&record_path.join("transition.delta"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                tau: read_trim(&record_path.join("transition.tau"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                gross_work: read_trim(&record_path.join("transition.gross_work"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                net_work: read_trim(&record_path.join("transition.net_work"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                commitment: read_trim(&record_path.join("qtm.commitment"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                coordinate: read_trim(&record_path.join("qtm.coordinate"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+            });
+        }
+    }
+
+    events.sort_by(|a, b| {
+        a.activation
+            .parse::<u64>()
+            .unwrap_or(0)
+            .cmp(&b.activation.parse::<u64>().unwrap_or(0))
+            .then_with(|| a.record.cmp(&b.record))
+    });
+
+    json_response(
+        StatusCode::OK,
+        &EventStoreResponse {
+            substrate: name,
+            directory: substrate_path.display().to_string(),
+            events_directory: events_path.display().to_string(),
+            events,
+            runtime: serialize_runtime(SystemTime::now()),
+        },
+    )
 }
 fn handle_list_event_payloads(name: String, record: String) -> HttpResponse {
 let lock = substrate_lock(&name);
@@ -2212,7 +2248,7 @@ Ok(board) => json_response(StatusCode::OK, &board),
 Err(e) => e,
 }
 }
-/ ---------- Hyper Route Dispatcher ---------- */
+// ---------- Hyper Route Dispatcher ---------- */
 async fn dispatch(req: Request<Incoming>) -> HttpResponse {
 let method = req.method().clone();
 if method == Method::OPTIONS {
