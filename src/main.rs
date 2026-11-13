@@ -444,14 +444,25 @@ activation: u64,
 pipelines: Vec<BitMinerProcessEntry>,
 }
 /* ---------- HTTP / Hyper Response & Body Helpers ---------- */
+
 fn attach_cors(res: &mut HttpResponse) {
-let h = res.headers_mut();
-h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static(""));
-h.insert(
-header::ACCESS_CONTROL_ALLOW_METHODS,
-HeaderValue::from_static("GET, HEAD, POST, PUT, DELETE, OPTIONS"),
-);
-h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static(""));
+    let headers = res.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, HEAD, POST, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Accept, Content-Type, Authorization"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
+    );
 }
 
 fn bytes_response(
