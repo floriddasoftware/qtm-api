@@ -2169,13 +2169,6 @@ return e;
 }
 let qtm = QtmResponse {
 commitment: hex::encode(event.qtm.commitment),
-coordinate: hex::encode(event.qtm.coordinate),
-sigma: event.qtm.sigma.to_string(),
-network: event.qtm.net_work.to_string(),
-};
-let event_payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
-json_response(StatusCode::OK, &direction_response(event_payload, Some(selection), qtm))
-}
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
@@ -2197,6 +2190,13 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
             "amount and ordinal must be greater than zero",
         );
     }
+
+    let activation = match guarded("activation lookup", || {
+        commands::load_activation(&name)
+    }) {
+        Ok(activation) => activation,
+        Err(e) => return e,
+    };
 
     let network = match selected_network(&body.network) {
         Some(network) => network,
@@ -2221,7 +2221,7 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
 
     let budget = match load_network_budget(
         &substrate_path,
-        body.amount,
+        activation,
         &network.id,
     ) {
         Ok(Some(budget)) => budget,
@@ -2230,7 +2230,7 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
                 StatusCode::BAD_REQUEST,
                 format!(
                     "no receive budget configured: activation={} network={}",
-                    body.amount,
+                    activation,
                     network.id,
                 ),
             );
@@ -2238,14 +2238,26 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         Err(e) => return e,
     };
 
-    let limit = body.amount.min(budget.max_events);
-
-    if body.ordinal > limit {
+    if body.amount < budget.min_events || body.amount > budget.max_events {
         return error(
             StatusCode::BAD_REQUEST,
             format!(
-                "ordinal exceeds receive budget: network={} maximum={limit}",
+                "receive amount outside network budget: activation={} network={} minimum={} maximum={} requested={}",
+                activation,
                 network.id,
+                budget.min_events,
+                budget.max_events,
+                body.amount,
+            ),
+        );
+    }
+
+    if body.ordinal > body.amount {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "ordinal exceeds receive amount: maximum={}",
+                body.amount,
             ),
         );
     }
