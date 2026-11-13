@@ -2168,7 +2168,7 @@ if let Err(e) = write_depth_payload(&record_path, &network_id, &event.depth) {
 return e;
 }
 let qtm = QtmResponse {
-commitment: hex::encode(event.qtm.commitment),
+commitment: hex::encode(event.qtm.commitment),}
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
