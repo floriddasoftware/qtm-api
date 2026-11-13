@@ -256,6 +256,7 @@ external: u64,
 #[derive(Deserialize)]
 struct ReceiveRequest {
     amount: u64,
+    network: String,
     flow: String,
     ordinal: u64,
 }
@@ -2197,6 +2198,16 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         );
     }
 
+    let network = match selected_network(&body.network) {
+        Some(network) => network,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported network: {}", body.network),
+            );
+        }
+    };
+
     let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
         "receive" => Flow::Receive,
         "change" => Flow::Change,
@@ -2208,23 +2219,34 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         }
     };
 
-    let max_events = match registered_networks().networks.iter().try_fold(
-        0u64,
-        |max, network| {
-            load_network_budget(&substrate_path, body.amount, &network.id)
-                .map(|budget| max.max(budget.map_or(0, |b| b.max_events)))
-        },
+    let budget = match load_network_budget(
+        &substrate_path,
+        body.amount,
+        &network.id,
     ) {
-        Ok(max) => max,
+        Ok(Some(budget)) => budget,
+        Ok(None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "no receive budget configured: activation={} network={}",
+                    body.amount,
+                    network.id,
+                ),
+            );
+        }
         Err(e) => return e,
     };
 
-    let limit = body.amount.min(max_events);
+    let limit = body.amount.min(budget.max_events);
 
     if body.ordinal > limit {
         return error(
             StatusCode::BAD_REQUEST,
-            format!("ordinal exceeds receive budget: maximum={limit}"),
+            format!(
+                "ordinal exceeds receive budget: network={} maximum={limit}",
+                network.id,
+            ),
         );
     }
 
@@ -2249,23 +2271,11 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         },
     };
 
-    let event = match flow {
-        Flow::Receive => {
-            match guarded("receive", || {
-                transaction.receive(&name, Flow::Receive)
-            }) {
-                Ok(event) => event,
-                Err(e) => return e,
-            }
-        }
-        Flow::Change => {
-            match guarded("change", || {
-                transaction.receive(&name, Flow::Change)
-            }) {
-                Ok(event) => event,
-                Err(e) => return e,
-            }
-        }
+    let event = match guarded("receive", || {
+        transaction.receive(&name, flow)
+    }) {
+        Ok(event) => event,
+        Err(e) => return e,
     };
 
     let payload = EventPayload::from_heritage(
