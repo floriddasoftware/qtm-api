@@ -252,11 +252,10 @@ coin: u64,
 account: u64,
 change: u64,
 external: u64,
-}
 #[derive(Deserialize)]
 struct ReceiveRequest {
     amount: u64,
-    flow: Flow,
+    flow: String,
     ordinal: u64,
 }
 #[derive(Deserialize)]
