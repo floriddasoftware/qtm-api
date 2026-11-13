@@ -36,11 +36,29 @@ process::{Child, Command},
 sync::Mutex as AsyncMutex,
 };
 
+
 #[cfg(feature = "bit-miner")]
-use bitcoin::{Amount, OutPoint, TxOut};
+use bitcoin::{
+    bip32::{
+        DerivationPath,
+        Fingerprint,
+        Xpriv,
+        Xpub,
+    },
+    Address as BitcoinAddress,
+    Amount,
+    NetworkKind,
+    OutPoint,
+    PublicKey,
+    ScriptBuf,
+    TxOut,
+    WPubkeyHash,
+    Witness,
+};
 
 #[cfg(feature = "bit-miner")]
 use bit_miner::{
+    bit_block::{self, QtmMasterKeys},
     bitcoinpsbt::{PrevoutResolver, ResolvedPrevout},
     broadcast::WirePacket,
     observestream::decode_wirepackets,
@@ -750,6 +768,267 @@ fn registered_networks() -> NetworkListResponse {
 fn selected_network(id: &str) -> Option<NetworkOption> {
 registered_networks().networks.into_iter().find(|n| n.id == id)
 }
+
+
+
+#[cfg(feature = "bit-miner")]
+type BitBlockResult<T> =
+    Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// =============================================================================
+// BITCOIN BITBLOCK DELEGATION
+//
+// qtm-api supplies QTM state and network selection.
+// bit_block owns Bitcoin key derivation, scripts and addresses.
+// =============================================================================
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_registered_path(network: &str) -> ApiResult<String> {
+    let selected = selected_network(network)
+        .ok_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                format!("network is not registered: {network}"),
+            )
+        })?;
+
+    if !is_bitcoin_network_id(network) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            format!("network is not a Bitcoin network: {network}"),
+        ));
+    }
+
+    Ok(selected.path)
+}
+
+// -----------------------------------------------------------------------------
+// EXTENDED KEYS
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_xpriv(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    network: NetworkKind,
+) -> BitBlockResult<Xpriv> {
+    bit_block::qtm_xpriv(
+        coordinate,
+        commitment,
+        activation,
+        network,
+    )
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_master_fingerprint(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    network: NetworkKind,
+) -> BitBlockResult<Fingerprint> {
+    bit_block::qtm_master_fingerprint(
+        coordinate,
+        commitment,
+        activation,
+        network,
+    )
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_master_xpub(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    network: NetworkKind,
+) -> BitBlockResult<Xpub> {
+    bit_block::qtm_master_xpub(
+        coordinate,
+        commitment,
+        activation,
+        network,
+    )
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_master_zpub(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    network: NetworkKind,
+) -> BitBlockResult<String> {
+    bit_block::qtm_master_zpub(
+        coordinate,
+        commitment,
+        activation,
+        network,
+    )
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_xpub_to_zpub(xpub: &Xpub) -> String {
+    bit_block::xpub_to_zpub(xpub)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_master_keys(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    network: NetworkKind,
+) -> BitBlockResult<QtmMasterKeys> {
+    bit_block::qtm_master_keys(
+        coordinate,
+        commitment,
+        activation,
+        network,
+    )
+}
+
+// -----------------------------------------------------------------------------
+// PATH AND CHILD DERIVATION
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_bip32_path_depth(
+    path: &DerivationPath,
+) -> usize {
+    bit_block::bip32_path_depth(path)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_path_depth(
+    activation: u64,
+    path: &DerivationPath,
+) -> BitBlockResult<u8> {
+    bit_block::qtm_path_depth(
+        activation,
+        path,
+    )
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_derive_qtm_child(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    path: &str,
+    network: NetworkKind,
+) -> BitBlockResult<[u8; 32]> {
+    bit_block::derive_qtm_child(
+        coordinate,
+        commitment,
+        activation,
+        path,
+        network,
+    )
+}
+
+// -----------------------------------------------------------------------------
+// PUBLIC KEY
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_derive_public_key(
+    private_key: [u8; 32],
+) -> BitBlockResult<(PublicKey, WPubkeyHash)> {
+    bit_block::derive_public_key(private_key)
+}
+
+// -----------------------------------------------------------------------------
+// SCRIPT PUBKEY
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_p2pkh_script(
+    private_key: [u8; 32],
+) -> BitBlockResult<ScriptBuf> {
+    bit_block::p2pkh_script(private_key)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_p2wpkh_script(
+    private_key: [u8; 32],
+) -> BitBlockResult<ScriptBuf> {
+    bit_block::p2wpkh_script(private_key)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_taproot_script(
+    private_key: [u8; 32],
+) -> BitBlockResult<ScriptBuf> {
+    bit_block::taproot_script(private_key)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_derive_script_pubkey(
+    private_key: [u8; 32],
+) -> BitBlockResult<ScriptBuf> {
+    bit_block::derive_script_pubkey(private_key)
+}
+
+// -----------------------------------------------------------------------------
+// WITNESS
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_derive_p2wpkh_witness(
+    private_key: [u8; 32],
+) -> BitBlockResult<Witness> {
+    bit_block::derive_p2wpkh_witness(private_key)
+}
+
+// -----------------------------------------------------------------------------
+// ADDRESSES
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_p2pkh_address(
+    private_key: [u8; 32],
+) -> BitBlockResult<BitcoinAddress> {
+    bit_block::p2pkh_address(private_key)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_p2wpkh_address(
+    private_key: [u8; 32],
+) -> BitBlockResult<BitcoinAddress> {
+    bit_block::p2wpkh_address(private_key)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_bip44_address(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    path: &str,
+) -> BitBlockResult<BitcoinAddress> {
+    bit_block::qtm_bip44_address(
+        coordinate,
+        commitment,
+        activation,
+        path,
+    )
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_bip84_address(
+    coordinate: [u8; 32],
+    commitment: [u8; 32],
+    activation: u64,
+    path: &str,
+) -> BitBlockResult<BitcoinAddress> {
+    bit_block::qtm_bip84_address(
+        coordinate,
+        commitment,
+        activation,
+        path,
+    )
+}
+
+
+
 fn scale_name(scale: Scale) -> &'static str {
 match scale {
 Scale::Minimal => "Minimal",
