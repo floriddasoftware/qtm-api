@@ -3097,6 +3097,115 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
     )
 }
 
+fn load_wirepackets(
+    name: &str,
+    activation: u64,
+    network: &str,
+) -> ApiResult<WirePacketsResponse> {
+    validate_wirepackets_scope(name, network)?;
+
+    let lock = substrate_lock(name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = ensure_existing_substrate(name)?;
+
+    let budget = load_network_budget(&substrate_path, activation, network)?
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "no WirePackets budget configured for this activation and network",
+            )
+        })?;
+
+    let event_path = commands::substrate_root()
+        .join(name)
+        .join("activations")
+        .join(activation.to_string())
+        .join("event");
+
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for submission in 1..=budget.max_events {
+        let path = commands::wirepackets_path(name, activation, submission);
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect submission {submission}: {e}"),
+                ));
+            }
+        };
+
+        let bytes = std::fs::read(&path).map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read submission {submission}: {e}"),
+            )
+        })?;
+
+        let next_size = total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "combined WirePackets size overflow",
+                )
+            })?;
+
+        if next_size > WIREPACKETS_MAX_BYTES {
+            return Err(error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
+                ),
+            ));
+        }
+
+        let packets = decode_wirepackets(&bytes).map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "invalid WirePackets for activation {activation}, submission {submission}: {e}"
+                ),
+            )
+        })?;
+
+        let packet_count = packets.len();
+
+        entries.push(WirePacketEntry {
+            submission,
+            name: submission.to_string(),
+            path: path.display().to_string(),
+            bytes: metadata.len(),
+            packet_count,
+            packets: wire_packet_value_entries(&packets),
+        });
+
+        total_bytes = next_size;
+    }
+
+    let exists = !entries.is_empty();
+
+    Ok(WirePacketsResponse {
+        substrate: name.to_owned(),
+        activation,
+        network: network.to_owned(),
+        scope: "activation",
+        path: event_path.display().to_string(),
+        exists,
+        bytes: exists.then_some(total_bytes),
+        file_route: Some(format!(
+            "/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"
+        )),
+        packets: entries,
+    })
+}
+
 fn handle_get_wirepackets(
     name: String,
     activation: u64,
