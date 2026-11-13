@@ -2105,70 +2105,122 @@ json_response(StatusCode::OK, &NetworkBudgetEntry { network, activation, configu
 }
 /// POST /wallets/:name/transit
 async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
-let body: TransitRequest = match parse_json_body(req).await {
-Ok(b) => b,
-Err(e) => return e,
-};
-let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-let substrate_path = match ensure_existing_substrate(&name) {
-Ok(p) => p,
-Err(e) => return e,
-};
-let preset = match body.network.as_deref() {
-Some(id) => match selected_network(id) {
-Some(net) => Some(net),
-None => return error(StatusCode::BAD_REQUEST, format!("unsupported network: {id}")),
-},
-None => None,
-};
-let purpose = body.purpose.or_else(|| preset.as_ref().map(|n| n.purpose)).unwrap_or(44);
-let coin = body.coin.or_else(|| preset.as_ref().map(|n| n.coin)).unwrap_or(0);
-let account = body.account.unwrap_or(0);
-let change = body.change.unwrap_or(0);
-let external = body.external.unwrap_or(0);
-let path = match body.path {
-Some(p) => {
-let trimmed = p.trim();
-if trimmed.is_empty() {
-return error(StatusCode::BAD_REQUEST, "path must not be empty");
+    let body: TransitRequest = match parse_json_body(req).await {
+        Ok(body) => body,
+        Err(e) => return e,
+    };
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    let preset = match body.network.as_deref() {
+        Some(id) => match selected_network(id) {
+            Some(network) => Some(network),
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported network: {id}"),
+                );
+            }
+        },
+        None => None,
+    };
+
+    let purpose = body.purpose
+        .or_else(|| preset.as_ref().map(|n| n.purpose))
+        .unwrap_or(44);
+    let coin = body.coin
+        .or_else(|| preset.as_ref().map(|n| n.coin))
+        .unwrap_or(0);
+    let account = body.account.unwrap_or(0);
+    let change = body.change.unwrap_or(0);
+    let external = body.external.unwrap_or(0);
+
+    let path = match body.path {
+        Some(path) => {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return error(StatusCode::BAD_REQUEST, "path must not be empty");
+            }
+            Some(trimmed.to_string())
+        }
+        None => preset.as_ref().map(|n| n.path.clone()),
+    };
+
+    let network_id = body.network
+        .as_deref()
+        .or_else(|| preset.as_ref().map(|n| n.id.as_str()))
+        .unwrap_or("default")
+        .to_string();
+
+    let selection = TransitSelection {
+        network: Some(network_id.clone()),
+        path,
+        activation: body.activation,
+        purpose,
+        coin,
+        account,
+        change,
+        external,
+    };
+
+    let payload = TotalMass::new(
+        purpose as u128,
+        coin as u128,
+        account as u128,
+        change as u128,
+        external as u128,
+    ).memorize();
+
+    let event = match guarded("transit", || {
+        commands::qtm_transit(&name, payload, body.activation)
+    }) {
+        Ok(event) => event,
+        Err(e) => return e,
+    };
+
+    let activation = event.heritage.state.activations();
+    let dimension = event.heritage.state.dimension();
+
+    let record_path = match canonical_record_path(
+        &substrate_path,
+        "transit",
+        activation,
+        u128::from(dimension),
+    ) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    if let Err(e) = write_depth_payload(&record_path, &network_id, &event.depth) {
+        return e;
+    }
+
+    let qtm = QtmResponse {
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
+
+    let event_payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
+
+    json_response(
+        StatusCode::OK,
+        &direction_response(event_payload, Some(selection), qtm),
+    )
 }
-Some(trimmed.to_string())
-}
-None => preset.as_ref().map(|n| n.path.clone()),
-};
-let network_id = body
-.network
-.as_deref()
-.or_else(|| preset.as_ref().map(|n| n.id.as_str()))
-.unwrap_or("default")
-.to_string();
-let selection = TransitSelection {
-network: Some(network_id.clone()),
-path,
-activation: body.activation,
-purpose,
-coin,
-account,
-change,
-external,
-};
-let payload = TotalMass::new(purpose as u128, coin as u128, account as u128, change as u128, external as u128).memorize();
-let event = match guarded("transit", || commands::qtm_transit(&name, payload, body.activation)) {
-Ok(ev) => ev,
-Err(e) => return e,
-};
-let activation = event.heritage.state.activations();
-let dimension = event.heritage.state.dimension();
-let record_path = match canonical_record_path(&substrate_path, "transit", activation, u128::from(dimension)) {
-Ok(rp) => rp,
-Err(e) => return e,
-};
-if let Err(e) = write_depth_payload(&record_path, &network_id, &event.depth) {
-return e;
-}
-let qtm = QtmResponse {
-commitment: hex::encode(event.qtm.commitment),}
+
+
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
