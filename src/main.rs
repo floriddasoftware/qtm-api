@@ -255,8 +255,9 @@ external: u64,
 }
 #[derive(Deserialize)]
 struct ReceiveRequest {
-amount: u64,
-flow: String,
+    amount: u64,
+    flow: Flow,
+    ordinal: u64,
 }
 #[derive(Deserialize)]
 struct BudgetRequest {
