@@ -2892,6 +2892,102 @@ async fn handle_get_payload_board(
         Err(e) => e,
     }
 }
+
+/// GET /wallets/:name/exile/depth
+fn handle_exile_depth(name: String) -> HttpResponse {
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    let record_path = match latest_record_path(&substrate_path, "exile_") {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    let record = record_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let entries = match std::fs::read_dir(&record_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read exile payloads: {e}"),
+            );
+        }
+    };
+
+    let mut payloads = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to read exile network: {e}"),
+                );
+            }
+        };
+
+        let network_path = entry.path();
+        if !network_path.is_dir() {
+            continue;
+        }
+
+        let network_id = entry.file_name().to_string_lossy().into_owned();
+        let payload_path = network_path.join("payload");
+
+        if !payload_path.join("depth.path").is_file()
+            || !payload_path.join("depth.objects").is_file()
+        {
+            continue;
+        }
+
+        let depth = match read_persisted_depth(&payload_path) {
+            Ok(depth) => depth,
+            Err(e) => return e,
+        };
+
+        let selected = selected_network(&network_id);
+        let registered = selected.is_some();
+        let network_name = selected
+            .map(|network| network.name)
+            .unwrap_or_else(|| network_id.clone());
+
+        payloads.push(PersistedPayloadEntry {
+            record: record.clone(),
+            direction: "exile_outputs".to_string(),
+            network: PersistedPayloadNetwork {
+                id: network_id,
+                name: network_name,
+                registered,
+            },
+            path: payload_path.display().to_string(),
+            depth_identifier: depth.path,
+            objects: depth.objects,
+        });
+    }
+
+    payloads.sort_by(|a, b| a.network.id.cmp(&b.network.id));
+
+    json_response(
+        StatusCode::OK,
+        &PersistedPayloadsResponse {
+            substrate: name,
+            record,
+            directory: record_path.display().to_string(),
+            payloads,
+        },
+    )
+}
 async fn handle_get_payload_board_for_network(name: String, activation: u64, network: String) -> HttpResponse {
 if !valid_observation_network_id(&network) {
 return error(StatusCode::BAD_REQUEST, "invalid network identifier for payload board");
