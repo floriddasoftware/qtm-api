@@ -256,7 +256,6 @@ external: u64,
 #[derive(Deserialize)]
 struct ReceiveRequest {
     amount: u64,
-    network: String,
     flow: String,
     ordinal: u64,
 }
@@ -1581,6 +1580,46 @@ async fn bitminer_process_list(
     Ok(pipelines)
 }
 
+async fn receive_pipeline_network(
+    name: &str,
+    activation: u64,
+) -> ApiResult<NetworkOption> {
+    let pipelines = bitminer_process_list(name, activation).await?;
+
+    let network_id = match pipelines.as_slice() {
+        [pipeline] => pipeline.network.as_str(),
+        [] => {
+            return Err(error(
+                StatusCode::CONFLICT,
+                format!(
+                    "no running observation pipeline: substrate={name} activation={activation}",
+                ),
+            ));
+        }
+        _ => {
+            let networks = pipelines
+                .iter()
+                .map(|pipeline| pipeline.network.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            return Err(error(
+                StatusCode::CONFLICT,
+                format!(
+                    "multiple observation pipelines are active; receive requires one pipeline: {networks}",
+                ),
+            ));
+        }
+    };
+
+    selected_network(network_id).ok_or_else(|| {
+        error(
+            StatusCode::BAD_REQUEST,
+            format!("pipeline network is not registered: {network_id}"),
+        )
+    })
+}
+
 fn validate_bitminer_scope(name: &str, network: &str) -> ApiResult<()> {
 if !valid_substrate_name(name) {
 return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
@@ -2222,17 +2261,12 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
 
 
 /// POST /wallets/:name/receive
-async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
+async fn handle_receive_wallet(
+    name: String,
+    req: Request<Incoming>,
+) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
         Ok(body) => body,
-        Err(e) => return e,
-    };
-
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-    let substrate_path = match ensure_existing_substrate(&name) {
-        Ok(path) => path,
         Err(e) => return e,
     };
 
@@ -2243,6 +2277,10 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         );
     }
 
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
     let activation = match guarded("activation lookup", || {
         commands::load_activation(&name)
     }) {
@@ -2250,14 +2288,9 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         Err(e) => return e,
     };
 
-    let network = match selected_network(&body.network) {
-        Some(network) => network,
-        None => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                format!("unsupported network: {}", body.network),
-            );
-        }
+    let network = match receive_pipeline_network(&name, activation).await {
+        Ok(network) => network,
+        Err(e) => return e,
     };
 
     let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
@@ -2270,6 +2303,28 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
             );
         }
     };
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    let current_activation = match guarded("activation lookup", || {
+        commands::load_activation(&name)
+    }) {
+        Ok(activation) => activation,
+        Err(e) => return e,
+    };
+
+    if current_activation != activation {
+        return error(
+            StatusCode::CONFLICT,
+            "substrate activation changed while resolving observation pipeline",
+        );
+    }
 
     let budget = match load_network_budget(
         &substrate_path,
@@ -2317,7 +2372,7 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
     let transaction = match guarded("receive", || {
         QuantumTransaction::send(&name, body.ordinal)
     }) {
-        Ok(tx) => tx,
+        Ok(transaction) => transaction,
         Err(e) => return e,
     };
 
@@ -3165,8 +3220,6 @@ _ => error(StatusCode::NOT_FOUND, format!("route not found: {raw_path}")),
 }
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
-
-#[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
     use bit_miner::observestream::{
         MempoolSpaceStream,
@@ -3187,11 +3240,28 @@ fn run_bit_miner(args: &[String]) -> ! {
     }
 
     let mut pipeline =
-        bit_miner::BitcoinObservationPipeline::new(activation, &substrate, &network)
-            .unwrap_or_else(|e| {
-                eprintln!("bit-miner: pipeline initialization failed: {e}");
-                std::process::exit(1);
-            });
+        bit_miner::BitcoinObservationPipeline::new(
+            activation,
+            &substrate,
+            &network,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("bit-miner: pipeline initialization failed: {e}");
+            std::process::exit(1);
+        });
+
+    let pipeline_network = pipeline.network();
+
+    if selected_network(pipeline_network).is_none() {
+        eprintln!(
+            "bit-miner: pipeline network is not registered: {pipeline_network}",
+        );
+        std::process::exit(2);
+    }
+
+    eprintln!(
+        "bit-miner: pipeline ready substrate={substrate} activation={activation} network={pipeline_network}",
+    );
 
     let resolver = WirePacketPrevoutResolver::new(&substrate, activation);
 
