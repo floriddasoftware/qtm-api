@@ -2229,37 +2229,180 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
 }
 
 
+
 fn handle_open_wallet(name: String) -> HttpResponse {
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    if let Err(e) = ensure_existing_substrate(&name) {
-        return e;
-    }
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
 
-    if let Err(e) = guarded("open", || commands::qtm_open(name.clone())) {
-        return e;
-    }
-
-    let activation = match guarded("activation lookup", || {
-        commands::load_activation(&name)
-    }) {
+    let activation = match guarded(
+        "activation lookup",
+        || commands::load_activation(&name),
+    ) {
         Ok(activation) => activation,
         Err(e) => return e,
     };
+
+    let (record, heritage, qtm, depth) =
+        if let Some(exile_path) =
+            commands::exile_path_at_activation(&name, activation)
+        {
+            let persisted = match guarded(
+                "persisted exile load",
+                || commands::load_event_at_activation(&name, activation),
+            ) {
+                Ok(event) => event,
+                Err(e) => return e,
+            };
+
+            match persisted {
+                qp_hd::PersistedEvent::Exile(event) => {
+                    let record = exile_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    (
+                        record,
+                        event.heritage,
+                        event.qtm,
+                        event.depth,
+                    )
+                }
+
+                qp_hd::PersistedEvent::Transit(_) => {
+                    return error(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "persisted exile path resolves to transit at activation {activation}",
+                        ),
+                    );
+                }
+            }
+        } else {
+            let Some(transit_path) =
+                commands::event_path_at_activation(&name, activation)
+            else {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "no available transit or exile event at activation {activation}",
+                    ),
+                );
+            };
+
+            let entries = match std::fs::read_dir(&transit_path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "unable to inspect transit payloads: {e}",
+                        ),
+                    );
+                }
+            };
+
+            let mut network_ids = Vec::new();
+
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "unable to inspect transit network: {e}",
+                            ),
+                        );
+                    }
+                };
+
+                let network_path = entry.path();
+
+                if !network_path.is_dir() {
+                    continue;
+                }
+
+                let payload_path = network_path.join("payload");
+
+                if payload_path.join("depth.path").is_file()
+                    && payload_path.join("depth.objects").is_file()
+                {
+                    network_ids.push(
+                        entry.file_name().to_string_lossy().to_string(),
+                    );
+                }
+            }
+
+            network_ids.sort();
+            network_ids.dedup();
+
+            let event = match guarded(
+                "open exile",
+                || commands::qtm_exile(&name),
+            ) {
+                Ok(event) => event,
+                Err(e) => return e,
+            };
+
+            let resulting_activation =
+                event.heritage.state.activations();
+
+            let dimension =
+                event.heritage.state.dimension();
+
+            let record_path = match canonical_record_path(
+                &substrate_path,
+                "exile",
+                resulting_activation,
+                u128::from(dimension),
+            ) {
+                Ok(path) => path,
+                Err(e) => return e,
+            };
+
+            for network_id in &network_ids {
+                if let Err(e) = write_depth_payload(
+                    &record_path,
+                    network_id,
+                    &event.depth,
+                ) {
+                    return e;
+                }
+            }
+
+            let record = record_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+
+            (
+                record,
+                event.heritage,
+                event.qtm,
+                event.depth,
+            )
+        };
 
     let substrate = match substrate_json(&name) {
         Ok(substrate) => substrate,
         Err(e) => return e,
     };
 
-    let event = match load_payload_event(&name, activation) {
-        Ok(Some((record, payload))) => {
-            Some(payload_event_view(record, &payload))
-        }
-        Ok(None) => None,
-        Err(e) => return e,
-    };
+    let payload = EventPayload::from_heritage(
+        heritage,
+        depth,
+        Scale::Local,
+    );
+
+    let event = Some(payload_event_view(record, &payload));
 
     json_response(
         StatusCode::OK,
@@ -2736,6 +2879,18 @@ async fn handle_receive_wallet(
         return e;
     }
 
+    // An ordinal remains a transit until that exact ordinal is executed.
+    // Do not reconstruct it from the current activation or substitute another event.
+    if commands::event_path_at_activation(&name, body.ordinal).is_none() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "receive requires a persisted transit at ordinal {}",
+                body.ordinal,
+            ),
+        );
+    }
+
     let transaction = match guarded("receive", || {
         QuantumTransaction::send(&name, body.ordinal)
     }) {
@@ -2775,6 +2930,8 @@ async fn handle_receive_wallet(
         constant_delta: constant_delta.to_string(),
     };
 
+    // Execute only the selected ordinal. Receive must preserve its persisted
+    // event state and depth rather than creating another forward transition.
     let event = match guarded("receive", || {
         transaction.receive(&name, flow)
     }) {
@@ -2799,176 +2956,145 @@ async fn handle_receive_wallet(
     )
 }
 
-
 /// POST /wallets/:name/exile
 fn handle_exile_wallet(name: String) -> HttpResponse {
-let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-let substrate_path = match ensure_existing_substrate(&name) {
-Ok(p) => p,
-Err(e) => return e,
-};
-let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
-Ok(a) => a,
-Err(e) => return e,
-};
-let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
-return error(StatusCode::NOT_FOUND, format!("no transit event exists at activation {activation}"));
-};
-let mut network_ids = Vec::new();
-let entries = match std::fs::read_dir(&transit_path) {
-Ok(e) => e,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit payloads: {e}")),
-};
-for entry in entries {
-let entry = match entry {
-Ok(e) => e,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit network: {e}")),
-};
-let payload = entry.path().join("payload");
-if payload.join("depth.path").is_file() && payload.join("depth.objects").is_file() {
-network_ids.push(entry.file_name().to_string_lossy().to_string());
-}
-}
-network_ids.sort();
-network_ids.dedup();
-let event = match guarded("exile", || commands::qtm_exile(&name)) {
-Ok(ev) => ev,
-Err(e) => return e,
-};
-let resulting_activation = event.heritage.state.activations();
-let dimension = event.heritage.state.dimension();
-let record_path = match canonical_record_path(&substrate_path, "exile", resulting_activation, u128::from(dimension)) {
-Ok(rp) => rp,
-Err(e) => return e,
-};
-for network_id in &network_ids {
-if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
-return e;
-}
-}
-let qtm = QtmResponse {
-commitment: hex::encode(event.qtm.commitment),
-coordinate: hex::encode(event.qtm.coordinate),
-sigma: event.qtm.sigma.to_string(),
-network: event.qtm.net_work.to_string(),
-};
-let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
-json_response(StatusCode::OK, &direction_response(payload, None, qtm))
-}
-
-fn load_wirepackets(
-    name: &str,
-    activation: u64,
-    network: &str,
-) -> Result<WirePacketsResponse, HttpResponse> {
-    if let Err(e) = validate_wirepackets_scope(name, network) {
-        return Err(e);
-    }
-
-    let lock = substrate_lock(name);
+    let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    if let Err(e) = ensure_existing_substrate(name) {
-        return Err(e);
-    }
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
 
-    let budget = load_budget(name, activation, network).map_err(|e| {
-        error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "unable to load budget for substrate={name} activation={activation} network={network}: {e}"
-            ),
-        )
-    })?;
+    let activation = match guarded("activation lookup", || {
+        commands::load_activation(&name)
+    }) {
+        Ok(activation) => activation,
+        Err(e) => return e,
+    };
 
-    let event_root = commands::substrate_root()
-        .join(name)
-        .join("activations")
-        .join(activation.to_string())
-        .join("event");
-
-    let mut packets = Vec::new();
-    let mut total_bytes = 0u64;
-
-    for submission in 1..=budget.max_events {
-        let path = commands::wirepackets_path(name, activation, submission);
-
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(error(
+    // Preserve an already-executed ordinal. Only a persisted transit
+    // may be consumed by exile.
+    let event = if let Some(exile_path) =
+        commands::exile_path_at_activation(&name, activation)
+    {
+        match guarded("exile event lookup", || {
+            commands::load_event_at_activation(&name, activation)
+        }) {
+            Ok(qp_hd::PersistedEvent::Exile(event)) => event,
+            Ok(qp_hd::PersistedEvent::Transit(..)) => {
+                return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect submission {submission}: {e}"),
-                ));
+                    format!(
+                        "persisted exile path contains a transit event at activation {activation}: {}",
+                        exile_path.display(),
+                    ),
+                );
+            }
+            Err(e) => return e,
+        }
+    } else {
+        let Some(transit_path) =
+            commands::event_path_at_activation(&name, activation)
+        else {
+            return error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no persisted transit or exile event exists at activation {activation}"
+                ),
+            );
+        };
+
+        // Preserve the network-specific depth payloads when the transit
+        // is materialized as an exile.
+        let mut network_ids = Vec::new();
+
+        let entries = match std::fs::read_dir(&transit_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect transit payloads: {e}"),
+                );
             }
         };
 
-        if !metadata.is_file() {
-            continue;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unable to inspect transit network: {e}"),
+                    );
+                }
+            };
+
+            let payload = entry.path().join("payload");
+
+            if payload.join("depth.path").is_file()
+                && payload.join("depth.objects").is_file()
+            {
+                network_ids.push(
+                    entry.file_name().to_string_lossy().to_string(),
+                );
+            }
         }
 
-        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
-            error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "combined WirePackets size overflow",
-            )
-        })?;
+        network_ids.sort();
+        network_ids.dedup();
 
-        #[cfg(feature = "bit-miner")]
-        let (packet_count, decoded) = {
-            let bytes = std::fs::read(&path).map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read submission {submission}: {e}"),
-                )
-            })?;
-
-            match decode_wirepackets(&bytes) {
-                Ok(wirepackets) => {
-                    let entries = wire_packet_value_entries(&wirepackets);
-                    (entries.len(), entries)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "wirepackets decode failed substrate={name} activation={activation} submission={submission}: {e}"
-                    );
-                    (0, Vec::new())
-                }
-            }
+        // Execute this ordinal once. qtm_exile consumes its persisted transit.
+        let event = match guarded("exile", || {
+            commands::qtm_exile(&name)
+        }) {
+            Ok(event) => event,
+            Err(e) => return e,
         };
 
-        #[cfg(not(feature = "bit-miner"))]
-        let (packet_count, decoded) = (0usize, Vec::new());
+        let resulting_activation = event.heritage.state.activations();
+        let dimension = event.heritage.state.dimension();
 
-        packets.push(WirePacketEntry {
-            submission,
-            name: format!("submission{submission}"),
-            path: path.display().to_string(),
-            bytes: metadata.len(),
-            packet_count,
-            packets: decoded,
-        });
-    }
+        let record_path = match canonical_record_path(
+            &substrate_path,
+            "exile",
+            resulting_activation,
+            u128::from(dimension),
+        ) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
 
-    let exists = !packets.is_empty();
+        for network_id in &network_ids {
+            if let Err(e) = write_depth_payload(
+                &record_path,
+                network_id,
+                &event.depth,
+            ) {
+                return e;
+            }
+        }
 
-    Ok(WirePacketsResponse {
-        substrate: name.to_string(),
-        activation,
-        network: network.to_string(),
-        scope: "activation/submissions/bitcoin",
-        path: event_root.display().to_string(),
-        exists,
-        bytes: exists.then_some(total_bytes),
-        file_route: exists.then(|| {
-            format!(
-                "/wallets/{name}/activations/{activation}/networks/{network}/wirepackets/file"
-            )
-        }),
-        packets,
-    })
+        event
+    };
+
+    let qtm = QtmResponse {
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
+
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
+
+    json_response(
+        StatusCode::OK,
+        &direction_response(payload, None, qtm),
+    )
 }
 
 fn handle_get_wirepackets(
