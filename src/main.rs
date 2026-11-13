@@ -83,12 +83,12 @@ language: Option<String>,
 #[serde(default)]
 passphrase: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct QtmResponse {
-commitment: String,
-coordinate: String,
-sigma: String,
-network: String,
+    commitment: String,
+    coordinate: String,
+    sigma: String,
+    network: String,
 }
 #[derive(Serialize)]
 struct QtmFrameResponse {
@@ -108,9 +108,11 @@ event: EventMapResponse,
 }
 #[derive(Serialize)]
 struct EventMapResponse {
-scale: String,
-runtime: RuntimeResponse,
-depth: DepthResponse,
+    scale: String,
+    runtime: RuntimeResponse,
+    heritage: EventHeritageView,
+    qtm: QtmFrameResponse,
+    depth: DepthResponse,
 }
 #[derive(Serialize, Clone)]
 struct DepthResponse {
@@ -140,9 +142,16 @@ event: EventMapResponse,
 }
 #[derive(Serialize)]
 struct QuantumTransactionResponse {
-amount: u64,
-qtm: QtmFrameResponse,
-constant: String,
+    amount: u64,
+    qtm: QtmFrameResponse,
+    constant: String,
+    constant_delta: String,
+}
+
+#[derive(Serialize)]
+struct OpenResponse {
+    substrate: SubstrateResponse,
+    event: EventMapResponse,
 }
 #[derive(Serialize)]
 struct SubstrateResponse {
@@ -958,19 +967,51 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
     })
 }
 
-fn event_map_response(payload: EventPayload) -> EventMapResponse {
-let event = payload.direction.into_event();
-EventMapResponse {
-scale: scale_name(event.scale).to_string(),
-runtime: serialize_runtime(event.runtime),
-depth: depth_response(&payload.depth),
+fn event_map_response(
+    payload: EventPayload,
+    qtm: QtmResponse,
+) -> EventMapResponse {
+    let event = payload.direction.into_event();
+    let heritage = event.heritage();
+    let state = &heritage.state;
+    let transition = &heritage.transition;
+    EventMapResponse {
+        scale: scale_name(event.scale).to_string(),
+        runtime: serialize_runtime(event.runtime),
+        heritage: EventHeritageView {
+            state: EventStateView {
+                dimension: state.dimension().to_string(),
+                structural_value: state.structural_value().to_string(),
+                retained_mass: state.retained_mass().to_string(),
+                activations: state.activations(),
+
+            },
+
+            transition: EventTransitionView {
+                tau: transition.tau.to_string(),
+                delta: transition.delta.to_string(),
+                gross_work: transition.gross_work.to_string(),
+                net_work: transition.net_work.to_string(),
+                mirror_bytes: hex::encode(&transition.mirror_bytes),
+            },
+        },
+        qtm: qtm_frame(qtm),
+        depth: depth_response(&payload.depth),
+    }
 }
-}
-fn direction_response(payload: EventPayload, selection: Option<TransitSelection>, qtm: QtmResponse) -> DirectionResponse {
-DirectionResponse {
-frame: DirectionFrameResponse { qtm: qtm_frame(qtm), event: event_map_response(payload) },
-selection,
-}
+
+fn direction_response(
+    payload: EventPayload,
+    selection: Option<TransitSelection>,
+    qtm: QtmResponse,
+) -> DirectionResponse {
+    DirectionResponse {
+        frame: DirectionFrameResponse {
+            qtm: qtm_frame(qtm.clone()),
+            event: event_map_response(payload, qtm),
+        },
+        selection,
+    }
 }
 // ---------- Activation/Network Budget Persistence ---------- /
 fn budget_directory(substrate_path: &FsPath, activation: u64, network: &str) -> PathBuf {
@@ -1905,20 +1946,48 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
     }
 }
 
+
 fn handle_open_wallet(name: String) -> HttpResponse {
-let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    if let Err(e) = guarded("open", || commands::qtm_open(name.clone())) {
+        return e;
+    }
+
+    let activation = match guarded("activation lookup", || {
+        commands::load_activation(&name)
+    }) {
+        Ok(activation) => activation,
+        Err(e) => return e,
+    };
+
+    let substrate = match substrate_json(&name) {
+        Ok(substrate) => substrate,
+        Err(e) => return e,
+    };
+
+    let event = match load_payload_event(&name, activation) {
+        Ok(Some((record, payload))) => {
+            Some(payload_event_view(record, &payload))
+        }
+        Ok(None) => None,
+        Err(e) => return e,
+    };
+
+    json_response(
+        StatusCode::OK,
+        &OpenResponse {
+            substrate,
+            event,
+        },
+    )
 }
-if let Err(e) = guarded("open", || commands::qtm_open(name.clone())) {
-return e;
-}
-match substrate_json(&name) {
-Ok(res) => json_response(StatusCode::OK, &res),
-Err(e) => e,
-}
-}
+
 fn handle_list_events(name: String) -> HttpResponse {
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1954,6 +2023,7 @@ fn handle_list_events(name: String) -> HttpResponse {
             };
 
             let record_path = entry.path();
+
             if !record_path.is_dir() {
                 continue;
             }
@@ -1968,66 +2038,127 @@ fn handle_list_events(name: String) -> HttpResponse {
                 continue;
             };
 
-            let identity = parse_record_identity(&record);
-
-            let activation = read_trim(&record_path.join("manifold.activations"))
-                .or_else(|| {
-                    identity.map(|(activation, _)| activation.to_string())
+            let read_persisted = |field: &str| -> ApiResult<String> {
+                read_trim(&record_path.join(field)).ok_or_else(|| {
+                    error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "missing persisted event field: record={} field={}",
+                            record,
+                            field,
+                        ),
+                    )
                 })
-                .unwrap_or_else(|| "unknown".to_string());
+            };
 
-            let dimension = read_trim(&record_path.join("manifold.dimension"))
-                .or_else(|| {
-                    identity.map(|(_, dimension)| dimension.to_string())
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+            let activation = match read_persisted("manifold.activations") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
 
-            let depth_objects = read_trim(&record_path.join("depth.objects"))
-                .map(|contents| {
-                    contents
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .count()
-                })
-                .unwrap_or(0);
+            let activation_number = match activation.parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "invalid persisted activation: record={} activation={}",
+                            record,
+                            activation,
+                        ),
+                    );
+                }
+            };
 
-            events.push(PersistedEventSummary {
-                kind: kind.to_string(),
-                record,
-                activation,
-                dimension,
-                structural_value: read_trim(
-                    &record_path.join("manifold.structural_value"),
-                )
-                .unwrap_or_else(|| "unknown".to_string()),
-                depth_objects,
-                retained_mass: read_trim(
-                    &record_path.join("manifold.retained_mass"),
-                )
-                .unwrap_or_else(|| "unknown".to_string()),
-                delta: read_trim(&record_path.join("transition.delta"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                tau: read_trim(&record_path.join("transition.tau"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                gross_work: read_trim(&record_path.join("transition.gross_work"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                net_work: read_trim(&record_path.join("transition.net_work"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                commitment: read_trim(&record_path.join("qtm.commitment"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                coordinate: read_trim(&record_path.join("qtm.coordinate"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-            });
+            let dimension = match read_persisted("manifold.dimension") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+
+            let structural_value =
+                match read_persisted("manifold.structural_value") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+
+            let retained_mass =
+                match read_persisted("manifold.retained_mass") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+
+            let delta = match read_persisted("transition.delta") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+
+            let tau = match read_persisted("transition.tau") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+
+            let gross_work =
+                match read_persisted("transition.gross_work") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+
+            let net_work =
+                match read_persisted("transition.net_work") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+
+            let commitment = match read_persisted("qtm.commitment") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+
+            let coordinate = match read_persisted("qtm.coordinate") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+
+            let depth_contents = match read_persisted("depth.objects") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+
+            let depth_objects = depth_contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+
+            events.push((
+                activation_number,
+                PersistedEventSummary {
+                    kind: kind.to_string(),
+                    record,
+                    activation,
+                    dimension,
+                    structural_value,
+                    depth_objects,
+                    retained_mass,
+                    delta,
+                    tau,
+                    gross_work,
+                    net_work,
+                    commitment,
+                    coordinate,
+                },
+            ));
         }
     }
 
     events.sort_by(|a, b| {
-        a.activation
-            .parse::<u64>()
-            .unwrap_or(0)
-            .cmp(&b.activation.parse::<u64>().unwrap_or(0))
-            .then_with(|| a.record.cmp(&b.record))
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.record.cmp(&b.1.record))
     });
+
+    let events = events
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
 
     json_response(
         StatusCode::OK,
@@ -2260,6 +2391,7 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
 }
 
 
+
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(
     name: String,
@@ -2277,25 +2409,39 @@ async fn handle_receive_wallet(
         );
     }
 
+    if body.ordinal > body.amount {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("ordinal exceeds receive amount: maximum={}", body.amount),
+        );
+    }
+
     if let Err(e) = ensure_existing_substrate(&name) {
         return e;
     }
 
-    let activation = match guarded("activation lookup", || {
-        commands::load_activation(&name)
-    }) {
-        Ok(activation) => activation,
-        Err(e) => return e,
+    let network_id = body.network.trim();
+
+    if !valid_observation_network_id(network_id) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier",
+        );
+    }
+
+    let network = match selected_network(network_id) {
+        Some(network) => network,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("network is not registered: {network_id}"),
+            );
+        }
     };
 
-    let network = match receive_pipeline_network(&name, activation).await {
-        Ok(network) => network,
-        Err(e) => return e,
-    };
-
-    let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
-        "receive" => Flow::Receive,
-        "change" => Flow::Change,
+    let change_requested = match body.flow.trim().to_ascii_lowercase().as_str() {
+        "receive" => false,
+        "change" => true,
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -2312,19 +2458,12 @@ async fn handle_receive_wallet(
         Err(e) => return e,
     };
 
-    let current_activation = match guarded("activation lookup", || {
+    let activation = match guarded("activation lookup", || {
         commands::load_activation(&name)
     }) {
         Ok(activation) => activation,
         Err(e) => return e,
     };
-
-    if current_activation != activation {
-        return error(
-            StatusCode::CONFLICT,
-            "substrate activation changed while resolving observation pipeline",
-        );
-    }
 
     let budget = match load_network_budget(
         &substrate_path,
@@ -2359,21 +2498,30 @@ async fn handle_receive_wallet(
         );
     }
 
-    if body.ordinal > body.amount {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "ordinal exceeds receive amount: maximum={}",
-                body.amount,
-            ),
-        );
-    }
-
     let transaction = match guarded("receive", || {
         QuantumTransaction::send(&name, body.ordinal)
     }) {
         Ok(transaction) => transaction,
         Err(e) => return e,
+    };
+
+    // The persisted transaction constant is the source of Change provenance.
+    let constant_delta = match &transaction.constant {
+        qp_hd::PersistedEvent::Exile(event) => {
+            event.heritage.transition.delta
+        }
+        qp_hd::PersistedEvent::Transit(..) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "QuantumTransaction::send returned a transit constant; expected persisted exile provenance",
+            );
+        }
+    };
+
+    let flow = if change_requested {
+        Flow::Change(constant_delta)
+    } else {
+        Flow::Receive
     };
 
     let transaction_response = QuantumTransactionResponse {
@@ -2384,10 +2532,8 @@ async fn handle_receive_wallet(
             sigma: transaction.qtm.sigma.to_string(),
             network: transaction.qtm.net_work.to_string(),
         }),
-        constant: match &transaction.constant {
-            qp_hd::PersistedEvent::Transit(..) => "transit".to_string(),
-            qp_hd::PersistedEvent::Exile(..) => "exile".to_string(),
-        },
+        constant: "exile".to_string(),
+        constant_delta: constant_delta.to_string(),
     };
 
     let event = match guarded("receive", || {
@@ -2413,6 +2559,7 @@ async fn handle_receive_wallet(
         },
     )
 }
+
 /// POST /wallets/:name/exile
 fn handle_exile_wallet(name: String) -> HttpResponse {
 let lock = substrate_lock(&name);
