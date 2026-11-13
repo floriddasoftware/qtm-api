@@ -2393,8 +2393,6 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
     )
 }
 
-
-
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(
     name: String,
@@ -2420,10 +2418,6 @@ async fn handle_receive_wallet(
                 body.amount,
             ),
         );
-    }
-
-    if let Err(e) = ensure_existing_substrate(&name) {
-        return e;
     }
 
     let network_id = body.network.trim();
@@ -2459,49 +2453,8 @@ async fn handle_receive_wallet(
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    let substrate_path = match ensure_existing_substrate(&name) {
-        Ok(path) => path,
-        Err(e) => return e,
-    };
-
-    let activation = match guarded("activation lookup", || {
-        commands::load_activation(&name)
-    }) {
-        Ok(activation) => activation,
-        Err(e) => return e,
-    };
-
-    let budget = match load_network_budget(
-        &substrate_path,
-        activation,
-        &network.id,
-    ) {
-        Ok(Some(budget)) => budget,
-        Ok(None) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "no receive budget configured: activation={} network={}",
-                    activation,
-                    network.id,
-                ),
-            );
-        }
-        Err(e) => return e,
-    };
-
-    if body.amount < budget.min_events || body.amount > budget.max_events {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "receive amount outside network budget: activation={} network={} minimum={} maximum={} requested={}",
-                activation,
-                network.id,
-                budget.min_events,
-                budget.max_events,
-                body.amount,
-            ),
-        );
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
     }
 
     let transaction = match guarded("receive", || {
@@ -2566,6 +2519,8 @@ async fn handle_receive_wallet(
         },
     )
 }
+
+
 /// POST /wallets/:name/exile
 fn handle_exile_wallet(name: String) -> HttpResponse {
 let lock = substrate_lock(&name);
