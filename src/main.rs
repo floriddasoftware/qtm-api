@@ -151,8 +151,9 @@ struct QuantumTransactionResponse {
 #[derive(Serialize)]
 struct OpenResponse {
     substrate: SubstrateResponse,
-    event: EventMapResponse,
+    event: Option<PayloadEventView>,
 }
+
 #[derive(Serialize)]
 struct SubstrateResponse {
 namespace: String,
@@ -267,7 +268,9 @@ struct ReceiveRequest {
     amount: u64,
     flow: String,
     ordinal: u64,
+    network: String,
 }
+
 #[derive(Deserialize)]
 struct BudgetRequest {
 min_events: u64,
@@ -2412,7 +2415,10 @@ async fn handle_receive_wallet(
     if body.ordinal > body.amount {
         return error(
             StatusCode::BAD_REQUEST,
-            format!("ordinal exceeds receive amount: maximum={}", body.amount),
+            format!(
+                "ordinal exceeds receive amount: maximum={}",
+                body.amount,
+            ),
         );
     }
 
@@ -2505,7 +2511,6 @@ async fn handle_receive_wallet(
         Err(e) => return e,
     };
 
-    // The persisted transaction constant is the source of Change provenance.
     let constant_delta = match &transaction.constant {
         qp_hd::PersistedEvent::Exile(event) => {
             event.heritage.transition.delta
@@ -2524,14 +2529,16 @@ async fn handle_receive_wallet(
         Flow::Receive
     };
 
+    let qtm = QtmResponse {
+        commitment: hex::encode(transaction.qtm.commitment),
+        coordinate: hex::encode(transaction.qtm.coordinate),
+        sigma: transaction.qtm.sigma.to_string(),
+        network: transaction.qtm.net_work.to_string(),
+    };
+
     let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
-        qtm: qtm_frame(QtmResponse {
-            commitment: hex::encode(transaction.qtm.commitment),
-            coordinate: hex::encode(transaction.qtm.coordinate),
-            sigma: transaction.qtm.sigma.to_string(),
-            network: transaction.qtm.net_work.to_string(),
-        }),
+        qtm: qtm_frame(qtm.clone()),
         constant: "exile".to_string(),
         constant_delta: constant_delta.to_string(),
     };
@@ -2554,12 +2561,11 @@ async fn handle_receive_wallet(
         &ReceiveResponse {
             frame: QuantumTransactionFrame {
                 quantum_transaction: transaction_response,
-                event: event_map_response(payload),
+                event: event_map_response(payload, qtm),
             },
         },
     )
 }
-
 /// POST /wallets/:name/exile
 fn handle_exile_wallet(name: String) -> HttpResponse {
 let lock = substrate_lock(&name);
