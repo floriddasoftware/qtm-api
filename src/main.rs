@@ -2177,96 +2177,112 @@ json_response(StatusCode::OK, &direction_response(event_payload, Some(selection)
 }
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
-let body: ReceiveRequest = match parse_json_body(req).await {
-Ok(b) => b,
-Err(e) => return e,
-};
-let lock = substrate_lock(&name);
-let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-if let Err(e) = ensure_existing_substrate(&name) {
-return e;
-}
-if body.amount == 0 {
-return error(StatusCode::BAD_REQUEST, "amount must be greater than zero");
-}
-let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
-"receive" => Flow::Receive,
-"change" => Flow::Change,
-_ => return error(StatusCode::BAD_REQUEST, "flow must be receive or change"),
-};
-let transaction = match guarded("receive", || QuantumTransaction::send(&name, body.amount)) {
-Ok(tx) => tx,
-Err(e) => return e,
-};
-let transaction_response = QuantumTransactionResponse {
-amount: transaction.amount,
-qtm: qtm_frame(QtmResponse {
-commitment: hex::encode(transaction.qtm.commitment),
-coordinate: hex::encode(transaction.qtm.coordinate),
-sigma: transaction.qtm.sigma.to_string(),
-network: transaction.qtm.net_work.to_string(),
-}),
-constant: match &transaction.constant {
-qp_hd::PersistedEvent::Transit(..) => "transit".to_string(),
-qp_hd::PersistedEvent::Exile(..) => "exile".to_string(),
-},
-};
-let event = match guarded("receive", || transaction.receive(&name, flow)) {
-Ok(ev) => ev,
-Err(e) => return e,
-};
-let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
-json_response(
-StatusCode::OK,
-&ReceiveResponse {
-frame: QuantumTransactionFrame {
-quantum_transaction: transaction_response,
-event: event_map_response(payload),
-},
-},
-)
-}
-/// GET /wallets/:name/exile/depth
-fn handle_exile_depth(name: String) -> HttpResponse {
-let lock = substrate_lock(&name);
-let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-let substrate_path = match ensure_existing_substrate(&name) {
-Ok(p) => p,
-Err(e) => return e,
-};
-let record_path = match latest_record_path(&substrate_path, "exile") {
-Ok(rp) => rp,
-Err(e) => return e,
-};
-if record_path.join("depth.path").is_file() && record_path.join("depth.objects").is_file() {
-return match read_persisted_depth(&record_path) {
-Ok(d) => json_response(StatusCode::OK, &d),
-Err(e) => e,
-};
-}
-let entries = match std::fs::read_dir(&record_path) {
-Ok(e) => e,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read exile record: {e}")),
-};
-let mut payload_directories = Vec::new();
-for entry in entries {
-let entry = match entry {
-Ok(e) => e,
-Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read exile entry: {e}")),
-};
-let payload = entry.path().join("payload");
-if payload.join("depth.path").is_file() && payload.join("depth.objects").is_file() {
-payload_directories.push(payload);
-}
-}
-payload_directories.sort();
-let Some(payload_path) = payload_directories.into_iter().next() else {
-return error(StatusCode::NOT_FOUND, format!("no persisted exile depth exists for substrate: {name}"));
-};
-match read_persisted_depth(&payload_path) {
-Ok(d) => json_response(StatusCode::OK, &d),
-Err(e) => e,
-}
+    let body: ReceiveRequest = match parse_json_body(req).await {
+        Ok(body) => body,
+        Err(e) => return e,
+    };
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    if body.amount == 0 || body.ordinal == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "amount and ordinal must be greater than zero",
+        );
+    }
+
+    let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
+        "receive" => Flow::Receive,
+        "change" => Flow::Change,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "flow must be receive or change",
+            );
+        }
+    };
+
+    let max_events = match registered_networks().networks.iter().try_fold(
+        0u64,
+        |max, network| {
+            load_network_budget(&substrate_path, body.amount, &network.id)
+                .map(|budget| max.max(budget.map_or(0, |b| b.max_events)))
+        },
+    ) {
+        Ok(max) => max,
+        Err(e) => return e,
+    };
+
+    let limit = body.amount.min(max_events);
+
+    if body.ordinal > limit {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("ordinal exceeds receive budget: maximum={limit}"),
+        );
+    }
+
+    let transaction = match guarded("receive", || {
+        QuantumTransaction::send(&name, body.ordinal)
+    }) {
+        Ok(tx) => tx,
+        Err(e) => return e,
+    };
+
+    let transaction_response = QuantumTransactionResponse {
+        amount: transaction.amount,
+        qtm: qtm_frame(QtmResponse {
+            commitment: hex::encode(transaction.qtm.commitment),
+            coordinate: hex::encode(transaction.qtm.coordinate),
+            sigma: transaction.qtm.sigma.to_string(),
+            network: transaction.qtm.net_work.to_string(),
+        }),
+        constant: match &transaction.constant {
+            qp_hd::PersistedEvent::Transit(..) => "transit".to_string(),
+            qp_hd::PersistedEvent::Exile(..) => "exile".to_string(),
+        },
+    };
+
+    let event = match flow {
+        Flow::Receive => {
+            match guarded("receive", || {
+                transaction.receive(&name, Flow::Receive)
+            }) {
+                Ok(event) => event,
+                Err(e) => return e,
+            }
+        }
+        Flow::Change => {
+            match guarded("change", || {
+                transaction.receive(&name, Flow::Change)
+            }) {
+                Ok(event) => event,
+                Err(e) => return e,
+            }
+        }
+    };
+
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
+
+    json_response(
+        StatusCode::OK,
+        &ReceiveResponse {
+            frame: QuantumTransactionFrame {
+                quantum_transaction: transaction_response,
+                event: event_map_response(payload),
+            },
+        },
+    )
 }
 /// POST /wallets/:name/exile
 fn handle_exile_wallet(name: String) -> HttpResponse {
