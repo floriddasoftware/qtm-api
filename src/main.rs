@@ -48,6 +48,9 @@ use bit_miner::{
     bitcoinpsbt::{PrevoutResolver, ResolvedPrevout},
     broadcast::WirePacket,
     observestream::decode_wirepackets,
+    Authorization,
+    AuthorizationState,
+    SettlementState,
 };
 #[cfg(feature = "bit-miner")]
 use qp_hd::protocol_id::LockedStructure;
@@ -2698,7 +2701,7 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         return error(StatusCode::BAD_REQUEST, "invalid network identifier");
     }
 
-    let network = match selected_network(network_id) {
+    if let network = match selected_network(network_id) {
         Some(network) => network,
         None => {
             return error(StatusCode::BAD_REQUEST, format!("network is not registered: {network_id}"));
