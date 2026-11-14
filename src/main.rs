@@ -3098,8 +3098,11 @@ match (method, segments.as_slice()) {
 (Method::GET, ["wallets"]) => handle_list_wallets(),
 (Method::HEAD, ["wallets"]) => handle_head_wallets(),
 (Method::POST, ["wallets"]) => handle_create_wallet(req).await,
-(Method::GET, ["wallets", name]) => handle_open_wallet((*name).to_string()),
-(Method::GET, ["wallets", name, "events"]) => handle_list_events((*name).to_string()),
+(Method::GET, ["wallets", name, "activations", act, "open"]) => match parse_u64_param(act, "activation") {
+Ok(a) => handle_open_wallet((*name).to_string(), a),
+Err(e) => e,
+},
+(Method::GET, ["wallets", name, "events"]) => error(StatusCode::NOT_IMPLEMENTED, format!("event listing is not implemented for substrate: {name}")),
 (Method::GET, ["wallets", name, "events", record, "payloads"]) => {
 handle_list_event_payloads((*name).to_string(), (*record).to_string())
 }
@@ -3161,7 +3164,7 @@ Err(e) => e,
 }
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "payload-board"]) => {
 match parse_u64_param(act, "activation") {
-Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (net).to_string()).await,
+Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (*net).to_string()).await,
 Err(e) => e,
 }
 }
