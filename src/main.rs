@@ -49,6 +49,8 @@ use bit_miner::{
     broadcast::WirePacket,
     observestream::decode_wirepackets,
 };
+#[cfg(feature = "bit-miner")]
+use qp_hd::protocol_id::LockedStructure;
 
 const DOMAIN_SIZE: u16 = 2048;
 const NUM_INDICES: usize = 12;
@@ -872,98 +874,316 @@ fn submission_directory(name: &str, activation: u64, submission: u64) -> PathBuf
         .join(submission.to_string())
 }
 
+
 #[cfg(feature = "bit-miner")]
-async fn handle_derive_submission(name: String, activation: u64, submission: u64, req: Request<Incoming>) -> HttpResponse {
+fn authorization_directory(
+    name: &str,
+    activation: u64,
+    submission: u64,
+    network: &str,
+) -> PathBuf {
+    submission_directory(name, activation, submission)
+        .join(network)
+        .join("authorization")
+}
+
+#[cfg(feature = "bit-miner")]
+fn authorization_state_name(state: AuthorizationState) -> &'static str {
+    match state {
+        AuthorizationState::Unauthorized => "unauthorized",
+        AuthorizationState::Authorized => "authorized",
+        AuthorizationState::Spent => "spent",
+        AuthorizationState::Invalidated => "invalidated",
+    }
+}
+
+#[cfg(feature = "bit-miner")]
+fn settlement_state_name(state: SettlementState) -> &'static str {
+    match state {
+        SettlementState::Pending => "pending",
+        SettlementState::Success => "success",
+        SettlementState::Failed => "failed",
+    }
+}
+
+#[cfg(feature = "bit-miner")]
+fn persist_authorization(
+    directory: &FsPath,
+    authorization: &Authorization,
+    authorization_state: AuthorizationState,
+    settlement_state: SettlementState,
+) -> ApiResult<()> {
+    std::fs::create_dir_all(directory).map_err(|e| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to create authorization directory: {e}"),
+        )
+    })?;
+
+    let values = [
+        ("commitment", hex::encode(authorization.commitment)),
+        ("activation", authorization.activation.to_string()),
+        ("dimension", authorization.locked.dimension.to_string()),
+        (
+            "structural_value",
+            authorization.locked.structural_value.to_string(),
+        ),
+        (
+            "state",
+            authorization_state_name(authorization_state).to_string(),
+        ),
+        (
+            "settlement.state",
+            settlement_state_name(settlement_state).to_string(),
+        ),
+    ];
+
+    for (filename, value) in values {
+        write_atomic(&directory.join(filename), value.as_bytes())?;
+    }
+    Ok(())
+}
+
+
+#[cfg(feature = "bit-miner")]
+async fn handle_derive_submission(
+    name: String,
+    activation: u64,
+    submission: u64,
+    req: Request<Incoming>,
+) -> HttpResponse {
     let body: SubmissionDerivationRequest = match parse_json_body(req).await {
         Ok(body) => body,
         Err(e) => return e,
     };
-    if submission == 0 {
-        return error(StatusCode::BAD_REQUEST, "submission must be greater than zero");
+
+    if activation == 0 || submission == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "activation and submission must be greater than zero",
+        );
     }
+
     let network_id = body.network.trim();
+
     if !valid_observation_network_id(network_id) {
         return error(StatusCode::BAD_REQUEST, "invalid network identifier");
     }
+
     let network = match selected_network(network_id) {
         Some(network) if is_bitcoin_network_id(network_id) => network,
-        Some(_) => return error(StatusCode::BAD_REQUEST, "submission derivation currently requires a Bitcoin network"),
-        None => return error(StatusCode::BAD_REQUEST, format!("network is not registered: {network_id}")),
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "submission derivation currently requires a Bitcoin network",
+            );
+        }
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("network is not registered: {network_id}"),
+            );
+        }
     };
+
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
     if let Err(e) = ensure_existing_substrate(&name) {
         return e;
     }
-    let persisted = match guarded("submission QTM lookup", || commands::load_event_at_activation(&name, submission)) {
+
+    let persisted = match guarded(
+        "submission QTM lookup",
+        || commands::load_event_at_activation(&name, submission),
+    ) {
         Ok(event) => event,
         Err(e) => return e,
     };
-    let (coordinate, commitment, qtm_activation) = match persisted {
-        qp_hd::PersistedEvent::Transit(event) => (event.qtm.coordinate, event.qtm.commitment, event.heritage.state.activations()),
-        qp_hd::PersistedEvent::Exile(event) => (event.qtm.coordinate, event.qtm.commitment, event.heritage.state.activations()),
+
+    let (coordinate, commitment, qtm_activation, locked) = match persisted {
+        qp_hd::PersistedEvent::Transit(event) => {
+            let state = &event.heritage.state;
+
+            (
+                event.qtm.coordinate,
+                event.qtm.commitment,
+                state.activations(),
+                LockedStructure {
+                    dimension: state.dimension(),
+                    structural_value: state.structural_value(),
+                },
+            )
+        }
+        qp_hd::PersistedEvent::Exile(event) => {
+            let state = &event.heritage.state;
+
+            (
+                event.qtm.coordinate,
+                event.qtm.commitment,
+                state.activations(),
+                LockedStructure {
+                    dimension: state.dimension(),
+                    structural_value: state.structural_value(),
+                },
+            )
+        }
     };
-    let keys = match bitblock_qtm_master_keys(coordinate, commitment, qtm_activation, NetworkKind::Main) {
+
+    let authorization = Authorization::new(
+        commitment,
+        qtm_activation,
+        locked,
+    );
+
+    let keys = match bitblock_qtm_master_keys(
+        coordinate,
+        commitment,
+        qtm_activation,
+        NetworkKind::Main,
+    ) {
         Ok(keys) => keys,
-        Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, format!("extended-key derivation failed: {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("extended-key derivation failed: {e}"),
+            );
+        }
     };
-    let private_key = match bitblock_derive_qtm_child(coordinate, commitment, qtm_activation, &network.path, NetworkKind::Main) {
+
+    let private_key = match bitblock_derive_qtm_child(
+        coordinate,
+        commitment,
+        qtm_activation,
+        &network.path,
+        NetworkKind::Main,
+    ) {
         Ok(key) => key,
-        Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, format!("submission child derivation failed: {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("submission child derivation failed: {e}"),
+            );
+        }
     };
+
     let script = match network.purpose {
         44 => bitblock_p2pkh_script(private_key),
         84 => bitblock_p2wpkh_script(private_key),
-        purpose => return error(StatusCode::BAD_REQUEST, format!("unsupported Bitcoin script purpose: {purpose}")),
+        purpose => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported Bitcoin script purpose: {purpose}"),
+            );
+        }
     };
+
     let script = match script {
         Ok(script) => script,
-        Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, format!("scriptPubKey derivation failed: {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("scriptPubKey derivation failed: {e}"),
+            );
+        }
     };
+
     let address = match network.purpose {
-        44 => bitblock_qtm_bip44_address(coordinate, commitment, qtm_activation, &network.path),
-        84 => bitblock_qtm_bip84_address(coordinate, commitment, qtm_activation, &network.path),
+        44 => bitblock_qtm_bip44_address(
+            coordinate,
+            commitment,
+            qtm_activation,
+            &network.path,
+        ),
+        84 => bitblock_qtm_bip84_address(
+            coordinate,
+            commitment,
+            qtm_activation,
+            &network.path,
+        ),
         _ => unreachable!(),
     };
+
     let address = match address {
         Ok(address) => address.to_string(),
-        Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, format!("address derivation failed: {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("address derivation failed: {e}"),
+            );
+        }
     };
-    let scriptpubkey = hex::encode(script.as_bytes());
-    let directory = submission_directory(&name, activation, submission).join(network_id);
+
+    let directory =
+        submission_directory(&name, activation, submission).join(network_id);
+
     if let Err(e) = std::fs::create_dir_all(&directory) {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to create submission directory {}: {e}", directory.display()));
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "unable to create submission directory {}: {e}",
+                directory.display()
+            ),
+        );
     }
+
     let persisted_values = [
         ("network", network_id.to_string()),
         ("qtm.activation", qtm_activation.to_string()),
         ("derivation.path", network.path.clone()),
         ("fingerprint", keys.fingerprint),
-        ("scriptpubkey", scriptpubkey),
+        ("scriptpubkey", hex::encode(script.as_bytes())),
         ("xpriv", keys.xpriv),
         ("xpub", keys.xpub),
         ("zpub", keys.zpub),
         ("address", address),
     ];
+
     for (filename, value) in persisted_values {
         if let Err(e) = write_atomic(&directory.join(filename), value.as_bytes()) {
             return e;
         }
     }
-    json_response(StatusCode::CREATED, &SubmissionDerivationResponse {
-        substrate: name,
-        activation,
-        submission,
-        qtm_activation,
-        network: network_id.to_string(),
-        derivation_path: network.path,
-        directory: directory.display().to_string(),
-        scriptpubkey: "scriptpubkey".to_string(),
-        xpriv: "xpriv".to_string(),
-        xpub: "xpub".to_string(),
-        zpub: "zpub".to_string(),
-        address: "address".to_string(),
-    })
+
+    let auth_directory =
+        authorization_directory(&name, activation, submission, network_id);
+
+    if let Err(e) = persist_authorization(
+        &auth_directory,
+        &authorization,
+        AuthorizationState::Authorized,
+        SettlementState::Pending,
+    ) {
+        return e;
+    }
+
+    json_response(
+        StatusCode::CREATED,
+        &json!({
+            "substrate": name,
+            "activation": activation,
+            "submission": submission,
+            "commitment": hex::encode(commitment),
+            "qtm_activation": qtm_activation,
+            "network": network_id,
+            "authorization_state": "authorized",
+            "settlement_state": "pending",
+            "authorization": {
+                "commitment": hex::encode(authorization.commitment),
+                "activation": authorization.activation,
+                "dimension": authorization.locked.dimension,
+                "structural_value": authorization.locked.structural_value,
+            },
+            "request": null,
+            "derivation_path": network.path,
+            "directory": directory.display().to_string(),
+            "scriptpubkey": "scriptpubkey",
+            "xpriv": "xpriv",
+            "xpub": "xpub",
+            "zpub": "zpub",
+            "address": "address",
+        }),
+    )
 }
 
 #[cfg(feature = "bit-miner")]
