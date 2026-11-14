@@ -1,6 +1,8 @@
+
 use bit_miner::{
     bitcoinpayload::BitcoinPayload,
     sharedtypes::{
+        Authorization,
         AuthorizationState,
         SettlementRequest,
         SettlementState,
@@ -19,9 +21,32 @@ pub enum PayloadKind {
 }
 
 pub struct AuthorizedPayload {
-    pub request: SettlementRequest,
+    pub authorization: Authorization,
+    pub request: Option<SettlementRequest>,
     pub authorization_state: AuthorizationState,
     pub settlement_state: SettlementState,
+}
+
+impl AuthorizedPayload {
+    #[inline(always)]
+    pub fn new(authorization: Authorization) -> Self {
+        Self {
+            authorization,
+            request: None,
+            authorization_state: AuthorizationState::Authorized,
+            settlement_state: SettlementState::Pending,
+        }
+    }
+
+    #[inline(always)]
+    pub fn carried(&self) -> bool {
+        self.request.is_some()
+    }
+
+    #[inline(always)]
+    pub fn attach_request(&mut self, request: SettlementRequest) {
+        self.request = Some(request);
+    }
 }
 
 /// Owns the authentic event direction and its associated depth.
