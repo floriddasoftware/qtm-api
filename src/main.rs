@@ -3274,6 +3274,15 @@ Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (*net).to_
 Err(e) => e,
 }
 }
+
+#[cfg(feature = "bit-miner")]
+(Method::POST, ["wallets", name, "activations", act, "submissions", sub, "derive"]) => {
+    match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
+        (Ok(a), Ok(s)) => handle_derive_submission((*name).to_string(), a, s, req).await,
+        (Err(e), _) | (_, Err(e)) => e,
+    }
+}
+
 #[cfg(feature = "bit-miner")]
 (Method::GET, [
     "wallets",
