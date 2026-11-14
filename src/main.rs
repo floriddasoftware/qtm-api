@@ -2067,261 +2067,90 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
     }
 }
 
-fn handle_open_wallet(name: String) -> HttpResponse {
+
+fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
+    if activation == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "open activation ordinal must be greater than zero",
+        );
+    }
+
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    let substrate_path = match ensure_existing_substrate(&name) {
+    let _substrate_path = match ensure_existing_substrate(&name) {
         Ok(path) => path,
         Err(e) => return e,
     };
 
-    let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
-        Ok(activation) => activation,
+    // Resolve only the UI-selected ordinal. Do not substitute the
+    // substrate's current activation.
+    let record_path = if let Some(path) =
+        commands::exile_path_at_activation(&name, activation)
+    {
+        path
+    } else if let Some(path) =
+        commands::event_path_at_activation(&name, activation)
+    {
+        path
+    } else {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no persisted transit or exile event at selected ordinal {activation}"
+            ),
+        );
+    };
+
+    let record = record_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Load the exact selected event. This supports both persisted
+    // transit and exile records without executing another transition.
+    let persisted = match guarded(
+        "selected ordinal event load",
+        || commands::load_event_at_activation(&name, activation),
+    ) {
+        Ok(event) => event,
         Err(e) => return e,
     };
 
-    let (record, heritage, qtm, depth) = if let Some(exile_path) = commands::exile_path_at_activation(&name, activation) {
-        let persisted = match guarded("persisted exile load", || commands::load_event_at_activation(&name, activation)) {
-            Ok(event) => event,
-            Err(e) => return e,
-        };
-
-        match persisted {
-            qp_hd::PersistedEvent::Exile(event) => {
-                let record = exile_path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
-                (record, event.heritage, event.qtm, event.depth)
-            }
-            qp_hd::PersistedEvent::Transit(_) => {
-                return error(
-                    StatusCode::CONFLICT,
-                    format!("persisted exile path resolves to transit at activation {activation}"),
-                );
-            }
+    let (heritage, depth) = match persisted {
+        qp_hd::PersistedEvent::Transit(event) => {
+            (event.heritage, event.depth)
         }
-    } else {
-        let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                format!("no available transit or exile event at activation {activation}"),
-            );
-        };
-
-        let entries = match std::fs::read_dir(&transit_path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit payloads: {e}"));
-            }
-        };
-
-        let mut network_ids = Vec::new();
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit network: {e}"));
-                }
-            };
-
-            let network_path = entry.path();
-
-            if !network_path.is_dir() {
-                continue;
-            }
-
-            let payload_path = network_path.join("payload");
-
-            if payload_path.join("depth.path").is_file() && payload_path.join("depth.objects").is_file() {
-                network_ids.push(entry.file_name().to_string_lossy().to_string());
-            }
+        qp_hd::PersistedEvent::Exile(event) => {
+            (event.heritage, event.depth)
         }
-
-        network_ids.sort();
-        network_ids.dedup();
-
-        let event = match guarded("open exile", || commands::qtm_exile(&name)) {
-            Ok(event) => event,
-            Err(e) => return e,
-        };
-
-        let resulting_activation = event.heritage.state.activations();
-        let dimension = event.heritage.state.dimension();
-
-        let record_path = match canonical_record_path(&substrate_path, "exile", resulting_activation, u128::from(dimension)) {
-            Ok(path) => path,
-            Err(e) => return e,
-        };
-
-        for network_id in &network_ids {
-            if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
-                return e;
-            }
-        }
-
-        let record = record_path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
-
-        (record, event.heritage, event.qtm, event.depth)
     };
+
+    let payload = EventPayload::from_heritage(
+        heritage,
+        depth,
+        Scale::Local,
+    );
+
+    let event = Some(payload_event_view(record, &payload));
 
     let substrate = match substrate_json(&name) {
         Ok(substrate) => substrate,
         Err(e) => return e,
     };
 
-    let payload = EventPayload::from_heritage(heritage, depth, Scale::Local);
-    let event = Some(payload_event_view(record, &payload));
-
-    json_response(StatusCode::OK, &OpenResponse { substrate, event })
-}
-
-fn handle_list_events(name: String) -> HttpResponse {
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-    let substrate_path = match ensure_existing_substrate(&name) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-
-    let events_path = substrate_path.join("events");
-    let mut events = Vec::new();
-
-    if events_path.is_dir() {
-        let entries = match std::fs::read_dir(&events_path) {
-            Ok(entries) => entries,
-            Err(err) => {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to list events: {err}"));
-            }
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read event entry: {err}"));
-                }
-            };
-
-            let record_path = entry.path();
-
-            if !record_path.is_dir() {
-                continue;
-            }
-
-            let record = entry.file_name().to_string_lossy().to_string();
-
-            let kind = if record.starts_with("exile_") {
-                "exile"
-            } else if record.starts_with("event_") {
-                "transit"
-            } else {
-                continue;
-            };
-
-            let read_persisted = |field: &str| -> ApiResult<String> {
-                read_trim(&record_path.join(field)).ok_or_else(|| {
-                    error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("missing persisted event field: record={} field={}", record, field),
-                    )
-                })
-            };
-
-            let activation = match read_persisted("manifold.activations") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let activation_number = match activation.parse::<u64>() {
-                Ok(value) => value,
-                Err(_) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("invalid persisted activation: record={} activation={}", record, activation),
-                    );
-                }
-            };
-
-            let dimension = match read_persisted("manifold.dimension") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let structural_value = match read_persisted("manifold.structural_value") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let retained_mass = match read_persisted("manifold.retained_mass") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let delta = match read_persisted("transition.delta") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let tau = match read_persisted("transition.tau") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let gross_work = match read_persisted("transition.gross_work") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let net_work = match read_persisted("transition.net_work") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let commitment = match read_persisted("qtm.commitment") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let coordinate = match read_persisted("qtm.coordinate") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-            let depth_contents = match read_persisted("depth.objects") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let depth_objects = depth_contents.lines().filter(|line| !line.trim().is_empty()).count();
-
-            events.push((
-                activation_number,
-                PersistedEventSummary {
-                    kind: kind.to_string(),
-                    record,
-                    activation,
-                    dimension,
-                    structural_value,
-                    depth_objects,
-                    retained_mass,
-                    delta,
-                    tau,
-                    gross_work,
-                    net_work,
-                    commitment,
-                    coordinate,
-                },
-            ));
-        }
-    }
-
-    events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.record.cmp(&b.1.record)));
-
-    let events = events.into_iter().map(|(_, event)| event).collect();
-
     json_response(
         StatusCode::OK,
-        &EventStoreResponse {
-            substrate: name,
-            directory: substrate_path.display().to_string(),
-            events_directory: events_path.display().to_string(),
-            events,
-            runtime: serialize_runtime(SystemTime::now()),
+        &OpenResponse {
+            substrate,
+            event,
         },
     )
 }
+
+
 fn handle_list_event_payloads(name: String, record: String) -> HttpResponse {
 let lock = substrate_lock(&name);
 let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
