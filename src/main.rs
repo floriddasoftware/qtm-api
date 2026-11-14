@@ -1026,9 +1026,18 @@ async fn handle_derive_submission(
     let scriptpubkey = hex::encode(script.as_bytes());
 
     // Persist under the requested activation and selected submission ordinal.
-    let directory = submission_directory(&name, activation, submission);
-    let network_file = directory.join("network");
+    let directory = submission_directory(&name, activation, submission)
+    .join(network_id);
 
+if let Err(e) = std::fs::create_dir_all(&directory) {
+    return error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "unable to create submission directory {}: {e}",
+            directory.display()
+        ),
+    );
+}
     // A submission directory represents one selected network.
     // Never silently overwrite its derivation with another network.
     if let Some(existing_network) = read_trim(&network_file) {
@@ -1054,16 +1063,17 @@ async fn handle_derive_submission(
         );
     }
 
-    let persisted_values = [
-        ("network", network_id.to_string()),
-        ("qtm.activation", qtm_activation.to_string()),
-        ("derivation.path", network.path.clone()),
-        ("scriptpubkey", scriptpubkey),
-        ("xpriv", keys.xpriv),
-        ("xpub", keys.xpub),
-        ("zpub", keys.zpub),
-        ("address", address),
-    ];
+        let persisted_values = [
+    ("network", network_id.to_string()),
+    ("qtm.activation", qtm_activation.to_string()),
+    ("derivation.path", network.path.clone()),
+    ("fingerprint", keys.fingerprint),
+    ("scriptpubkey", scriptpubkey),
+    ("xpriv", keys.xpriv),
+    ("xpub", keys.xpub),
+    ("zpub", keys.zpub),
+    ("address", address),
+];
 
     for (filename, value) in persisted_values {
         if let Err(e) = write_atomic(&directory.join(filename), value.as_bytes()) {
@@ -1091,11 +1101,34 @@ async fn handle_derive_submission(
 }
 
 #[cfg(feature = "bit-miner")]
-fn handle_get_submission_value(name: String, activation: u64, submission: u64, field: String) -> HttpResponse {
-    const FIELDS: [&str; 5] = ["scriptpubkey", "xpriv", "xpub", "zpub", "address"];
+fn handle_get_submission_value(
+    name: String,
+    activation: u64,
+    submission: u64,
+    network: String,
+    field: String,
+) -> HttpResponse {
+    const FIELDS: [&str; 6] = [
+        "fingerprint",
+        "scriptpubkey",
+        "xpriv",
+        "xpub",
+        "zpub",
+        "address",
+    ];
 
     if !FIELDS.contains(&field.as_str()) {
-        return error(StatusCode::BAD_REQUEST, format!("unsupported submission value: {field}"));
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported submission value: {field}"),
+        );
+    }
+
+    if !valid_observation_network_id(&network) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier",
+        );
     }
 
     let lock = substrate_lock(&name);
@@ -1105,33 +1138,56 @@ fn handle_get_submission_value(name: String, activation: u64, submission: u64, f
         return e;
     }
 
-    let directory = submission_directory(&name, activation, submission);
+    let base = submission_directory(&name, activation, submission);
+    let network_directory = base.join(&network);
 
-    if !directory.join("network").is_file() {
+    let directory = if network_directory.join("network").is_file() {
+        network_directory
+    } else if base.join("network").is_file()
+        && read_trim(&base.join("network")).as_deref()
+            == Some(network.as_str())
+    {
+        base
+    } else {
         return error(
             StatusCode::NOT_FOUND,
-            format!("submission derivation not found: activation={} submission={}", activation, submission),
+            format!(
+                "submission derivation not found: activation={} submission={} network={}",
+                activation, submission, network
+            ),
         );
-    }
+    };
 
-    let path = directory.join(&field);
-
-    let value = match read_trim(&path) {
+    let value = match read_trim(&directory.join(&field)) {
         Some(value) if !value.is_empty() => value,
         _ => {
-            return error(StatusCode::NOT_FOUND, format!("submission value has not been derived: {}", field));
+            return error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "submission value has not been derived: {}",
+                    field
+                ),
+            );
         }
     };
 
-    let mut response = bytes_response(StatusCode::OK, "text/plain; charset=utf-8", value);
+    let mut response = bytes_response(
+        StatusCode::OK,
+        "text/plain; charset=utf-8",
+        value,
+    );
 
-    // Prevent browser and intermediary caching of key material.
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate"));
-    response.headers_mut().insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    response.headers_mut().insert(
+        header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
 
     response
 }
-
 fn scale_name(scale: Scale) -> &'static str {
 match scale {
 Scale::Minimal => "Minimal",
@@ -3360,16 +3416,31 @@ match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
 }
 }
 #[cfg(feature = "bit-miner")]
-(Method::GET, ["wallets", name, "activations", act, "submissions", sub, field]) => {
-match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
-(Ok(a), Ok(s)) => handle_get_submission_value((*name).to_string(), a, s, (*field).to_string()),
-(Err(e), _) | (_, Err(e)) => e,
+(Method::GET, [
+    "wallets",
+    name,
+    "activations",
+    act,
+    "submissions",
+    sub,
+    "networks",
+    net,
+    field,
+]) => {
+    match (
+        parse_u64_param(act, "activation"),
+        parse_u64_param(sub, "submission"),
+    ) {
+        (Ok(a), Ok(s)) => handle_get_submission_value(
+            (*name).to_string(),
+            a,
+            s,
+            (*net).to_string(),
+            (*field).to_string(),
+        ),
+        (Err(e), _) | (_, Err(e)) => e,
+    }
 }
-}
-_ => error(StatusCode::NOT_FOUND, format!("route not found: {raw_path}")),
-}
-}
-
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
