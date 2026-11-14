@@ -2701,7 +2701,7 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         return error(StatusCode::BAD_REQUEST, "invalid network identifier");
     }
 
-    if let network = match selected_network(network_id) {
+    let network = match selected_network(network_id) {
         Some(network) => network,
         None => {
             return error(StatusCode::BAD_REQUEST, format!("network is not registered: {network_id}"));
