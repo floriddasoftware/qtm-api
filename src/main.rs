@@ -3409,13 +3409,6 @@ Err(e) => e,
 }
 }
 #[cfg(feature = "bit-miner")]
-(Method::POST, ["wallets", name, "activations", act, "submissions", sub, "derive"]) => {
-match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
-(Ok(a), Ok(s)) => handle_derive_submission((*name).to_string(), a, s, req).await,
-(Err(e), _) | (_, Err(e)) => e,
-}
-}
-#[cfg(feature = "bit-miner")]
 (Method::GET, [
     "wallets",
     name,
@@ -3441,6 +3434,11 @@ match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
         (Err(e), _) | (_, Err(e)) => e,
     }
 }
+_ => error(StatusCode::NOT_FOUND, "route not found"),
+}
+}
+
+
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
