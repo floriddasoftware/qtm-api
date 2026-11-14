@@ -36,24 +36,10 @@ process::{Child, Command},
 sync::Mutex as AsyncMutex,
 };
 
-
 #[cfg(feature = "bit-miner")]
 use bitcoin::{
-    bip32::{
-        DerivationPath,
-        Fingerprint,
-        Xpriv,
-        Xpub,
-    },
-    Address as BitcoinAddress,
-    Amount,
-    NetworkKind,
-    OutPoint,
-    PublicKey,
-    ScriptBuf,
-    TxOut,
-    WPubkeyHash,
-    Witness,
+    bip32::{DerivationPath, Fingerprint, Xpriv, Xpub},
+    Address as BitcoinAddress, Amount, NetworkKind, OutPoint, PublicKey, ScriptBuf, TxOut, WPubkeyHash, Witness,
 };
 
 #[cfg(feature = "bit-miner")]
@@ -290,6 +276,27 @@ struct ReceiveRequest {
 }
 
 #[derive(Deserialize)]
+struct SubmissionDerivationRequest {
+    network: String,
+}
+
+#[derive(Serialize)]
+struct SubmissionDerivationResponse {
+    substrate: String,
+    activation: u64,
+    submission: u64,
+    qtm_activation: u64,
+    network: String,
+    derivation_path: String,
+    directory: String,
+    scriptpubkey: String,
+    xpriv: String,
+    xpub: String,
+    zpub: String,
+    address: String,
+}
+
+#[derive(Deserialize)]
 struct BudgetRequest {
 min_events: u64,
 max_events: u64,
@@ -478,35 +485,16 @@ pipelines: Vec<BitMinerProcessEntry>,
 
 fn attach_cors(res: &mut HttpResponse) {
     let headers = res.headers_mut();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, HEAD, POST, PUT, DELETE, OPTIONS"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Accept, Content-Type, Authorization"),
-    );
-    headers.insert(
-        header::ACCESS_CONTROL_MAX_AGE,
-        HeaderValue::from_static("600"),
-    );
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, HEAD, POST, PUT, DELETE, OPTIONS"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Accept, Content-Type, Authorization"));
+    headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
 }
 
-fn bytes_response(
-    status: StatusCode,
-    content_type: &'static str,
-    body: impl Into<Bytes>,
-) -> HttpResponse {
+fn bytes_response(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> HttpResponse {
     let mut res = Response::new(Full::new(body.into()));
     *res.status_mut() = status;
-    res.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type),
-    );
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     attach_cors(&mut res);
     res
 }
@@ -541,17 +529,12 @@ raw.parse::<u64>()
 }
 // ---------- Synchronization & Core Substrate Helpers ----------
 
-static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    OnceLock::new();
+static SUBSTRATE_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn substrate_lock(name: &str) -> Arc<Mutex<()>> {
     let registry = SUBSTRATE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    Arc::clone(
-        registry
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(()))),
-    )
+    Arc::clone(registry.entry(name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
 }
 
 fn guarded<T>(label: &str, operation: impl FnOnce() -> T) -> ApiResult<T> {
@@ -562,25 +545,17 @@ fn guarded<T>(label: &str, operation: impl FnOnce() -> T) -> ApiResult<T> {
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown failure".to_string());
 
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{label} failed in qp_hd: {detail}"),
-        )
+        error(StatusCode::INTERNAL_SERVER_ERROR, format!("{label} failed in qp_hd: {detail}"))
     })
 }
 
 fn read_trim(path: &FsPath) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|value| value.trim().to_string())
+    std::fs::read_to_string(path).ok().map(|value| value.trim().to_string())
 }
 
 fn required_file(path: &FsPath) -> ApiResult<String> {
     read_trim(path).ok_or_else(|| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to read substrate file: {}", path.display()),
-        )
+        error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read substrate file: {}", path.display()))
     })
 }
 
@@ -589,9 +564,7 @@ fn valid_substrate_name(name: &str) -> bool {
         && name.len() <= MAX_SUBSTRATE_NAME_LENGTH
         && name != "."
         && name != ".."
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn valid_observation_network_id(network: &str) -> bool {
@@ -599,18 +572,12 @@ fn valid_observation_network_id(network: &str) -> bool {
         && network.len() <= 64
         && network != "."
         && network != ".."
-        && network
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && network.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn is_bitcoin_network_id(network: &str) -> bool {
     let lower = network.trim().to_ascii_lowercase();
-
-    matches!(
-        lower.as_str(),
-        "bitcoin-legacy" | "bitcoin-native-segwit" | "bitcoin" | "btc"
-    ) || lower.contains("bitcoin")
+    matches!(lower.as_str(), "bitcoin-legacy" | "bitcoin-native-segwit" | "bitcoin" | "btc") || lower.contains("bitcoin")
 }
 fn parse_bip39_language(value: &str) -> Result<BIP39Language, String> {
 match value.trim().to_ascii_lowercase().as_str() {
@@ -717,13 +684,7 @@ activations: read_trim(&path.join("activation")).unwrap_or_else(|| "0".to_string
 substrates.sort_by(|a, b| a.name.cmp(&b.name));
 Ok(SubstrateListResponse { substrates })
 }
-fn network_option(
-    id: &str,
-    name: &str,
-    coin: CoinType,
-    purpose: u64,
-    path: &str,
-) -> NetworkOption {
+fn network_option(id: &str, name: &str, coin: CoinType, purpose: u64, path: &str) -> NetworkOption {
     NetworkOption {
         id: id.to_string(),
         name: name.to_string(),
@@ -744,13 +705,7 @@ fn registered_networks() -> NetworkListResponse {
                 CoinType::Tron => "tron",
             };
 
-            network_option(
-                id,
-                coin.name(),
-                *coin,
-                44,
-                PathsRegistry::get_path(*coin),
-            )
+            network_option(id, coin.name(), *coin, 44, PathsRegistry::get_path(*coin))
         })
         .collect::<Vec<_>>();
 
@@ -769,11 +724,8 @@ fn selected_network(id: &str) -> Option<NetworkOption> {
 registered_networks().networks.into_iter().find(|n| n.id == id)
 }
 
-
-
 #[cfg(feature = "bit-miner")]
-type BitBlockResult<T> =
-    Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type BitBlockResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // =============================================================================
 // BITCOIN BITBLOCK DELEGATION
@@ -784,86 +736,37 @@ type BitBlockResult<T> =
 
 #[cfg(feature = "bit-miner")]
 fn bitblock_registered_path(network: &str) -> ApiResult<String> {
-    let selected = selected_network(network)
-        .ok_or_else(|| {
-            error(
-                StatusCode::BAD_REQUEST,
-                format!("network is not registered: {network}"),
-            )
-        })?;
+    let selected = selected_network(network).ok_or_else(|| {
+        error(StatusCode::BAD_REQUEST, format!("network is not registered: {network}"))
+    })?;
 
     if !is_bitcoin_network_id(network) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            format!("network is not a Bitcoin network: {network}"),
-        ));
+        return Err(error(StatusCode::BAD_REQUEST, format!("network is not a Bitcoin network: {network}")));
     }
 
     Ok(selected.path)
 }
 
-// -----------------------------------------------------------------------------
-// EXTENDED KEYS
-// -----------------------------------------------------------------------------
+// ---------------------------- EXTENDED KEYS ----------------------------
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_xpriv(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    network: NetworkKind,
-) -> BitBlockResult<Xpriv> {
-    bit_block::qtm_xpriv(
-        coordinate,
-        commitment,
-        activation,
-        network,
-    )
+fn bitblock_qtm_xpriv(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, network: NetworkKind) -> BitBlockResult<Xpriv> {
+    bit_block::qtm_xpriv(coordinate, commitment, activation, network)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_master_fingerprint(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    network: NetworkKind,
-) -> BitBlockResult<Fingerprint> {
-    bit_block::qtm_master_fingerprint(
-        coordinate,
-        commitment,
-        activation,
-        network,
-    )
+fn bitblock_qtm_master_fingerprint(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, network: NetworkKind) -> BitBlockResult<Fingerprint> {
+    bit_block::qtm_master_fingerprint(coordinate, commitment, activation, network)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_master_xpub(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    network: NetworkKind,
-) -> BitBlockResult<Xpub> {
-    bit_block::qtm_master_xpub(
-        coordinate,
-        commitment,
-        activation,
-        network,
-    )
+fn bitblock_qtm_master_xpub(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, network: NetworkKind) -> BitBlockResult<Xpub> {
+    bit_block::qtm_master_xpub(coordinate, commitment, activation, network)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_master_zpub(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    network: NetworkKind,
-) -> BitBlockResult<String> {
-    bit_block::qtm_master_zpub(
-        coordinate,
-        commitment,
-        activation,
-        network,
-    )
+fn bitblock_qtm_master_zpub(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, network: NetworkKind) -> BitBlockResult<String> {
+    bit_block::qtm_master_zpub(coordinate, commitment, activation, network)
 }
 
 #[cfg(feature = "bit-miner")]
@@ -872,162 +775,305 @@ fn bitblock_xpub_to_zpub(xpub: &Xpub) -> String {
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_master_keys(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    network: NetworkKind,
-) -> BitBlockResult<QtmMasterKeys> {
-    bit_block::qtm_master_keys(
-        coordinate,
-        commitment,
-        activation,
-        network,
-    )
+fn bitblock_qtm_master_keys(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, network: NetworkKind) -> BitBlockResult<QtmMasterKeys> {
+    bit_block::qtm_master_keys(coordinate, commitment, activation, network)
 }
 
-// -----------------------------------------------------------------------------
-// PATH AND CHILD DERIVATION
-// -----------------------------------------------------------------------------
+// ------------------------ PATH AND CHILD DERIVATION ------------------------
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_bip32_path_depth(
-    path: &DerivationPath,
-) -> usize {
+fn bitblock_bip32_path_depth(path: &DerivationPath) -> usize {
     bit_block::bip32_path_depth(path)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_path_depth(
-    activation: u64,
-    path: &DerivationPath,
-) -> BitBlockResult<u8> {
-    bit_block::qtm_path_depth(
-        activation,
-        path,
-    )
+fn bitblock_qtm_path_depth(activation: u64, path: &DerivationPath) -> BitBlockResult<u8> {
+    bit_block::qtm_path_depth(activation, path)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_derive_qtm_child(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    path: &str,
-    network: NetworkKind,
-) -> BitBlockResult<[u8; 32]> {
-    bit_block::derive_qtm_child(
-        coordinate,
-        commitment,
-        activation,
-        path,
-        network,
-    )
+fn bitblock_derive_qtm_child(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, path: &str, network: NetworkKind) -> BitBlockResult<[u8; 32]> {
+    bit_block::derive_qtm_child(coordinate, commitment, activation, path, network)
 }
 
-// -----------------------------------------------------------------------------
-// PUBLIC KEY
-// -----------------------------------------------------------------------------
+// ------------------------------ PUBLIC KEY ------------------------------
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_derive_public_key(
-    private_key: [u8; 32],
-) -> BitBlockResult<(PublicKey, WPubkeyHash)> {
+fn bitblock_derive_public_key(private_key: [u8; 32]) -> BitBlockResult<(PublicKey, WPubkeyHash)> {
     bit_block::derive_public_key(private_key)
 }
 
-// -----------------------------------------------------------------------------
-// SCRIPT PUBKEY
-// -----------------------------------------------------------------------------
+// ----------------------------- SCRIPT PUBKEY -----------------------------
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_p2pkh_script(
-    private_key: [u8; 32],
-) -> BitBlockResult<ScriptBuf> {
+fn bitblock_p2pkh_script(private_key: [u8; 32]) -> BitBlockResult<ScriptBuf> {
     bit_block::p2pkh_script(private_key)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_p2wpkh_script(
-    private_key: [u8; 32],
-) -> BitBlockResult<ScriptBuf> {
+fn bitblock_p2wpkh_script(private_key: [u8; 32]) -> BitBlockResult<ScriptBuf> {
     bit_block::p2wpkh_script(private_key)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_taproot_script(
-    private_key: [u8; 32],
-) -> BitBlockResult<ScriptBuf> {
+fn bitblock_taproot_script(private_key: [u8; 32]) -> BitBlockResult<ScriptBuf> {
     bit_block::taproot_script(private_key)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_derive_script_pubkey(
-    private_key: [u8; 32],
-) -> BitBlockResult<ScriptBuf> {
+fn bitblock_derive_script_pubkey(private_key: [u8; 32]) -> BitBlockResult<ScriptBuf> {
     bit_block::derive_script_pubkey(private_key)
 }
 
-// -----------------------------------------------------------------------------
-// WITNESS
-// -----------------------------------------------------------------------------
+// -------------------------------- WITNESS --------------------------------
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_derive_p2wpkh_witness(
-    private_key: [u8; 32],
-) -> BitBlockResult<Witness> {
+fn bitblock_derive_p2wpkh_witness(private_key: [u8; 32]) -> BitBlockResult<Witness> {
     bit_block::derive_p2wpkh_witness(private_key)
 }
 
-// -----------------------------------------------------------------------------
-// ADDRESSES
-// -----------------------------------------------------------------------------
+// ------------------------------- ADDRESSES -------------------------------
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_p2pkh_address(
-    private_key: [u8; 32],
-) -> BitBlockResult<BitcoinAddress> {
+fn bitblock_p2pkh_address(private_key: [u8; 32]) -> BitBlockResult<BitcoinAddress> {
     bit_block::p2pkh_address(private_key)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_p2wpkh_address(
-    private_key: [u8; 32],
-) -> BitBlockResult<BitcoinAddress> {
+fn bitblock_p2wpkh_address(private_key: [u8; 32]) -> BitBlockResult<BitcoinAddress> {
     bit_block::p2wpkh_address(private_key)
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_bip44_address(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    path: &str,
-) -> BitBlockResult<BitcoinAddress> {
-    bit_block::qtm_bip44_address(
-        coordinate,
-        commitment,
-        activation,
-        path,
+fn bitblock_qtm_bip44_address(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, path: &str) -> BitBlockResult<BitcoinAddress> {
+    bit_block::qtm_bip44_address(coordinate, commitment, activation, path)
+}
+
+#[cfg(feature = "bit-miner")]
+fn bitblock_qtm_bip84_address(coordinate: [u8; 32], commitment: [u8; 32], activation: u64, path: &str) -> BitBlockResult<BitcoinAddress> {
+    bit_block::qtm_bip84_address(coordinate, commitment, activation, path)
+}
+
+// =============================================================================
+// SUBMISSION-SCOPED DERIVATION
+//
+// Each ordinal is a submission identifier. Derived values are persisted under
+// {substrate}/activations/{activation}/event/{submission}/ and never use the
+// current substrate activation or the latest wallet state.
+// =============================================================================
+
+#[cfg(feature = "bit-miner")]
+fn submission_directory(name: &str, activation: u64, submission: u64) -> PathBuf {
+    commands::substrate_root()
+        .join(name)
+        .join("activations")
+        .join(activation.to_string())
+        .join("event")
+        .join(submission.to_string())
+}
+
+#[cfg(feature = "bit-miner")]
+async fn handle_derive_submission(name: String, activation: u64, submission: u64, req: Request<Incoming>) -> HttpResponse {
+    let body: SubmissionDerivationRequest = match parse_json_body(req).await {
+        Ok(body) => body,
+        Err(e) => return e,
+    };
+
+    if submission == 0 {
+        return error(StatusCode::BAD_REQUEST, "submission must be greater than zero");
+    }
+
+    let network_id = body.network.trim();
+
+    if !valid_observation_network_id(network_id) {
+        return error(StatusCode::BAD_REQUEST, "invalid network identifier");
+    }
+
+    let network = match selected_network(network_id) {
+        Some(network) if is_bitcoin_network_id(network_id) => network,
+        Some(_) => {
+            return error(StatusCode::BAD_REQUEST, "submission derivation currently requires a Bitcoin network");
+        }
+        None => {
+            return error(StatusCode::BAD_REQUEST, format!("network is not registered: {network_id}"));
+        }
+    };
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    // A derivation belongs to an actual persisted submission.
+    let wirepackets = commands::wirepackets_path(&name, activation, submission);
+
+    if !wirepackets.is_file() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("persisted submission does not exist: activation={} submission={}", activation, submission),
+        );
+    }
+
+    // The submission ordinal identifies the QTM event.
+    // Do not substitute the current substrate activation.
+    let persisted = match guarded("submission QTM lookup", || commands::load_event_at_activation(&name, submission)) {
+        Ok(event) => event,
+        Err(e) => return e,
+    };
+
+    let (coordinate, commitment, qtm_activation) = match persisted {
+        qp_hd::PersistedEvent::Transit(event) => (event.qtm.coordinate, event.qtm.commitment, event.heritage.state.activations()),
+        qp_hd::PersistedEvent::Exile(event) => (event.qtm.coordinate, event.qtm.commitment, event.heritage.state.activations()),
+    };
+
+    // bit_block owns extended-key derivation.
+    let keys = match bitblock_qtm_master_keys(coordinate, commitment, qtm_activation, NetworkKind::Main) {
+        Ok(keys) => keys,
+        Err(e) => {
+            return error(StatusCode::UNPROCESSABLE_ENTITY, format!("extended-key derivation failed: {e}"));
+        }
+    };
+
+    // Derive the concrete child using the registered network path.
+    let private_key = match bitblock_derive_qtm_child(coordinate, commitment, qtm_activation, &network.path, NetworkKind::Main) {
+        Ok(key) => key,
+        Err(e) => {
+            return error(StatusCode::UNPROCESSABLE_ENTITY, format!("submission child derivation failed: {e}"));
+        }
+    };
+
+    // Select the locking script and address from the registered purpose.
+    let script = match network.purpose {
+        44 => bitblock_p2pkh_script(private_key),
+        84 => bitblock_p2wpkh_script(private_key),
+        _ => {
+            return error(StatusCode::BAD_REQUEST, format!("unsupported Bitcoin script purpose: {}", network.purpose));
+        }
+    };
+
+    let script = match script {
+        Ok(script) => script,
+        Err(e) => {
+            return error(StatusCode::UNPROCESSABLE_ENTITY, format!("scriptPubKey derivation failed: {e}"));
+        }
+    };
+
+    let address = match network.purpose {
+        44 => bitblock_qtm_bip44_address(coordinate, commitment, qtm_activation, &network.path),
+        84 => bitblock_qtm_bip84_address(coordinate, commitment, qtm_activation, &network.path),
+        _ => unreachable!(),
+    };
+
+    let address = match address {
+        Ok(address) => address.to_string(),
+        Err(e) => {
+            return error(StatusCode::UNPROCESSABLE_ENTITY, format!("address derivation failed: {e}"));
+        }
+    };
+
+    let scriptpubkey = hex::encode(script.as_bytes());
+
+    let directory = submission_directory(&name, activation, submission);
+
+    // A submission directory represents one selected network.
+    // Never silently overwrite its derivation with another network.
+    let network_file = directory.join("network");
+
+    if let Some(existing_network) = read_trim(&network_file) {
+        if existing_network != network_id {
+            return error(
+                StatusCode::CONFLICT,
+                format!("submission already derived for network {}; requested {}", existing_network, network_id),
+            );
+        }
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&directory) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to create submission directory {}: {e}", directory.display()),
+        );
+    }
+
+    let persisted_values = [
+        ("network", network_id.to_string()),
+        ("qtm.activation", qtm_activation.to_string()),
+        ("derivation.path", network.path.clone()),
+        ("scriptpubkey", scriptpubkey.clone()),
+        ("xpriv", keys.xpriv.clone()),
+        ("xpub", keys.xpub.clone()),
+        ("zpub", keys.zpub.clone()),
+        ("address", address.clone()),
+    ];
+
+    for (filename, value) in persisted_values {
+        if let Err(e) = write_atomic(&directory.join(filename), value.as_bytes()) {
+            return e;
+        }
+    }
+
+    json_response(
+        StatusCode::CREATED,
+        &SubmissionDerivationResponse {
+            substrate: name,
+            activation,
+            submission,
+            qtm_activation,
+            network: network_id.to_string(),
+            derivation_path: network.path,
+            directory: directory.display().to_string(),
+            scriptpubkey: "scriptpubkey".to_string(),
+            xpriv: "xpriv".to_string(),
+            xpub: "xpub".to_string(),
+            zpub: "zpub".to_string(),
+            address: "address".to_string(),
+        },
     )
 }
 
 #[cfg(feature = "bit-miner")]
-fn bitblock_qtm_bip84_address(
-    coordinate: [u8; 32],
-    commitment: [u8; 32],
-    activation: u64,
-    path: &str,
-) -> BitBlockResult<BitcoinAddress> {
-    bit_block::qtm_bip84_address(
-        coordinate,
-        commitment,
-        activation,
-        path,
-    )
+fn handle_get_submission_value(name: String, activation: u64, submission: u64, field: String) -> HttpResponse {
+    const FIELDS: [&str; 5] = ["scriptpubkey", "xpriv", "xpub", "zpub", "address"];
+
+    if !FIELDS.contains(&field.as_str()) {
+        return error(StatusCode::BAD_REQUEST, format!("unsupported submission value: {field}"));
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    let directory = submission_directory(&name, activation, submission);
+
+    if !directory.join("network").is_file() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("submission derivation not found: activation={} submission={}", activation, submission),
+        );
+    }
+
+    let path = directory.join(&field);
+
+    let value = match read_trim(&path) {
+        Some(value) if !value.is_empty() => value,
+        _ => {
+            return error(StatusCode::NOT_FOUND, format!("submission value has not been derived: {}", field));
+        }
+    };
+
+    let mut response = bytes_response(StatusCode::OK, "text/plain; charset=utf-8", value);
+
+    // Prevent browser and intermediary caching of key material.
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate"));
+    response.headers_mut().insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+
+    response
 }
-
-
 
 fn scale_name(scale: Scale) -> &'static str {
 match scale {
@@ -1094,31 +1140,19 @@ std::fs::rename(&temporary, path)
 fn latest_record_path(substrate_path: &FsPath, prefix: &str) -> ApiResult<PathBuf> {
     let events_path = substrate_path.join("events");
     let entries = std::fs::read_dir(&events_path).map_err(|e| {
-        error(
-            StatusCode::NOT_FOUND,
-            format!("event store is unavailable at {}: {e}", events_path.display()),
-        )
+        error(StatusCode::NOT_FOUND, format!("event store is unavailable at {}: {e}", events_path.display()))
     })?;
 
     let mut records = Vec::new();
 
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read entry: {e}"),
-            )
-        })?;
+        let entry = entry.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read entry: {e}")))?;
 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
         if path.is_dir() && name.starts_with(prefix) {
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(UNIX_EPOCH);
-
+            let modified = entry.metadata().and_then(|metadata| metadata.modified()).unwrap_or(UNIX_EPOCH);
             records.push((modified, path));
         }
     }
@@ -1129,50 +1163,28 @@ fn latest_record_path(substrate_path: &FsPath, prefix: &str) -> ApiResult<PathBu
         .into_iter()
         .map(|(_, path)| path)
         .next()
-        .ok_or_else(|| {
-            error(
-                StatusCode::NOT_FOUND,
-                format!("no {prefix} record exists in the event store"),
-            )
-        })
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, format!("no {prefix} record exists in the event store")))
 }
 fn parse_record_identity(record: &str) -> Option<(u64, u128)> {
-    let rest = record
-        .strip_prefix("event_")
-        .or_else(|| record.strip_prefix("exile_"))?;
-
+    let rest = record.strip_prefix("event_").or_else(|| record.strip_prefix("exile_"))?;
     let (activation, dimension) = rest.split_once('_')?;
-
     Some((activation.parse().ok()?, dimension.parse().ok()?))
 }
-fn canonical_record_path(
-    substrate_path: &FsPath,
-    kind: &str,
-    activation: u64,
-    dimension: u128,
-) -> ApiResult<PathBuf> {
+fn canonical_record_path(substrate_path: &FsPath, kind: &str, activation: u64, dimension: u128) -> ApiResult<PathBuf> {
     let prefix = match kind {
         "transit" => "event",
         "exile" => "exile",
         _ => {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "record kind must be transit or exile",
-            ));
+            return Err(error(StatusCode::BAD_REQUEST, "record kind must be transit or exile"));
         }
     };
 
-    let path = substrate_path
-        .join("events")
-        .join(format!("{prefix}_{activation}_{dimension}"));
+    let path = substrate_path.join("events").join(format!("{prefix}_{activation}_{dimension}"));
 
     if !path.is_dir() {
         return Err(error(
             StatusCode::NOT_FOUND,
-            format!(
-                "canonical {kind} record does not exist: {}",
-                path.display()
-            ),
+            format!("canonical {kind} record does not exist: {}", path.display()),
         ));
     }
 
@@ -1180,9 +1192,7 @@ fn canonical_record_path(
 }
 fn valid_record_name(record: &str) -> bool {
     (record.starts_with("event_") || record.starts_with("exile_"))
-        && record
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && record.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         && parse_record_identity(record).is_some()
 }
 
@@ -1190,17 +1200,13 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
     let path_file = payload_path.join("depth.path");
     let objects_file = payload_path.join("depth.objects");
 
-    let path = std::fs::read_to_string(&path_file)
-        .map_err(|e| error(
-            StatusCode::NOT_FOUND,
-            format!("persisted depth path unavailable at {}: {e}", path_file.display()),
-        ))?;
+    let path = std::fs::read_to_string(&path_file).map_err(|e| {
+        error(StatusCode::NOT_FOUND, format!("persisted depth path unavailable at {}: {e}", path_file.display()))
+    })?;
 
-    let contents = std::fs::read_to_string(&objects_file)
-        .map_err(|e| error(
-            StatusCode::NOT_FOUND,
-            format!("persisted depth objects unavailable at {}: {e}", objects_file.display()),
-        ))?;
+    let contents = std::fs::read_to_string(&objects_file).map_err(|e| {
+        error(StatusCode::NOT_FOUND, format!("persisted depth objects unavailable at {}: {e}", objects_file.display()))
+    })?;
 
     let mut objects = Vec::new();
 
@@ -1217,23 +1223,17 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
             ));
         }
 
-        let position = fields[0].parse::<usize>()
-            .map_err(|_| error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid depth position at line {}", idx + 1),
-            ))?;
+        let position = fields[0].parse::<usize>().map_err(|_| {
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid depth position at line {}", idx + 1))
+        })?;
 
-        let identifier_bytes = hex::decode(fields[1])
-            .map_err(|_| error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid depth identifier at line {}", idx + 1),
-            ))?;
+        let identifier_bytes = hex::decode(fields[1]).map_err(|_| {
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid depth identifier at line {}", idx + 1))
+        })?;
 
-        let identifier = String::from_utf8(identifier_bytes)
-            .map_err(|_| error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("depth identifier not UTF-8 at line {}", idx + 1),
-            ))?;
+        let identifier = String::from_utf8(identifier_bytes).map_err(|_| {
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("depth identifier not UTF-8 at line {}", idx + 1))
+        })?;
 
         objects.push(DepthObjectResponse {
             position,
@@ -1243,16 +1243,10 @@ fn read_persisted_depth(payload_path: &FsPath) -> ApiResult<DepthResponse> {
         });
     }
 
-    Ok(DepthResponse {
-        path: path.trim().to_string(),
-        objects,
-    })
+    Ok(DepthResponse { path: path.trim().to_string(), objects })
 }
 
-fn event_map_response(
-    payload: EventPayload,
-    qtm: QtmResponse,
-) -> EventMapResponse {
+fn event_map_response(payload: EventPayload, qtm: QtmResponse) -> EventMapResponse {
     let event = payload.direction.into_event();
     let heritage = event.heritage();
     let state = &heritage.state;
@@ -1266,9 +1260,7 @@ fn event_map_response(
                 structural_value: state.structural_value().to_string(),
                 retained_mass: state.retained_mass().to_string(),
                 activations: state.activations(),
-
             },
-
             transition: EventTransitionView {
                 tau: transition.tau.to_string(),
                 delta: transition.delta.to_string(),
@@ -1282,11 +1274,7 @@ fn event_map_response(
     }
 }
 
-fn direction_response(
-    payload: EventPayload,
-    selection: Option<TransitSelection>,
-    qtm: QtmResponse,
-) -> DirectionResponse {
+fn direction_response(payload: EventPayload, selection: Option<TransitSelection>, qtm: QtmResponse) -> DirectionResponse {
     DirectionResponse {
         frame: DirectionFrameResponse {
             qtm: qtm_frame(qtm.clone()),
@@ -1320,43 +1308,30 @@ fn parse_budget(contents: &str, path: &FsPath) -> ApiResult<EventBudget> {
 
         match key.trim() {
             "min_events" => {
-                min_events = Some(
-                    value.trim().parse::<u64>()
-                        .map_err(|_| error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("invalid min_events in {}", path.display()),
-                        ))?,
-                );
+                min_events = Some(value.trim().parse::<u64>().map_err(|_| {
+                    error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid min_events in {}", path.display()))
+                })?);
             }
             "max_events" => {
-                max_events = Some(
-                    value.trim().parse::<u64>()
-                        .map_err(|_| error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("invalid max_events in {}", path.display()),
-                        ))?,
-                );
+                max_events = Some(value.trim().parse::<u64>().map_err(|_| {
+                    error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid max_events in {}", path.display()))
+                })?);
             }
             _ => {}
         }
     }
 
     let budget = EventBudget {
-        min_events: min_events.ok_or_else(|| error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("missing min_events in {}", path.display()),
-        ))?,
-        max_events: max_events.ok_or_else(|| error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("missing max_events in {}", path.display()),
-        ))?,
+        min_events: min_events.ok_or_else(|| {
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("missing min_events in {}", path.display()))
+        })?,
+        max_events: max_events.ok_or_else(|| {
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("missing max_events in {}", path.display()))
+        })?,
     };
 
     if budget.max_events == 0 || budget.min_events > budget.max_events {
-        return Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("invalid budget values in {}", path.display()),
-        ));
+        return Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid budget values in {}", path.display())));
     }
 
     Ok(budget)
@@ -1395,10 +1370,7 @@ fn validate_wirepackets_scope(name: &str, network: &str) -> ApiResult<()> {
         return Err(error(StatusCode::BAD_REQUEST, "invalid network identifier"));
     }
     if !is_bitcoin_network_id(network) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "wire packets are persisted for Bitcoin settlement only",
-        ));
+        return Err(error(StatusCode::BAD_REQUEST, "wire packets are persisted for Bitcoin settlement only"));
     }
     Ok(())
 }
@@ -1426,43 +1398,25 @@ struct WirePacketPrevoutResolver {
 #[cfg(feature = "bit-miner")]
 impl WirePacketPrevoutResolver {
     fn new(substrate: &str, activation: u64) -> Self {
-        Self {
-            substrate: substrate.to_owned(),
-            activation,
-        }
+        Self { substrate: substrate.to_owned(), activation }
     }
 
-    fn resolve_packet(
-        &self,
-        requested: &OutPoint,
-        submission: u64,
-        commitment: [u8; 32],
-    ) -> Result<WirePacket, std::io::Error> {
+    fn resolve_packet(&self, requested: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<WirePacket, std::io::Error> {
         use std::io::{Error, ErrorKind};
 
-        let path = commands::wirepackets_path(
-            &self.substrate,
-            self.activation,
-            submission,
-        );
+        let path = commands::wirepackets_path(&self.substrate, self.activation, submission);
 
         let bytes = std::fs::read(&path).map_err(|e| {
             Error::new(
                 e.kind(),
                 format!(
                     "unable to load parent wirepackets: substrate={} activation={} submission={} outpoint={}:{}: {e}",
-                    self.substrate,
-                    self.activation,
-                    submission,
-                    requested.txid,
-                    requested.vout,
+                    self.substrate, self.activation, submission, requested.txid, requested.vout,
                 ),
             )
         })?;
 
-        let packets = decode_wirepackets(&bytes).map_err(|e| {
-            Error::new(ErrorKind::InvalidData, e.to_string())
-        })?;
+        let packets = decode_wirepackets(&bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 
         for packet in packets {
             if packet.outpoint != *requested {
@@ -1474,11 +1428,7 @@ impl WirePacketPrevoutResolver {
                     ErrorKind::InvalidData,
                     format!(
                         "parent commitment mismatch: substrate={} activation={} submission={} outpoint={}:{}",
-                        self.substrate,
-                        self.activation,
-                        submission,
-                        requested.txid,
-                        requested.vout,
+                        self.substrate, self.activation, submission, requested.txid, requested.vout,
                     ),
                 ));
             }
@@ -1490,11 +1440,7 @@ impl WirePacketPrevoutResolver {
             ErrorKind::NotFound,
             format!(
                 "previous output not found: substrate={} activation={} submission={} outpoint={}:{}",
-                self.substrate,
-                self.activation,
-                submission,
-                requested.txid,
-                requested.vout,
+                self.substrate, self.activation, submission, requested.txid, requested.vout,
             ),
         ))
     }
@@ -1502,12 +1448,7 @@ impl WirePacketPrevoutResolver {
 
 #[cfg(feature = "bit-miner")]
 impl PrevoutResolver for WirePacketPrevoutResolver {
-    fn resolve(
-        &self,
-        outpoint: &OutPoint,
-        submission: u64,
-        commitment: [u8; 32],
-    ) -> Result<ResolvedPrevout, Box<dyn std::error::Error + Send + Sync>> {
+    fn resolve(&self, outpoint: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<ResolvedPrevout, Box<dyn std::error::Error + Send + Sync>> {
         let packet = self.resolve_packet(outpoint, submission, commitment)?;
 
         Ok(ResolvedPrevout {
@@ -1522,7 +1463,6 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
     }
 }
 
-
 fn electrum_port() -> u16 {
     std::env::var("ELECTRUM_PORT")
         .ok()
@@ -1531,63 +1471,36 @@ fn electrum_port() -> u16 {
         .unwrap_or(50001)
 }
 
-fn route_electrum_method(
-    method: &str,
-    params: &Value,
-) -> Result<Value, Value> {
+fn route_electrum_method(method: &str, params: &Value) -> Result<Value, Value> {
     match method {
         "server.ping" => Ok(Value::Null),
 
         "qtm.wirepackets.get" => {
             let args = params.as_array().ok_or_else(|| {
-                json!({
-                    "code": -32602,
-                    "message": "expected [substrate, activation, network]"
-                })
+                json!({"code": -32602, "message": "expected [substrate, activation, network]"})
             })?;
 
             if args.len() != 3 {
-                return Err(json!({
-                    "code": -32602,
-                    "message": "expected [substrate, activation, network]"
-                }));
+                return Err(json!({"code": -32602, "message": "expected [substrate, activation, network]"}));
             }
 
-            let name = args[0].as_str().ok_or_else(|| {
-                json!({"code": -32602, "message": "invalid substrate"})
-            })?;
+            let name = args[0].as_str().ok_or_else(|| json!({"code": -32602, "message": "invalid substrate"}))?;
+            let activation = args[1].as_u64().ok_or_else(|| json!({"code": -32602, "message": "invalid activation"}))?;
+            let network = args[2].as_str().ok_or_else(|| json!({"code": -32602, "message": "invalid network"}))?;
 
-            let activation = args[1].as_u64().ok_or_else(|| {
-                json!({"code": -32602, "message": "invalid activation"})
+            let response = load_wirepackets(name, activation, network).map_err(|response| {
+                json!({
+                    "code": -32000,
+                    "message": format!("WirePackets request failed: HTTP {}", response.status().as_u16())
+                })
             })?;
-
-            let network = args[2].as_str().ok_or_else(|| {
-                json!({"code": -32602, "message": "invalid network"})
-            })?;
-
-            let response = load_wirepackets(name, activation, network)
-                .map_err(|response| {
-                    json!({
-                        "code": -32000,
-                        "message": format!(
-                            "WirePackets request failed: HTTP {}",
-                            response.status().as_u16()
-                        )
-                    })
-                })?;
 
             serde_json::to_value(response).map_err(|e| {
-                json!({
-                    "code": -32603,
-                    "message": format!("unable to serialize WirePackets: {e}")
-                })
+                json!({"code": -32603, "message": format!("unable to serialize WirePackets: {e}")})
             })
         }
 
-        _ => Err(json!({
-            "code": -32601,
-            "message": format!("method not found: {method}")
-        })),
+        _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
     }
 }
 
@@ -1617,49 +1530,25 @@ where
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(request) => {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
-                let method = request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let params = request
-                    .get("params")
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
+                let method = request.get("method").and_then(Value::as_str).unwrap_or("").to_owned();
+                let params = request.get("params").cloned().unwrap_or_else(|| json!([]));
 
-                let result = tokio::task::spawn_blocking(move || {
-                    route_electrum_method(&method, &params)
-                })
-                .await;
+                let result = tokio::task::spawn_blocking(move || route_electrum_method(&method, &params)).await;
 
                 match result {
-                    Ok(Ok(value)) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": value,
-                    }),
-                    Ok(Err(error)) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": error,
-                    }),
+                    Ok(Ok(value)) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+                    Ok(Err(error)) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
                     Err(e) => json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "error": {
-                            "code": -32603,
-                            "message": format!("Electrum request failed: {e}"),
-                        },
+                        "error": {"code": -32603, "message": format!("Electrum request failed: {e}")},
                     }),
                 }
             }
             Err(e) => json!({
                 "jsonrpc": "2.0",
                 "id": null,
-                "error": {
-                    "code": -32700,
-                    "message": format!("parse error: {e}"),
-                },
+                "error": {"code": -32700, "message": format!("parse error: {e}")},
             }),
         };
 
@@ -1680,12 +1569,8 @@ where
     }
 }
 
-
 async fn serve_electrum(listener: TcpListener) -> std::io::Result<()> {
-    println!(
-        "qtm-api Electrum TCP listener bound at {}",
-        listener.local_addr()?
-    );
+    println!("qtm-api Electrum TCP listener bound at {}", listener.local_addr()?);
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -1698,8 +1583,7 @@ async fn serve_electrum(listener: TcpListener) -> std::io::Result<()> {
 }
 
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
-    read_trim(&substrate_path.join("activation"))
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    read_trim(&substrate_path.join("activation")).and_then(|v| v.trim().parse::<u64>().ok())
 }
 
 fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
@@ -1707,10 +1591,7 @@ fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| {
-            e.path().is_dir()
-                && substrate_active_activation(&e.path()) == Some(activation)
-        })
+        .filter(|e| e.path().is_dir() && substrate_active_activation(&e.path()) == Some(activation))
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
 
@@ -1718,11 +1599,7 @@ fn active_clips(activation: u64) -> Vec<ObservationClipStatus> {
 
     names
         .into_iter()
-        .map(|substrate| ObservationClipStatus {
-            substrate,
-            active: true,
-            direction: None,
-        })
+        .map(|substrate| ObservationClipStatus { substrate, active: true, direction: None })
         .collect()
 }
 
@@ -1806,10 +1683,7 @@ tail
 })
 }
 
-fn live_bitminer(
-    processes: &mut HashMap<BitMinerKey, Child>,
-    key: &str,
-) -> ApiResult<(bool, Option<u32>)> {
+fn live_bitminer(processes: &mut HashMap<BitMinerKey, Child>, key: &str) -> ApiResult<(bool, Option<u32>)> {
     let Some(child) = processes.get_mut(key) else {
         return Ok((false, None));
     };
@@ -1820,37 +1694,20 @@ fn live_bitminer(
             processes.remove(key);
             Ok((false, None))
         }
-        Err(e) => Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to inspect bit-miner process: {e}"),
-        )),
+        Err(e) => Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect bit-miner process: {e}"))),
     }
 }
 
-
-async fn bitminer_process_state(
-    name: &str,
-    activation: u64,
-    network: &str,
-) -> ApiResult<(bool, Option<u32>)> {
+async fn bitminer_process_state(name: &str, activation: u64, network: &str) -> ApiResult<(bool, Option<u32>)> {
     let mut processes = bit_miner_processes().lock().await;
-    live_bitminer(
-        &mut processes,
-        &bitminer_key(name, activation, network),
-    )
+    live_bitminer(&mut processes, &bitminer_key(name, activation, network))
 }
 
-async fn bitminer_process_state_any(
-    name: &str,
-    activation: u64,
-) -> ApiResult<(bool, Option<u32>)> {
+async fn bitminer_process_state_any(name: &str, activation: u64) -> ApiResult<(bool, Option<u32>)> {
     let prefix = format!("{name}:{activation}:");
     let mut processes = bit_miner_processes().lock().await;
 
-    let mut keys: Vec<String> = processes.keys()
-        .filter(|key| key.starts_with(&prefix))
-        .cloned()
-        .collect();
+    let mut keys: Vec<String> = processes.keys().filter(|key| key.starts_with(&prefix)).cloned().collect();
 
     keys.sort();
 
@@ -1866,26 +1723,18 @@ async fn bitminer_process_state_any(
     Ok((first_pid.is_some(), first_pid))
 }
 
-async fn bitminer_process_list(
-    name: &str,
-    activation: u64,
-) -> ApiResult<Vec<BitMinerProcessEntry>> {
+async fn bitminer_process_list(name: &str, activation: u64) -> ApiResult<Vec<BitMinerProcessEntry>> {
     let prefix = format!("{name}:{activation}:");
     let mut processes = bit_miner_processes().lock().await;
 
-    let mut keys: Vec<String> = processes.keys()
-        .filter(|key| key.starts_with(&prefix))
-        .cloned()
-        .collect();
+    let mut keys: Vec<String> = processes.keys().filter(|key| key.starts_with(&prefix)).cloned().collect();
 
     keys.sort();
 
     let mut pipelines = Vec::new();
 
     for key in keys {
-        let network = key.strip_prefix(&prefix)
-            .unwrap_or_default()
-            .to_string();
+        let network = key.strip_prefix(&prefix).unwrap_or_default().to_string();
 
         let (running, pid) = live_bitminer(&mut processes, &key)?;
 
@@ -1903,10 +1752,7 @@ async fn bitminer_process_list(
     Ok(pipelines)
 }
 
-async fn receive_pipeline_network(
-    name: &str,
-    activation: u64,
-) -> ApiResult<NetworkOption> {
+async fn receive_pipeline_network(name: &str, activation: u64) -> ApiResult<NetworkOption> {
     let pipelines = bitminer_process_list(name, activation).await?;
 
     let network_id = match pipelines.as_slice() {
@@ -1914,32 +1760,21 @@ async fn receive_pipeline_network(
         [] => {
             return Err(error(
                 StatusCode::CONFLICT,
-                format!(
-                    "no running observation pipeline: substrate={name} activation={activation}",
-                ),
+                format!("no running observation pipeline: substrate={name} activation={activation}"),
             ));
         }
         _ => {
-            let networks = pipelines
-                .iter()
-                .map(|pipeline| pipeline.network.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let networks = pipelines.iter().map(|pipeline| pipeline.network.as_str()).collect::<Vec<_>>().join(", ");
 
             return Err(error(
                 StatusCode::CONFLICT,
-                format!(
-                    "multiple observation pipelines are active; receive requires one pipeline: {networks}",
-                ),
+                format!("multiple observation pipelines are active; receive requires one pipeline: {networks}"),
             ));
         }
     };
 
     selected_network(network_id).ok_or_else(|| {
-        error(
-            StatusCode::BAD_REQUEST,
-            format!("pipeline network is not registered: {network_id}"),
-        )
+        error(StatusCode::BAD_REQUEST, format!("pipeline network is not registered: {network_id}"))
     })
 }
 
@@ -2089,26 +1924,13 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
     let name = body.name.trim();
 
     if !valid_substrate_name(name) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "name must contain 1-64 ASCII letters, digits, hyphens, or underscores",
-        );
+        return error(StatusCode::BAD_REQUEST, "name must contain 1-64 ASCII letters, digits, hyphens, or underscores");
     }
 
-    let (indices, entropy) = match body
-        .seed_source
-        .as_deref()
-        .unwrap_or("persistent")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let (indices, entropy) = match body.seed_source.as_deref().unwrap_or("persistent").trim().to_ascii_lowercase().as_str() {
         "persistent" | "custom" => {
             let Some(raw_indices) = body.indices.as_deref() else {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "indices are required for persistent creation",
-                );
+                return error(StatusCode::BAD_REQUEST, "indices are required for persistent creation");
             };
 
             let parsed = match parse_indices(raw_indices) {
@@ -2116,40 +1938,22 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
                 Err(message) => return error(StatusCode::BAD_REQUEST, message),
             };
 
-            let Some(entropy) = body.entropy.as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "non-empty entropy is required",
-                );
+            let Some(entropy) = body.entropy.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+                return error(StatusCode::BAD_REQUEST, "non-empty entropy is required");
             };
 
             (
-                parsed.iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                parsed.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
                 entropy.to_string(),
             )
         }
         "bip39" => {
-            let Some(phrase) = body.phrase.as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "a BIP39 phrase is required",
-                );
+            let Some(phrase) = body.phrase.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+                return error(StatusCode::BAD_REQUEST, "a BIP39 phrase is required");
             };
 
             let Some(lang_name) = body.language.as_deref() else {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "select a BIP39 language in the UI",
-                );
+                return error(StatusCode::BAD_REQUEST, "select a BIP39 language in the UI");
             };
 
             let language = match parse_bip39_language(lang_name) {
@@ -2159,37 +1963,21 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
 
             let indices = match BIP39Handler::mnemonic_indices(phrase, language) {
                 Ok(indices) => indices,
-                Err(e) => return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid BIP39 mnemonic: {e}"),
-                ),
+                Err(e) => return error(StatusCode::BAD_REQUEST, format!("invalid BIP39 mnemonic: {e}")),
             };
 
-            let entropy = match BIP39Handler::mnemonic_entropy(
-                phrase,
-                language,
-                body.passphrase.as_deref(),
-            ) {
+            let entropy = match BIP39Handler::mnemonic_entropy(phrase, language, body.passphrase.as_deref()) {
                 Ok(entropy) => entropy,
-                Err(e) => return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unable to derive BIP39 entropy: {e}"),
-                ),
+                Err(e) => return error(StatusCode::BAD_REQUEST, format!("unable to derive BIP39 entropy: {e}")),
             };
 
             (
-                indices.iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                indices.iter().map(u16::to_string).collect::<Vec<_>>().join(","),
                 hex::encode(entropy),
             )
         }
         _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "seed_source must be persistent, custom, or bip39",
-            );
+            return error(StatusCode::BAD_REQUEST, "seed_source must be persistent, custom, or bip39");
         }
     };
 
@@ -2199,17 +1987,11 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
     let root = commands::substrate_root();
 
     if let Err(e) = std::fs::create_dir_all(&root) {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to access substrate root: {e}"),
-        );
+        return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to access substrate root: {e}"));
     }
 
     if root.join(name).exists() {
-        return error(
-            StatusCode::CONFLICT,
-            format!("substrate already exists: {name}"),
-        );
+        return error(StatusCode::CONFLICT, format!("substrate already exists: {name}"));
     }
 
     if let Err(e) = guarded("substrate creation", || {
@@ -2228,8 +2010,6 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
     }
 }
 
-
-
 fn handle_open_wallet(name: String) -> HttpResponse {
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -2239,178 +2019,103 @@ fn handle_open_wallet(name: String) -> HttpResponse {
         Err(e) => return e,
     };
 
-    let activation = match guarded(
-        "activation lookup",
-        || commands::load_activation(&name),
-    ) {
+    let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
         Ok(activation) => activation,
         Err(e) => return e,
     };
 
-    let (record, heritage, qtm, depth) =
-        if let Some(exile_path) =
-            commands::exile_path_at_activation(&name, activation)
-        {
-            let persisted = match guarded(
-                "persisted exile load",
-                || commands::load_event_at_activation(&name, activation),
-            ) {
-                Ok(event) => event,
-                Err(e) => return e,
-            };
-
-            match persisted {
-                qp_hd::PersistedEvent::Exile(event) => {
-                    let record = exile_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default()
-                        .to_string();
-
-                    (
-                        record,
-                        event.heritage,
-                        event.qtm,
-                        event.depth,
-                    )
-                }
-
-                qp_hd::PersistedEvent::Transit(_) => {
-                    return error(
-                        StatusCode::CONFLICT,
-                        format!(
-                            "persisted exile path resolves to transit at activation {activation}",
-                        ),
-                    );
-                }
-            }
-        } else {
-            let Some(transit_path) =
-                commands::event_path_at_activation(&name, activation)
-            else {
-                return error(
-                    StatusCode::NOT_FOUND,
-                    format!(
-                        "no available transit or exile event at activation {activation}",
-                    ),
-                );
-            };
-
-            let entries = match std::fs::read_dir(&transit_path) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "unable to inspect transit payloads: {e}",
-                        ),
-                    );
-                }
-            };
-
-            let mut network_ids = Vec::new();
-
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!(
-                                "unable to inspect transit network: {e}",
-                            ),
-                        );
-                    }
-                };
-
-                let network_path = entry.path();
-
-                if !network_path.is_dir() {
-                    continue;
-                }
-
-                let payload_path = network_path.join("payload");
-
-                if payload_path.join("depth.path").is_file()
-                    && payload_path.join("depth.objects").is_file()
-                {
-                    network_ids.push(
-                        entry.file_name().to_string_lossy().to_string(),
-                    );
-                }
-            }
-
-            network_ids.sort();
-            network_ids.dedup();
-
-            let event = match guarded(
-                "open exile",
-                || commands::qtm_exile(&name),
-            ) {
-                Ok(event) => event,
-                Err(e) => return e,
-            };
-
-            let resulting_activation =
-                event.heritage.state.activations();
-
-            let dimension =
-                event.heritage.state.dimension();
-
-            let record_path = match canonical_record_path(
-                &substrate_path,
-                "exile",
-                resulting_activation,
-                u128::from(dimension),
-            ) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
-
-            for network_id in &network_ids {
-                if let Err(e) = write_depth_payload(
-                    &record_path,
-                    network_id,
-                    &event.depth,
-                ) {
-                    return e;
-                }
-            }
-
-            let record = record_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string();
-
-            (
-                record,
-                event.heritage,
-                event.qtm,
-                event.depth,
-            )
+    let (record, heritage, qtm, depth) = if let Some(exile_path) = commands::exile_path_at_activation(&name, activation) {
+        let persisted = match guarded("persisted exile load", || commands::load_event_at_activation(&name, activation)) {
+            Ok(event) => event,
+            Err(e) => return e,
         };
+
+        match persisted {
+            qp_hd::PersistedEvent::Exile(event) => {
+                let record = exile_path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+                (record, event.heritage, event.qtm, event.depth)
+            }
+            qp_hd::PersistedEvent::Transit(_) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    format!("persisted exile path resolves to transit at activation {activation}"),
+                );
+            }
+        }
+    } else {
+        let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                format!("no available transit or exile event at activation {activation}"),
+            );
+        };
+
+        let entries = match std::fs::read_dir(&transit_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit payloads: {e}"));
+            }
+        };
+
+        let mut network_ids = Vec::new();
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit network: {e}"));
+                }
+            };
+
+            let network_path = entry.path();
+
+            if !network_path.is_dir() {
+                continue;
+            }
+
+            let payload_path = network_path.join("payload");
+
+            if payload_path.join("depth.path").is_file() && payload_path.join("depth.objects").is_file() {
+                network_ids.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+
+        network_ids.sort();
+        network_ids.dedup();
+
+        let event = match guarded("open exile", || commands::qtm_exile(&name)) {
+            Ok(event) => event,
+            Err(e) => return e,
+        };
+
+        let resulting_activation = event.heritage.state.activations();
+        let dimension = event.heritage.state.dimension();
+
+        let record_path = match canonical_record_path(&substrate_path, "exile", resulting_activation, u128::from(dimension)) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+
+        for network_id in &network_ids {
+            if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
+                return e;
+            }
+        }
+
+        let record = record_path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+
+        (record, event.heritage, event.qtm, event.depth)
+    };
 
     let substrate = match substrate_json(&name) {
         Ok(substrate) => substrate,
         Err(e) => return e,
     };
 
-    let payload = EventPayload::from_heritage(
-        heritage,
-        depth,
-        Scale::Local,
-    );
-
+    let payload = EventPayload::from_heritage(heritage, depth, Scale::Local);
     let event = Some(payload_event_view(record, &payload));
 
-    json_response(
-        StatusCode::OK,
-        &OpenResponse {
-            substrate,
-            event,
-        },
-    )
+    json_response(StatusCode::OK, &OpenResponse { substrate, event })
 }
 
 fn handle_list_events(name: String) -> HttpResponse {
@@ -2429,10 +2134,7 @@ fn handle_list_events(name: String) -> HttpResponse {
         let entries = match std::fs::read_dir(&events_path) {
             Ok(entries) => entries,
             Err(err) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to list events: {err}"),
-                );
+                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to list events: {err}"));
             }
         };
 
@@ -2440,10 +2142,7 @@ fn handle_list_events(name: String) -> HttpResponse {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("unable to read event entry: {err}"),
-                    );
+                    return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read event entry: {err}"));
                 }
             };
 
@@ -2467,11 +2166,7 @@ fn handle_list_events(name: String) -> HttpResponse {
                 read_trim(&record_path.join(field)).ok_or_else(|| {
                     error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "missing persisted event field: record={} field={}",
-                            record,
-                            field,
-                        ),
+                        format!("missing persisted event field: record={} field={}", record, field),
                     )
                 })
             };
@@ -2486,11 +2181,7 @@ fn handle_list_events(name: String) -> HttpResponse {
                 Err(_) => {
                     return error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "invalid persisted activation: record={} activation={}",
-                            record,
-                            activation,
-                        ),
+                        format!("invalid persisted activation: record={} activation={}", record, activation),
                     );
                 }
             };
@@ -2499,60 +2190,44 @@ fn handle_list_events(name: String) -> HttpResponse {
                 Ok(value) => value,
                 Err(err) => return err,
             };
-
-            let structural_value =
-                match read_persisted("manifold.structural_value") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
-            let retained_mass =
-                match read_persisted("manifold.retained_mass") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
+            let structural_value = match read_persisted("manifold.structural_value") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+            let retained_mass = match read_persisted("manifold.retained_mass") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
             let delta = match read_persisted("transition.delta") {
                 Ok(value) => value,
                 Err(err) => return err,
             };
-
             let tau = match read_persisted("transition.tau") {
                 Ok(value) => value,
                 Err(err) => return err,
             };
-
-            let gross_work =
-                match read_persisted("transition.gross_work") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
-            let net_work =
-                match read_persisted("transition.net_work") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
+            let gross_work = match read_persisted("transition.gross_work") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
+            let net_work = match read_persisted("transition.net_work") {
+                Ok(value) => value,
+                Err(err) => return err,
+            };
             let commitment = match read_persisted("qtm.commitment") {
                 Ok(value) => value,
                 Err(err) => return err,
             };
-
             let coordinate = match read_persisted("qtm.coordinate") {
                 Ok(value) => value,
                 Err(err) => return err,
             };
-
             let depth_contents = match read_persisted("depth.objects") {
                 Ok(value) => value,
                 Err(err) => return err,
             };
 
-            let depth_objects = depth_contents
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count();
+            let depth_objects = depth_contents.lines().filter(|line| !line.trim().is_empty()).count();
 
             events.push((
                 activation_number,
@@ -2575,15 +2250,9 @@ fn handle_list_events(name: String) -> HttpResponse {
         }
     }
 
-    events.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.record.cmp(&b.1.record))
-    });
+    events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.record.cmp(&b.1.record)));
 
-    let events = events
-        .into_iter()
-        .map(|(_, event)| event)
-        .collect();
+    let events = events.into_iter().map(|(_, event)| event).collect();
 
     json_response(
         StatusCode::OK,
@@ -2717,21 +2386,14 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
         Some(id) => match selected_network(id) {
             Some(network) => Some(network),
             None => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("unsupported network: {id}"),
-                );
+                return error(StatusCode::BAD_REQUEST, format!("unsupported network: {id}"));
             }
         },
         None => None,
     };
 
-    let purpose = body.purpose
-        .or_else(|| preset.as_ref().map(|n| n.purpose))
-        .unwrap_or(44);
-    let coin = body.coin
-        .or_else(|| preset.as_ref().map(|n| n.coin))
-        .unwrap_or(0);
+    let purpose = body.purpose.or_else(|| preset.as_ref().map(|n| n.purpose)).unwrap_or(44);
+    let coin = body.coin.or_else(|| preset.as_ref().map(|n| n.coin)).unwrap_or(0);
     let account = body.account.unwrap_or(0);
     let change = body.change.unwrap_or(0);
     let external = body.external.unwrap_or(0);
@@ -2747,7 +2409,8 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
         None => preset.as_ref().map(|n| n.path.clone()),
     };
 
-    let network_id = body.network
+    let network_id = body
+        .network
         .as_deref()
         .or_else(|| preset.as_ref().map(|n| n.id.as_str()))
         .unwrap_or("default")
@@ -2770,11 +2433,10 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
         account as u128,
         change as u128,
         external as u128,
-    ).memorize();
+    )
+    .memorize();
 
-    let event = match guarded("transit", || {
-        commands::qtm_transit(&name, payload, body.activation)
-    }) {
+    let event = match guarded("transit", || commands::qtm_transit(&name, payload, body.activation)) {
         Ok(event) => event,
         Err(e) => return e,
     };
@@ -2782,12 +2444,7 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
     let activation = event.heritage.state.activations();
     let dimension = event.heritage.state.dimension();
 
-    let record_path = match canonical_record_path(
-        &substrate_path,
-        "transit",
-        activation,
-        u128::from(dimension),
-    ) {
+    let record_path = match canonical_record_path(&substrate_path, "transit", activation, u128::from(dimension)) {
         Ok(path) => path,
         Err(e) => return e,
     };
@@ -2803,61 +2460,36 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
         network: event.qtm.net_work.to_string(),
     };
 
-    let event_payload = EventPayload::from_heritage(
-        event.heritage,
-        event.depth,
-        Scale::Local,
-    );
+    let event_payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
 
-    json_response(
-        StatusCode::OK,
-        &direction_response(event_payload, Some(selection), qtm),
-    )
+    json_response(StatusCode::OK, &direction_response(event_payload, Some(selection), qtm))
 }
 
 /// POST /wallets/:name/receive
-async fn handle_receive_wallet(
-    name: String,
-    req: Request<Incoming>,
-) -> HttpResponse {
+async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
         Ok(body) => body,
         Err(e) => return e,
     };
 
     if body.amount == 0 || body.ordinal == 0 {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "amount and ordinal must be greater than zero",
-        );
+        return error(StatusCode::BAD_REQUEST, "amount and ordinal must be greater than zero");
     }
 
     if body.ordinal > body.amount {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "ordinal exceeds receive amount: maximum={}",
-                body.amount,
-            ),
-        );
+        return error(StatusCode::BAD_REQUEST, format!("ordinal exceeds receive amount: maximum={}", body.amount));
     }
 
     let network_id = body.network.trim();
 
     if !valid_observation_network_id(network_id) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid network identifier",
-        );
+        return error(StatusCode::BAD_REQUEST, "invalid network identifier");
     }
 
     let network = match selected_network(network_id) {
         Some(network) => network,
         None => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                format!("network is not registered: {network_id}"),
-            );
+            return error(StatusCode::BAD_REQUEST, format!("network is not registered: {network_id}"));
         }
     };
 
@@ -2865,10 +2497,7 @@ async fn handle_receive_wallet(
         "receive" => false,
         "change" => true,
         _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "flow must be receive or change",
-            );
+            return error(StatusCode::BAD_REQUEST, "flow must be receive or change");
         }
     };
 
@@ -2884,24 +2513,17 @@ async fn handle_receive_wallet(
     if commands::event_path_at_activation(&name, body.ordinal).is_none() {
         return error(
             StatusCode::NOT_FOUND,
-            format!(
-                "receive requires a persisted transit at ordinal {}",
-                body.ordinal,
-            ),
+            format!("receive requires a persisted transit at ordinal {}", body.ordinal),
         );
     }
 
-    let transaction = match guarded("receive", || {
-        QuantumTransaction::send(&name, body.ordinal)
-    }) {
+    let transaction = match guarded("receive", || QuantumTransaction::send(&name, body.ordinal)) {
         Ok(transaction) => transaction,
         Err(e) => return e,
     };
 
     let constant_delta = match &transaction.constant {
-        qp_hd::PersistedEvent::Exile(event) => {
-            event.heritage.transition.delta
-        }
+        qp_hd::PersistedEvent::Exile(event) => event.heritage.transition.delta,
         qp_hd::PersistedEvent::Transit(..) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2910,11 +2532,7 @@ async fn handle_receive_wallet(
         }
     };
 
-    let flow = if change_requested {
-        Flow::Change(constant_delta)
-    } else {
-        Flow::Receive
-    };
+    let flow = if change_requested { Flow::Change(constant_delta) } else { Flow::Receive };
 
     let qtm = QtmResponse {
         commitment: hex::encode(transaction.qtm.commitment),
@@ -2932,18 +2550,12 @@ async fn handle_receive_wallet(
 
     // Execute only the selected ordinal. Receive must preserve its persisted
     // event state and depth rather than creating another forward transition.
-    let event = match guarded("receive", || {
-        transaction.receive(&name, flow)
-    }) {
+    let event = match guarded("receive", || transaction.receive(&name, flow)) {
         Ok(event) => event,
         Err(e) => return e,
     };
 
-    let payload = EventPayload::from_heritage(
-        event.heritage,
-        event.depth,
-        Scale::Local,
-    );
+    let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
 
     json_response(
         StatusCode::OK,
@@ -2966,21 +2578,15 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
         Err(e) => return e,
     };
 
-    let activation = match guarded("activation lookup", || {
-        commands::load_activation(&name)
-    }) {
+    let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
         Ok(activation) => activation,
         Err(e) => return e,
     };
 
     // Preserve an already-executed ordinal. Only a persisted transit
     // may be consumed by exile.
-    let event = if let Some(exile_path) =
-        commands::exile_path_at_activation(&name, activation)
-    {
-        match guarded("exile event lookup", || {
-            commands::load_event_at_activation(&name, activation)
-        }) {
+    let event = if let Some(exile_path) = commands::exile_path_at_activation(&name, activation) {
+        match guarded("exile event lookup", || commands::load_event_at_activation(&name, activation)) {
             Ok(qp_hd::PersistedEvent::Exile(event)) => event,
             Ok(qp_hd::PersistedEvent::Transit(..)) => {
                 return error(
@@ -2994,14 +2600,10 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
             Err(e) => return e,
         }
     } else {
-        let Some(transit_path) =
-            commands::event_path_at_activation(&name, activation)
-        else {
+        let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
             return error(
                 StatusCode::NOT_FOUND,
-                format!(
-                    "no persisted transit or exile event exists at activation {activation}"
-                ),
+                format!("no persisted transit or exile event exists at activation {activation}"),
             );
         };
 
@@ -3012,10 +2614,7 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
         let entries = match std::fs::read_dir(&transit_path) {
             Ok(entries) => entries,
             Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect transit payloads: {e}"),
-                );
+                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit payloads: {e}"));
             }
         };
 
@@ -3023,21 +2622,14 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("unable to inspect transit network: {e}"),
-                    );
+                    return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit network: {e}"));
                 }
             };
 
             let payload = entry.path().join("payload");
 
-            if payload.join("depth.path").is_file()
-                && payload.join("depth.objects").is_file()
-            {
-                network_ids.push(
-                    entry.file_name().to_string_lossy().to_string(),
-                );
+            if payload.join("depth.path").is_file() && payload.join("depth.objects").is_file() {
+                network_ids.push(entry.file_name().to_string_lossy().to_string());
             }
         }
 
@@ -3045,9 +2637,7 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
         network_ids.dedup();
 
         // Execute this ordinal once. qtm_exile consumes its persisted transit.
-        let event = match guarded("exile", || {
-            commands::qtm_exile(&name)
-        }) {
+        let event = match guarded("exile", || commands::qtm_exile(&name)) {
             Ok(event) => event,
             Err(e) => return e,
         };
@@ -3055,22 +2645,13 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
         let resulting_activation = event.heritage.state.activations();
         let dimension = event.heritage.state.dimension();
 
-        let record_path = match canonical_record_path(
-            &substrate_path,
-            "exile",
-            resulting_activation,
-            u128::from(dimension),
-        ) {
+        let record_path = match canonical_record_path(&substrate_path, "exile", resulting_activation, u128::from(dimension)) {
             Ok(path) => path,
             Err(e) => return e,
         };
 
         for network_id in &network_ids {
-            if let Err(e) = write_depth_payload(
-                &record_path,
-                network_id,
-                &event.depth,
-            ) {
+            if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
                 return e;
             }
         }
@@ -3085,23 +2666,12 @@ fn handle_exile_wallet(name: String) -> HttpResponse {
         network: event.qtm.net_work.to_string(),
     };
 
-    let payload = EventPayload::from_heritage(
-        event.heritage,
-        event.depth,
-        Scale::Local,
-    );
+    let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
 
-    json_response(
-        StatusCode::OK,
-        &direction_response(payload, None, qtm),
-    )
+    json_response(StatusCode::OK, &direction_response(payload, None, qtm))
 }
 
-fn load_wirepackets(
-    name: &str,
-    activation: u64,
-    network: &str,
-) -> ApiResult<WirePacketsResponse> {
+fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<WirePacketsResponse> {
     validate_wirepackets_scope(name, network)?;
 
     let lock = substrate_lock(name);
@@ -3109,13 +2679,9 @@ fn load_wirepackets(
 
     let substrate_path = ensure_existing_substrate(name)?;
 
-    let budget = load_network_budget(&substrate_path, activation, network)?
-        .ok_or_else(|| {
-            error(
-                StatusCode::NOT_FOUND,
-                "no WirePackets budget configured for this activation and network",
-            )
-        })?;
+    let budget = load_network_budget(&substrate_path, activation, network)?.ok_or_else(|| {
+        error(StatusCode::NOT_FOUND, "no WirePackets budget configured for this activation and network")
+    })?;
 
     let event_path = commands::substrate_root()
         .join(name)
@@ -3142,36 +2708,24 @@ fn load_wirepackets(
         };
 
         let bytes = std::fs::read(&path).map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read submission {submission}: {e}"),
-            )
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read submission {submission}: {e}"))
         })?;
 
         let next_size = total_bytes
             .checked_add(bytes.len() as u64)
-            .ok_or_else(|| {
-                error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "combined WirePackets size overflow",
-                )
-            })?;
+            .ok_or_else(|| error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size overflow"))?;
 
         if next_size > WIREPACKETS_MAX_BYTES {
             return Err(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
-                ),
+                format!("combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"),
             ));
         }
 
         let packets = decode_wirepackets(&bytes).map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "invalid WirePackets for activation {activation}, submission {submission}: {e}"
-                ),
+                format!("invalid WirePackets for activation {activation}, submission {submission}: {e}"),
             )
         })?;
 
@@ -3206,22 +2760,14 @@ fn load_wirepackets(
     })
 }
 
-fn handle_get_wirepackets(
-    name: String,
-    activation: u64,
-    network: String,
-) -> HttpResponse {
+fn handle_get_wirepackets(name: String, activation: u64, network: String) -> HttpResponse {
     match load_wirepackets(&name, activation, &network) {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(response) => response,
     }
 }
 
-fn handle_get_wirepackets_file(
-    name: String,
-    activation: u64,
-    network: String,
-) -> HttpResponse {
+fn handle_get_wirepackets_file(name: String, activation: u64, network: String) -> HttpResponse {
     if let Err(e) = validate_wirepackets_scope(&name, &network) {
         return e;
     }
@@ -3237,19 +2783,12 @@ fn handle_get_wirepackets_file(
     let budget = match load_network_budget(&substrate_path, activation, &network) {
         Ok(Some(budget)) => budget,
         Ok(None) => {
-            return error(
-                StatusCode::NOT_FOUND,
-                "no WirePackets budget configured for this activation and network",
-            );
+            return error(StatusCode::NOT_FOUND, "no WirePackets budget configured for this activation and network");
         }
         Err(e) => return e,
     };
 
-    let persisted = match has_persisted_wirepackets(
-        &name,
-        activation,
-        Some(budget.max_events),
-    ) {
+    let persisted = match has_persisted_wirepackets(&name, activation, Some(budget.max_events)) {
         Ok(persisted) => persisted,
         Err(e) => return e,
     };
@@ -3286,24 +2825,17 @@ fn handle_get_wirepackets_file(
                 }
             };
 
-            let next_size = match (combined.len() as u64)
-                .checked_add(bytes.len() as u64)
-            {
+            let next_size = match (combined.len() as u64).checked_add(bytes.len() as u64) {
                 Some(size) => size,
                 None => {
-                    return error(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "combined WirePackets size overflow",
-                    );
+                    return error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size overflow");
                 }
             };
 
             if next_size > WIREPACKETS_MAX_BYTES {
                 return error(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
-                    ),
+                    format!("combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"),
                 );
             }
 
@@ -3312,24 +2844,13 @@ fn handle_get_wirepackets_file(
     }
 
     if combined.is_empty() {
-        return error(
-            StatusCode::NOT_FOUND,
-            "no persisted WirePackets submissions within configured budget",
-        );
+        return error(StatusCode::NOT_FOUND, "no persisted WirePackets submissions within configured budget");
     }
 
-    bytes_response(
-        StatusCode::OK,
-        "application/octet-stream",
-        combined,
-    )
+    bytes_response(StatusCode::OK, "application/octet-stream", combined)
 }
 
-async fn handle_start_bitminer(
-    name: String,
-    activation: u64,
-    network: String,
-) -> HttpResponse {
+async fn handle_start_bitminer(name: String, activation: u64, network: String) -> HttpResponse {
     if let Err(e) = validate_bitminer_scope(&name, &network) {
         return e;
     }
@@ -3339,10 +2860,7 @@ async fn handle_start_bitminer(
     }
 
     if !bit_minner_enabled() && std::env::var_os("BIT_MINER_BIN").is_none() {
-        return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "bit-miner feature not enabled and BIT_MINER_BIN not set",
-        );
+        return error(StatusCode::NOT_IMPLEMENTED, "bit-miner feature not enabled and BIT_MINER_BIN not set");
     }
 
     let key = bitminer_key(&name, activation, &network);
@@ -3367,39 +2885,29 @@ async fn handle_start_bitminer(
         );
     }
 
-    let (executable, mode_args): (std::ffi::OsString, Vec<&str>) =
-        match std::env::var_os("BIT_MINER_BIN") {
-            Some(bin) => (bin, Vec::new()),
-            None => match std::env::current_exe() {
-                Ok(exe) => (exe.into_os_string(), vec!["--bit-miner"]),
-                Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("unable to locate executable: {e}"),
-                    );
-                }
-            },
-        };
+    let (executable, mode_args): (std::ffi::OsString, Vec<&str>) = match std::env::var_os("BIT_MINER_BIN") {
+        Some(bin) => (bin, Vec::new()),
+        None => match std::env::current_exe() {
+            Ok(exe) => (exe.into_os_string(), vec!["--bit-miner"]),
+            Err(e) => {
+                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to locate executable: {e}"));
+            }
+        },
+    };
 
     let log_path = bitminer_log_path(&name, activation, &network);
 
     let log_file = match std::fs::File::create(&log_path) {
         Ok(file) => file,
         Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to create log file: {e}"),
-            );
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to create log file: {e}"));
         }
     };
 
     let log_file_err = match log_file.try_clone() {
         Ok(file) => file,
         Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to open log file: {e}"),
-            );
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to open log file: {e}"));
         }
     };
 
@@ -3416,10 +2924,7 @@ async fn handle_start_bitminer(
     {
         Ok(child) => child,
         Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to start bit-miner: {e}"),
-            );
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start bit-miner: {e}"));
         }
     };
 
@@ -3439,11 +2944,7 @@ async fn handle_start_bitminer(
     )
 }
 
-async fn handle_get_bitminer_status(
-    name: String,
-    activation: u64,
-    network: String,
-) -> HttpResponse {
+async fn handle_get_bitminer_status(name: String, activation: u64, network: String) -> HttpResponse {
     if let Err(e) = validate_bitminer_scope(&name, &network) {
         return e;
     }
@@ -3457,13 +2958,8 @@ async fn handle_get_bitminer_status(
     };
 
     let log_path = bitminer_log_path(&name, activation, &network);
-    let event_path = commands::event_path_at_activation(&name, activation)
-        .map(|path| path.display().to_string());
-    let last_error = if running {
-        None
-    } else {
-        bitminer_log_tail(&log_path)
-    };
+    let event_path = commands::event_path_at_activation(&name, activation).map(|path| path.display().to_string());
+    let last_error = if running { None } else { bitminer_log_tail(&log_path) };
 
     json_response(
         StatusCode::OK,
@@ -3483,11 +2979,7 @@ async fn handle_get_bitminer_status(
     )
 }
 
-async fn handle_stop_bitminer(
-    name: String,
-    activation: u64,
-    network: String,
-) -> HttpResponse {
+async fn handle_stop_bitminer(name: String, activation: u64, network: String) -> HttpResponse {
     if let Err(e) = validate_bitminer_scope(&name, &network) {
         return e;
     }
@@ -3532,18 +3024,12 @@ async fn handle_stop_bitminer(
         }
         Ok(None) => {}
         Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect bit-miner process: {e}"),
-            );
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect bit-miner process: {e}"));
         }
     }
 
     if let Err(e) = child.kill().await {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unable to stop bit-miner process: {e}"),
-        );
+        return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to stop bit-miner process: {e}"));
     }
 
     json_response(
@@ -3560,11 +3046,7 @@ async fn handle_stop_bitminer(
     )
 }
 
-fn handle_get_bitminer_log(
-    name: String,
-    activation: u64,
-    network: String,
-) -> HttpResponse {
+fn handle_get_bitminer_log(name: String, activation: u64, network: String) -> HttpResponse {
     if let Err(e) = validate_bitminer_scope(&name, &network) {
         return e;
     }
@@ -3576,36 +3058,21 @@ fn handle_get_bitminer_log(
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            let status = if e.kind() == ErrorKind::NotFound {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-
+            let status = if e.kind() == ErrorKind::NotFound { StatusCode::NOT_FOUND } else { StatusCode::INTERNAL_SERVER_ERROR };
             return error(status, format!("unable to read bit-miner log: {e}"));
         }
     };
 
     let start = bytes.len().saturating_sub(BITMINER_LOG_MAX_BYTES);
     let body = String::from_utf8_lossy(&bytes[start..]).into_owned();
-    let mut response = bytes_response(
-        StatusCode::OK,
-        "text/plain; charset=utf-8",
-        body,
-    );
+    let mut response = bytes_response(StatusCode::OK, "text/plain; charset=utf-8", body);
 
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     response
 }
 
-async fn handle_list_bitcoin_observations(
-    name: String,
-    activation: u64,
-) -> HttpResponse {
+async fn handle_list_bitcoin_observations(name: String, activation: u64) -> HttpResponse {
     if !valid_substrate_name(&name) {
         return error(StatusCode::BAD_REQUEST, "invalid substrate name");
     }
@@ -3616,20 +3083,13 @@ async fn handle_list_bitcoin_observations(
     match bitminer_process_list(&name, activation).await {
         Ok(pipelines) => json_response(
             StatusCode::OK,
-            &BitMinerProcessListResponse {
-                substrate: name,
-                activation,
-                pipelines,
-            },
+            &BitMinerProcessListResponse { substrate: name, activation, pipelines },
         ),
         Err(e) => e,
     }
 }
 
-async fn handle_get_payload_board(
-    name: String,
-    activation: u64,
-) -> HttpResponse {
+async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse {
     let miner = match bitminer_process_state_any(&name, activation).await {
         Ok(miner) => miner,
         Err(e) => return e,
@@ -3659,19 +3119,12 @@ fn handle_exile_depth(name: String) -> HttpResponse {
         Err(e) => return e,
     };
 
-    let record = record_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string();
+    let record = record_path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
 
     let entries = match std::fs::read_dir(&record_path) {
         Ok(entries) => entries,
         Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read exile payloads: {e}"),
-            );
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read exile payloads: {e}"));
         }
     };
 
@@ -3681,10 +3134,7 @@ fn handle_exile_depth(name: String) -> HttpResponse {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read exile network: {e}"),
-                );
+                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read exile network: {e}"));
             }
         };
 
@@ -3696,9 +3146,7 @@ fn handle_exile_depth(name: String) -> HttpResponse {
         let network_id = entry.file_name().to_string_lossy().into_owned();
         let payload_path = network_path.join("payload");
 
-        if !payload_path.join("depth.path").is_file()
-            || !payload_path.join("depth.objects").is_file()
-        {
+        if !payload_path.join("depth.path").is_file() || !payload_path.join("depth.objects").is_file() {
             continue;
         }
 
@@ -3709,18 +3157,12 @@ fn handle_exile_depth(name: String) -> HttpResponse {
 
         let selected = selected_network(&network_id);
         let registered = selected.is_some();
-        let network_name = selected
-            .map(|network| network.name)
-            .unwrap_or_else(|| network_id.clone());
+        let network_name = selected.map(|network| network.name).unwrap_or_else(|| network_id.clone());
 
         payloads.push(PersistedPayloadEntry {
             record: record.clone(),
             direction: "exile_outputs".to_string(),
-            network: PersistedPayloadNetwork {
-                id: network_id,
-                name: network_name,
-                registered,
-            },
+            network: PersistedPayloadNetwork { id: network_id, name: network_name, registered },
             path: payload_path.display().to_string(),
             depth_identifier: depth.path,
             objects: depth.objects,
@@ -3837,21 +3279,29 @@ Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (net).to_s
 Err(e) => e,
 }
 }
+#[cfg(feature = "bit-miner")]
+(Method::POST, ["wallets", name, "activations", act, "submissions", sub, "derive"]) => {
+match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
+(Ok(a), Ok(s)) => handle_derive_submission((*name).to_string(), a, s, req).await,
+(Err(e), _) | (_, Err(e)) => e,
+}
+}
+#[cfg(feature = "bit-miner")]
+(Method::GET, ["wallets", name, "activations", act, "submissions", sub, field]) => {
+match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
+(Ok(a), Ok(s)) => handle_get_submission_value((*name).to_string(), a, s, (*field).to_string()),
+(Err(e), _) | (_, Err(e)) => e,
+}
+}
 _ => error(StatusCode::NOT_FOUND, format!("route not found: {raw_path}")),
 }
 }
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
 fn run_bit_miner(args: &[String]) -> ! {
-    use bit_miner::observestream::{
-        MempoolSpaceStream,
-        MempoolStreamMode,
-    };
+    use bit_miner::observestream::{MempoolSpaceStream, MempoolStreamMode};
 
-    let activation = args.first()
-        .expect("missing activation")
-        .parse::<u64>()
-        .expect("invalid activation");
+    let activation = args.first().expect("missing activation").parse::<u64>().expect("invalid activation");
 
     let substrate = args.get(1).expect("missing substrate").clone();
     let network = args.get(2).expect("missing network").clone();
@@ -3861,29 +3311,19 @@ fn run_bit_miner(args: &[String]) -> ! {
         std::process::exit(2);
     }
 
-    let mut pipeline =
-        bit_miner::BitcoinObservationPipeline::new(
-            activation,
-            &substrate,
-            &network,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("bit-miner: pipeline initialization failed: {e}");
-            std::process::exit(1);
-        });
+    let mut pipeline = bit_miner::BitcoinObservationPipeline::new(activation, &substrate, &network).unwrap_or_else(|e| {
+        eprintln!("bit-miner: pipeline initialization failed: {e}");
+        std::process::exit(1);
+    });
 
     let pipeline_network = pipeline.network();
 
     if selected_network(pipeline_network).is_none() {
-        eprintln!(
-            "bit-miner: pipeline network is not registered: {pipeline_network}",
-        );
+        eprintln!("bit-miner: pipeline network is not registered: {pipeline_network}");
         std::process::exit(2);
     }
 
-    eprintln!(
-        "bit-miner: pipeline ready substrate={substrate} activation={activation} network={pipeline_network}",
-    );
+    eprintln!("bit-miner: pipeline ready substrate={substrate} activation={activation} network={pipeline_network}");
 
     let resolver = WirePacketPrevoutResolver::new(&substrate, activation);
 
@@ -3894,10 +3334,7 @@ fn run_bit_miner(args: &[String]) -> ! {
 
     runtime.block_on(async move {
         loop {
-            let mut observation_stream = match MempoolSpaceStream::connect(
-                activation,
-                MempoolStreamMode::TransactionIds,
-            ).await {
+            let mut observation_stream = match MempoolSpaceStream::connect(activation, MempoolStreamMode::TransactionIds).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     eprintln!("bit-miner: stream connection failed: {e}");
@@ -3906,14 +3343,9 @@ fn run_bit_miner(args: &[String]) -> ! {
             };
 
             loop {
-                match observation_stream
-                    .stream(&substrate, &mut pipeline, &resolver)
-                    .await
-                {
+                match observation_stream.stream(&substrate, &mut pipeline, &resolver).await {
                     Ok(Ok(Some(_))) => {
-                        eprintln!(
-                            "bit-miner: transaction processed substrate={substrate} activation={activation}"
-                        );
+                        eprintln!("bit-miner: transaction processed substrate={substrate} activation={activation}");
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(e)) => eprintln!("bit-miner: pipeline error: {e}"),
@@ -3982,11 +3414,9 @@ async fn serve() {
             println!("substrates_discovered={}", discovered.len());
 
             for substrate in discovered {
-                let commitment = read_trim(
-                    &root.join(&substrate).join("qtm.commitment"),
-                )
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "unavailable".to_string());
+                let commitment = read_trim(&root.join(&substrate).join("qtm.commitment"))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "unavailable".to_string());
 
                 println!("substrate={substrate} commitment={commitment}");
             }
@@ -4012,15 +3442,11 @@ async fn serve() {
 
     let listener = TcpListener::bind(&http_address)
         .await
-        .unwrap_or_else(|e| {
-            panic!("failed to bind qtm-api HTTP listener at {http_address}: {e}")
-        });
+        .unwrap_or_else(|e| panic!("failed to bind qtm-api HTTP listener at {http_address}: {e}"));
 
     let electrum_listener = TcpListener::bind(&electrum_address)
         .await
-        .unwrap_or_else(|e| {
-            panic!("failed to bind qtm-api Electrum listener at {electrum_address}: {e}")
-        });
+        .unwrap_or_else(|e| panic!("failed to bind qtm-api Electrum listener at {electrum_address}: {e}"));
 
     println!(
         "qtm-api Hyper HTTP/1 listener bound at {}",
@@ -4045,14 +3471,9 @@ async fn serve() {
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
 
-            let service = service_fn(|req: Request<Incoming>| async move {
-                Ok::<_, Infallible>(dispatch(req).await)
-            });
+            let service = service_fn(|req: Request<Incoming>| async move { Ok::<_, Infallible>(dispatch(req).await) });
 
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-            {
+            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
                 eprintln!("HTTP/1 connection error: {e}");
             }
         });
