@@ -1962,6 +1962,182 @@ async fn serve_electrum(listener: TcpListener) -> std::io::Result<()> {
     }
 }
 
+async fn handle_electrum_websocket(mut req: Request<Incoming>) -> HttpResponse {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{
+        tungstenite::{
+            handshake::derive_accept_key,
+            protocol::{Role, Message},
+        },
+        WebSocketStream,
+    };
+
+    let is_websocket_upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+
+    let has_connection_upgrade = req
+        .headers()
+        .get(header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+
+    let websocket_key = req
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok());
+
+    let websocket_version = req
+        .headers()
+        .get("sec-websocket-version")
+        .and_then(|value| value.to_str().ok());
+
+    let Some(websocket_key) = websocket_key else {
+        return error(StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key");
+    };
+
+    if !is_websocket_upgrade || !has_connection_upgrade || websocket_version != Some("13") {
+        return error(StatusCode::BAD_REQUEST, "invalid WebSocket upgrade request");
+    }
+
+    let accept_key = derive_accept_key(websocket_key.as_bytes());
+
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+
+    response.headers_mut().insert(
+        header::UPGRADE,
+        HeaderValue::from_static("websocket"),
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+
+    let accept_header = match HeaderValue::from_str(&accept_key) {
+        Ok(value) => value,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid WebSocket accept key: {e}"),
+            );
+        }
+    };
+
+    response.headers_mut().insert(
+        "sec-websocket-accept",
+        accept_header,
+    );
+
+    let on_upgrade = hyper::upgrade::on(&mut req);
+
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(e) => {
+                eprintln!("electrum WebSocket upgrade failed: {e}");
+                return;
+            }
+        };
+
+        let io = TokioIo::new(upgraded);
+
+        let mut socket = WebSocketStream::from_raw_socket(
+            io,
+            Role::Server,
+            None,
+        )
+        .await;
+
+        println!("electrum WebSocket client connected");
+
+        while let Some(message) = socket.next().await {
+            let text = match message {
+                Ok(Message::Text(text)) => text.to_string(),
+                Ok(Message::Close(_)) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("electrum WebSocket read error: {e}");
+                    break;
+                }
+            };
+
+            let response = match serde_json::from_str::<Value>(&text) {
+                Ok(request) => {
+                    let id = request.get("id").cloned().unwrap_or(Value::Null);
+                    let method = request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let params = request
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        route_electrum_method(&method, &params)
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(value)) => {
+                            json!({"jsonrpc": "2.0", "id": id, "result": value})
+                        }
+                        Ok(Err(error)) => {
+                            json!({"jsonrpc": "2.0", "id": id, "error": error})
+                        }
+                        Err(e) => {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32603,
+                                    "message": format!("Electrum request failed: {e}")
+                                }
+                            })
+                        }
+                    }
+                }
+                Err(e) => {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": -32700,
+                            "message": format!("parse error: {e}")
+                        }
+                    })
+                }
+            };
+
+            let output = match serde_json::to_string(&response) {
+                Ok(output) => output,
+                Err(e) => {
+                    eprintln!("electrum WebSocket serialization error: {e}");
+                    continue;
+                }
+            };
+
+            if let Err(e) = socket.send(Message::Text(output.into())).await {
+                eprintln!("electrum WebSocket write error: {e}");
+                break;
+            }
+        }
+
+        println!("electrum WebSocket client disconnected");
+    });
+
+    response
+}
+
+
 fn substrate_active_activation(substrate_path: &FsPath) -> Option<u64> {
     read_trim(&substrate_path.join("activation")).and_then(|v| v.trim().parse::<u64>().ok())
 }
@@ -3585,47 +3761,66 @@ Err(e) => e,
 // ---------- Hyper Route Dispatcher ---------- */
 async fn dispatch(req: Request<Incoming>) -> HttpResponse {
 let method = req.method().clone();
+
 if method == Method::OPTIONS {
 return handle_preflight();
 }
+
+if method == Method::GET
+    && req.uri().path().trim_end_matches('/') == "/electrum"
+{
+    return handle_electrum_websocket(req).await;
+}
+
 let raw_path = req.uri().path().to_string();
 let trimmed = raw_path.trim_end_matches('/');
 let path = if trimmed.is_empty() { "/" } else { trimmed };
 let segments: Vec<&str> = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+
 match (method, segments.as_slice()) {
 (Method::GET, ["health"]) => handle_health(),
 (Method::GET, ["networks"]) => handle_list_networks(),
 (Method::GET, ["wallets"]) => handle_list_wallets(),
 (Method::HEAD, ["wallets"]) => handle_head_wallets(),
 (Method::POST, ["wallets"]) => handle_create_wallet(req).await,
+
 (Method::GET, ["wallets", name, "activations", act, "open"]) => match parse_u64_param(act, "activation") {
 Ok(a) => handle_open_wallet((*name).to_string(), a),
 Err(e) => e,
 },
+
 (Method::GET, ["wallets", name, "events"]) => handle_list_events((*name).to_string()),
+
 (Method::GET, ["wallets", name, "events", record, "payloads"]) => {
 handle_list_event_payloads((*name).to_string(), (*record).to_string())
 }
+
 (Method::POST, ["wallets", name, "transit"]) => handle_transit_wallet((*name).to_string(), req).await,
 (Method::POST, ["wallets", name, "receive"]) => handle_receive_wallet((*name).to_string(), req).await,
+
 (Method::GET, ["wallets", name, "exile", "depth"]) => handle_exile_depth((*name).to_string()),
 (Method::POST, ["wallets", name, "exile"]) => handle_exile_wallet((*name).to_string()),
+
 (Method::GET, ["wallets", name, "activations", act, "budgets"]) => match parse_u64_param(act, "activation") {
 Ok(a) => handle_list_activation_budgets((*name).to_string(), a),
 Err(e) => e,
 },
+
 (Method::PUT, ["wallets", name, "activations", act, "budgets", net]) => match parse_u64_param(act, "activation") {
 Ok(a) => handle_update_activation_network_budget((*name).to_string(), a, (*net).to_string(), req).await,
 Err(e) => e,
 },
+
 (Method::GET, ["wallets", name, "activations", act, "observations"]) => match parse_u64_param(act, "activation") {
 Ok(a) => handle_list_bitcoin_observations((*name).to_string(), a).await,
 Err(e) => e,
 },
+
 (Method::GET, ["wallets", name, "activations", act, "payload-board"]) => match parse_u64_param(act, "activation") {
 Ok(a) => handle_get_payload_board((*name).to_string(), a).await,
 Err(e) => e,
 },
+
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "observation"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_get_bitminer_status((*name).to_string(), a, (*net).to_string()).await,
@@ -3643,30 +3838,35 @@ Ok(a) => handle_start_bitminer((*name).to_string(), a, (*net).to_string()).await
 Err(e) => e,
 }
 }
+
 (Method::DELETE, ["wallets", name, "activations", act, "networks", net, "observation"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_stop_bitminer((*name).to_string(), a, (*net).to_string()).await,
 Err(e) => e,
 }
 }
+
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "observation", "log"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_get_bitminer_log((*name).to_string(), a, (*net).to_string()),
 Err(e) => e,
 }
 }
+
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepackets"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_get_wirepackets((*name).to_string(), a, (*net).to_string()),
 Err(e) => e,
 }
 }
+
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepackets", "file"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_get_wirepackets_file((*name).to_string(), a, (*net).to_string()),
 Err(e) => e,
 }
 }
+
 (Method::GET, ["wallets", name, "activations", act, "networks", net, "payload-board"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (*net).to_string()).await,
@@ -3708,10 +3908,10 @@ Err(e) => e,
         (Err(e), _) | (_, Err(e)) => e,
     }
 }
+
 _ => error(StatusCode::NOT_FOUND, "route not found"),
 }
 }
-
 
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
@@ -3848,33 +4048,18 @@ async fn serve() {
         .filter(|port| *port != 0)
         .unwrap_or(8080);
 
-    let electrum = electrum_port();
-
-    if port == electrum {
-        panic!("HTTP and Electrum cannot share port {port}");
-    }
-
     let http_address = format!("0.0.0.0:{port}");
-    let electrum_address = format!("0.0.0.0:{electrum}");
 
     let listener = TcpListener::bind(&http_address)
         .await
         .unwrap_or_else(|e| panic!("failed to bind qtm-api HTTP listener at {http_address}: {e}"));
-
-    let electrum_listener = TcpListener::bind(&electrum_address)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind qtm-api Electrum listener at {electrum_address}: {e}"));
 
     println!(
         "qtm-api Hyper HTTP/1 listener bound at {}",
         listener.local_addr().expect("HTTP listener address unavailable")
     );
 
-    tokio::spawn(async move {
-        if let Err(e) = serve_electrum(electrum_listener).await {
-            eprintln!("Electrum listener stopped: {e}");
-        }
-    });
+    println!("qtm-api Electrum WebSocket endpoint: /electrum");
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -3888,9 +4073,17 @@ async fn serve() {
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
 
-            let service = service_fn(|req: Request<Incoming>| async move { Ok::<_, Infallible>(dispatch(req).await) });
+            let service = service_fn(
+                |req: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(dispatch(req).await)
+                },
+            );
 
-            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+            {
                 eprintln!("HTTP/1 connection error: {e}");
             }
         });
