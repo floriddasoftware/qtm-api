@@ -1673,8 +1673,165 @@ fn electrum_port() -> u16 {
         .unwrap_or(50001)
 }
 
+
 fn route_electrum_method(method: &str, params: &Value) -> Result<Value, Value> {
+    const PROTOCOL_MIN: &str = "1.4";
+    const PROTOCOL_MAX: &str = "1.6";
+
+    let parse_version = |version: &str| -> Option<Vec<u32>> {
+        let parts = version
+            .split('.')
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+
+        if parts.len() < 2 || parts.len() > 3 {
+            return None;
+        }
+
+        Some(parts)
+    };
+
+    let compare_versions = |a: &[u32], b: &[u32]| {
+        let length = a.len().max(b.len());
+
+        (0..length)
+            .map(|i| {
+                (
+                    a.get(i).copied().unwrap_or(0),
+                    b.get(i).copied().unwrap_or(0),
+                )
+            })
+            .find_map(|(a, b)| (a != b).then_some(a.cmp(&b)))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+
     match method {
+        "server.version" => {
+            let args = params.as_array().ok_or_else(|| {
+                json!({
+                    "code": -32602,
+                    "message": "expected [client_name, protocol_version]"
+                })
+            })?;
+
+            if args.len() != 2 {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "expected [client_name, protocol_version]"
+                }));
+            }
+
+            let _client_name = args[0].as_str().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid client name"})
+            })?;
+
+            let (client_min, client_max) = match &args[1] {
+                Value::String(version) => (version.as_str(), version.as_str()),
+
+                Value::Array(versions) if versions.len() == 2 => {
+                    let min = versions[0].as_str().ok_or_else(|| {
+                        json!({"code": -32602, "message": "invalid minimum protocol version"})
+                    })?;
+
+                    let max = versions[1].as_str().ok_or_else(|| {
+                        json!({"code": -32602, "message": "invalid maximum protocol version"})
+                    })?;
+
+                    (min, max)
+                }
+
+                _ => {
+                    return Err(json!({
+                        "code": -32602,
+                        "message": "invalid protocol version range"
+                    }));
+                }
+            };
+
+            let client_min = parse_version(client_min).ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid minimum protocol version"})
+            })?;
+
+            let client_max = parse_version(client_max).ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid maximum protocol version"})
+            })?;
+
+            let server_min = parse_version(PROTOCOL_MIN).unwrap();
+            let server_max = parse_version(PROTOCOL_MAX).unwrap();
+
+            if compare_versions(&client_min, &client_max)
+                == std::cmp::Ordering::Greater
+            {
+                return Err(json!({
+                    "code": -32602,
+                    "message": "minimum protocol version exceeds maximum"
+                }));
+            }
+
+            if compare_versions(&client_min, &server_max)
+                == std::cmp::Ordering::Greater
+                || compare_versions(&client_max, &server_min)
+                    == std::cmp::Ordering::Less
+            {
+                return Err(json!({
+                    "code": -1,
+                    "message": "no compatible Electrum protocol version"
+                }));
+            }
+
+            let negotiated = if compare_versions(&client_max, &server_max)
+                == std::cmp::Ordering::Less
+            {
+                client_max
+            } else {
+                server_max
+            };
+
+            if compare_versions(&negotiated, &client_min)
+                == std::cmp::Ordering::Less
+            {
+                return Err(json!({
+                    "code": -1,
+                    "message": "no compatible Electrum protocol version"
+                }));
+            }
+
+            let negotiated = negotiated
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+
+            Ok(json!(["QTM-API", negotiated]))
+        }
+
+        "server.features" => {
+            let args = params.as_array().ok_or_else(|| {
+                json!({"code": -32602, "message": "expected []"})
+            })?;
+
+            if !args.is_empty() {
+                return Err(json!({"code": -32602, "message": "expected []"}));
+            }
+
+            Ok(json!({
+                "server_version": "QTM-API",
+                "protocol_min": PROTOCOL_MIN,
+                "protocol_max": PROTOCOL_MAX,
+                "genesis_hash": "000000000019d6689c085ae165831e934ff763ae46a2c172b3f1b60a8ce26f",
+                "hash_function": "sha256",
+                "hosts": {},
+                "pruning": null
+            }))
+        }
+
+        "server.banner" => {
+            Ok(json!(
+                "QTM-API Electrum interface. QTM WirePackets are served through the QTM protocol."
+            ))
+        }
+
         "server.ping" => Ok(Value::Null),
 
         "qtm.wirepackets.get" => {
@@ -1683,26 +1840,47 @@ fn route_electrum_method(method: &str, params: &Value) -> Result<Value, Value> {
             })?;
 
             if args.len() != 3 {
-                return Err(json!({"code": -32602, "message": "expected [substrate, activation, network]"}));
+                return Err(json!({
+                    "code": -32602,
+                    "message": "expected [substrate, activation, network]"
+                }));
             }
 
-            let name = args[0].as_str().ok_or_else(|| json!({"code": -32602, "message": "invalid substrate"}))?;
-            let activation = args[1].as_u64().ok_or_else(|| json!({"code": -32602, "message": "invalid activation"}))?;
-            let network = args[2].as_str().ok_or_else(|| json!({"code": -32602, "message": "invalid network"}))?;
-
-            let response = load_wirepackets(name, activation, network).map_err(|response| {
-                json!({
-                    "code": -32000,
-                    "message": format!("WirePackets request failed: HTTP {}", response.status().as_u16())
-                })
+            let name = args[0].as_str().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid substrate"})
             })?;
 
+            let activation = args[1].as_u64().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid activation"})
+            })?;
+
+            let network = args[2].as_str().ok_or_else(|| {
+                json!({"code": -32602, "message": "invalid network"})
+            })?;
+
+            let response = load_wirepackets(name, activation, network)
+                .map_err(|response| {
+                    json!({
+                        "code": -32000,
+                        "message": format!(
+                            "WirePackets request failed: HTTP {}",
+                            response.status().as_u16()
+                        )
+                    })
+                })?;
+
             serde_json::to_value(response).map_err(|e| {
-                json!({"code": -32603, "message": format!("unable to serialize WirePackets: {e}")})
+                json!({
+                    "code": -32603,
+                    "message": format!("unable to serialize WirePackets: {e}")
+                })
             })
         }
 
-        _ => Err(json!({"code": -32601, "message": format!("method not found: {method}")})),
+        _ => Err(json!({
+            "code": -32601,
+            "message": format!("method not found: {method}")
+        })),
     }
 }
 
