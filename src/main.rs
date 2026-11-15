@@ -2700,18 +2700,6 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         return error(StatusCode::BAD_REQUEST, format!("ordinal exceeds receive amount: maximum={}", body.amount));
     }
 
-    let network_id = body.network.trim();
-
-    if !valid_observation_network_id(network_id) {
-        return error(StatusCode::BAD_REQUEST, "invalid network identifier");
-    }
-
-    let network = match selected_network(network_id) {
-        Some(network) => network,
-        None => {
-            return error(StatusCode::BAD_REQUEST, format!("network is not registered: {network_id}"));
-        }
-    };
 
     let change_requested = match body.flow.trim().to_ascii_lowercase().as_str() {
         "receive" => false,
