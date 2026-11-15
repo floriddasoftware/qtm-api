@@ -2213,7 +2213,30 @@ async fn handle_create_wallet(req: Request<Incoming>) -> HttpResponse {
 }
 
 
+fn load_wallet_substrate(name: &str) -> ApiResult<SubstrateResponse> {
+    ensure_existing_substrate(name)?;
+    substrate_json(name)
+}
+
+fn handle_get_wallet(name: String) -> HttpResponse {
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    match load_wallet_substrate(&name) {
+        Ok(substrate) => json_response(StatusCode::OK, &substrate),
+        Err(e) => e,
+    }
+}
+
 fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate = match load_wallet_substrate(&name) {
+        Ok(substrate) => substrate,
+        Err(e) => return e,
+    };
+
     if activation == 0 {
         return error(
             StatusCode::BAD_REQUEST,
@@ -2221,16 +2244,6 @@ fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
         );
     }
 
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-    let _substrate_path = match ensure_existing_substrate(&name) {
-        Ok(path) => path,
-        Err(e) => return e,
-    };
-
-    // Resolve only the UI-selected ordinal. Do not substitute the
-    // substrate's current activation.
     let record_path = if let Some(path) =
         commands::exile_path_at_activation(&name, activation)
     {
@@ -2254,8 +2267,6 @@ fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
         .unwrap_or_default()
         .to_string();
 
-    // Load the exact selected event. This supports both persisted
-    // transit and exile records without executing another transition.
     let persisted = match guarded(
         "selected ordinal event load",
         || commands::load_event_at_activation(&name, activation),
@@ -2280,11 +2291,6 @@ fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
     );
 
     let event = Some(payload_event_view(record, &payload));
-
-    let substrate = match substrate_json(&name) {
-        Ok(substrate) => substrate,
-        Err(e) => return e,
-    };
 
     json_response(
         StatusCode::OK,
@@ -2478,7 +2484,6 @@ fn handle_list_events(name: String) -> HttpResponse {
         },
     )
 }
-
 
 fn handle_list_event_payloads(name: String, record: String) -> HttpResponse {
 let lock = substrate_lock(&name);
@@ -3461,6 +3466,11 @@ Ok(a) => handle_get_bitminer_status((*name).to_string(), a, (*net).to_string()).
 Err(e) => e,
 }
 }
+
+(Method::GET, ["wallets", name]) => {
+    handle_get_wallet((*name).to_string())
+}
+
 (Method::POST, ["wallets", name, "activations", act, "networks", net, "observation"]) => {
 match parse_u64_param(act, "activation") {
 Ok(a) => handle_start_bitminer((*name).to_string(), a, (*net).to_string()).await,
