@@ -998,7 +998,7 @@ async fn handle_derive_submission(
 
     let persisted = match guarded(
         "submission QTM lookup",
-        || commands::load_event_at_activation(&name, submission),
+        || commands::load_event_at_activation(&name, activation),
     ) {
         Ok(event) => event,
         Err(e) => return e,
