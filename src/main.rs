@@ -13,7 +13,6 @@ use payload::EventPayload;
 use qp_hd::{
 commands,
 economic_gate::QuantumTransaction,
-load_budget,
 pathsregistry::{CoinType, PathsRegistry},
 purpose::{BIP39Handler, BIP39Language},
 qp44::{Flow, TotalMass},
@@ -2583,6 +2582,7 @@ Err(e) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to
 }
 Ok(false)
 }
+
 fn build_payload_board(
 name: &str,
 activation: u64,
@@ -2592,7 +2592,14 @@ miner: (bool, Option<u32>),
 let substrate_path = ensure_existing_substrate(name)?;
 let commitment = read_trim(&substrate_path.join("qtm.commitment"));
 let (process_running, pid) = miner;
-let wirepackets_persisted = has_persisted_wirepackets(name, activation, network,None)?;
+let wirepackets_persisted = match network_filter {
+Some(network) => {
+has_persisted_wirepackets(name, activation, network, None)?
+}
+None => {
+has_persisted_wirepackets_any_network(name, activation, None)?
+}
+};
 let loaded_event = load_payload_event(name, activation)?;
 let (event, depth_record, depth) = match loaded_event {
 Some((record, payload)) => {
@@ -2653,6 +2660,7 @@ runtime: serialize_runtime(SystemTime::now()),
 message,
 })
 }
+
 
 
 fn has_persisted_wirepackets_any_network(
@@ -3680,7 +3688,7 @@ fn handle_get_wirepackets_file(name: String, activation: u64, network: String) -
 
     if persisted {
         for submission in 1..=budget.max_events {
-            let path = commands::wirepackets_path(&name, activation, submission);
+            let path = commands::wirepackets_path(&name, activation, submission, &network);
 
             let metadata = match std::fs::metadata(&path) {
                 Ok(metadata) => metadata,
@@ -4265,7 +4273,8 @@ fn run_bit_miner(args: &[String]) -> ! {
 
     eprintln!("bit-miner: pipeline ready substrate={substrate} activation={activation} network={pipeline_network}");
 
-    let resolver = WirePacketPrevoutResolver::new(&substrate, activation);
+let resolver =
+    WirePacketPrevoutResolver::new(&substrate, activation, pipeline_network);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
