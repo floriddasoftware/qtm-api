@@ -4179,7 +4179,7 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
         return handle_electrum_websocket(req).await;
     }
 
-    let raw = req.uri().path();
+    let raw = req.uri().path().to_owned();
     let trimmed = raw.trim_end_matches('/');
     let path = if trimmed.is_empty() { "/" } else { trimmed };
     let segments: Vec<&str> = path.trim_start_matches('/')
