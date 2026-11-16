@@ -276,7 +276,6 @@ struct ReceiveRequest {
     amount: u64,
     flow: String,
     ordinal: u64,
-    network: String,
 }
 
 #[derive(Serialize)]
