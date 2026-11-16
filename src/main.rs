@@ -3368,7 +3368,7 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
 async fn handle_receive_wallet(
     name: String,
     submission: u64,
-    req: Request<Incoming>,
+    body: ReceiveRequest,
 ) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
         Ok(body) => body,
@@ -4200,7 +4200,20 @@ handle_list_event_payloads((*name).to_string(), (*record).to_string())
 (Method::POST, ["wallets", name, "transit"]) => {
     handle_transit_wallet((*name).to_string(), req).await
 }
-(Method::POST, ["wallets", name, "receive"]) => handle_receive_wallet((*name).to_string(), req).await,
+(Method::POST, ["wallets", name, "receive"]) => {
+    match parse_json_body(req).await {
+        Ok(body) => {
+            let submission = body.ordinal;
+            handle_receive_wallet(
+                (*name).to_string(),
+                submission,
+                body,
+            )
+            .await
+        }
+        Err(e) => e,
+    }
+}
 
 (Method::GET, ["wallets", name, "exile", "depth"]) => handle_exile_depth((*name).to_string()),
 (Method::POST, ["wallets", name, "exile"]) => handle_exile_wallet((*name).to_string()),
