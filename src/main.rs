@@ -141,7 +141,9 @@ subsec_nanos: u32,
 }
 #[derive(Serialize)]
 struct ReceiveResponse {
-frame: QuantumTransactionFrame,
+    frame: QuantumTransactionFrame,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derivation: Option<Value>,
 }
 #[derive(Serialize)]
 struct QuantumTransactionFrame {
@@ -941,6 +943,7 @@ fn persist_authorization(
 }
 
 
+
 #[cfg(feature = "bit-miner")]
 async fn handle_derive_submission(
     name: String,
@@ -953,9 +956,6 @@ async fn handle_derive_submission(
             "activation and submission must be greater than zero",
         );
     }
-
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
     if let Err(e) = ensure_existing_substrate(&name) {
         return e;
@@ -1041,11 +1041,11 @@ async fn handle_derive_submission(
         Ok(value) => match value.parse() {
             Ok(value) => value,
             Err(e) => {
-    return error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("invalid submission dimension: {e}"),
-    );
-    }
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("invalid submission dimension: {e}"),
+                );
+            }
         },
         Err(e) => return e,
     };
@@ -1386,6 +1386,7 @@ async fn handle_derive_submission(
         }),
     )
 }
+
 
 #[cfg(feature = "bit-miner")]
 fn handle_get_submission_value(
@@ -3362,6 +3363,7 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
     json_response(StatusCode::OK, &direction_response(event_payload, Some(selection), qtm))
 }
 
+
 /// POST /wallets/:name/receive
 async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
@@ -3370,19 +3372,30 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
     };
 
     if body.amount == 0 || body.ordinal == 0 {
-        return error(StatusCode::BAD_REQUEST, "amount and ordinal must be greater than zero");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "amount and ordinal must be greater than zero",
+        );
     }
 
     if body.ordinal > body.amount {
-        return error(StatusCode::BAD_REQUEST, format!("ordinal exceeds receive amount: maximum={}", body.amount));
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "ordinal exceeds receive amount: maximum={}",
+                body.amount
+            ),
+        );
     }
-
 
     let change_requested = match body.flow.trim().to_ascii_lowercase().as_str() {
         "receive" => false,
         "change" => true,
         _ => {
-            return error(StatusCode::BAD_REQUEST, "flow must be receive or change");
+            return error(
+                StatusCode::BAD_REQUEST,
+                "flow must be receive or change",
+            );
         }
     };
 
@@ -3398,17 +3411,24 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
     if commands::event_path_at_activation(&name, body.ordinal).is_none() {
         return error(
             StatusCode::NOT_FOUND,
-            format!("receive requires a persisted transit at ordinal {}", body.ordinal),
+            format!(
+                "receive requires a persisted transit at ordinal {}",
+                body.ordinal
+            ),
         );
     }
 
-    let transaction = match guarded("receive", || QuantumTransaction::send(&name, body.ordinal)) {
+    let transaction = match guarded("receive", || {
+        QuantumTransaction::send(&name, body.ordinal)
+    }) {
         Ok(transaction) => transaction,
         Err(e) => return e,
     };
 
     let constant_delta = match &transaction.constant {
-        qp_hd::PersistedEvent::Exile(event) => event.heritage.transition.delta,
+        qp_hd::PersistedEvent::Exile(event) => {
+            event.heritage.transition.delta
+        }
         qp_hd::PersistedEvent::Transit(..) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3417,7 +3437,11 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         }
     };
 
-    let flow = if change_requested { Flow::Change(constant_delta) } else { Flow::Receive };
+    let flow = if change_requested {
+        Flow::Change(constant_delta)
+    } else {
+        Flow::Receive
+    };
 
     let qtm = QtmResponse {
         commitment: hex::encode(transaction.qtm.commitment),
@@ -3433,14 +3457,59 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         constant_delta: constant_delta.to_string(),
     };
 
-    // Execute only the selected ordinal. Receive must preserve its persisted
-    // event state and depth rather than creating another forward transition.
-    let event = match guarded("receive", || transaction.receive(&name, flow)) {
+    // Execute only the selected ordinal. Preserve its persisted event state and depth.
+    let event = match guarded("receive", || {
+        transaction.receive(&name, flow)
+    }) {
         Ok(event) => event,
         Err(e) => return e,
     };
 
-    let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
+    // Capture the activation before moving event.heritage into EventPayload.
+    let activation = event.heritage.state.activations();
+    let submission = body.ordinal;
+
+    // Release the receive lock before invoking the derivation handler.
+    // handle_derive_submission acquires this same substrate lock.
+    drop(_guard);
+
+    #[cfg(feature = "bit-miner")]
+    let derivation = {
+        let response = handle_derive_submission(
+            name.clone(),
+            activation,
+            submission,
+        )
+        .await;
+
+        if !response.status().is_success() {
+            return response;
+        }
+
+        let bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(never) => match never {},
+        };
+
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to decode submission derivation response: {e}"),
+                );
+            }
+        }
+    };
+
+    #[cfg(not(feature = "bit-miner"))]
+    let derivation: Option<serde_json::Value> = None;
+
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
 
     json_response(
         StatusCode::OK,
@@ -3449,6 +3518,7 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
                 quantum_transaction: transaction_response,
                 event: event_map_response(payload, qtm),
             },
+            derivation,
         },
     )
 }
