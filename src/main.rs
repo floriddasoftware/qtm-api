@@ -966,128 +966,61 @@ async fn handle_derive_submission(
     if !base.is_dir() {
         return error(
             StatusCode::NOT_FOUND,
-            format!(
-                "submission directory does not exist: {}",
-                base.display()
-            ),
+            format!("submission directory does not exist: {}", base.display()),
         );
     }
 
-        let exile_response = handle_exile_wallet(
-        name.clone(),
-        Some(ReceiveRequest {
-            amount: activation,
-            flow: "receive".to_string(),
-            ordinal: submission,
-        }),
-    )
-    .await;
-
-    if !exile_response.status().is_success() {
-        return exile_response;
-    }
-
-    let exile_bytes = match exile_response.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(never) => match never {},
+    let read_submission_value = |field: &str| -> ApiResult<String> {
+        required_file(&base.join(field))
     };
 
-    let exile: Value = match serde_json::from_slice(&exile_bytes) {
+    let parse_submission_u64 = |field: &str| -> ApiResult<u64> {
+        let value = read_submission_value(field)?;
+        value.trim().parse::<u64>().map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid finalized submission value {field}: {e}"),
+            )
+        })
+    };
+
+    let parse_submission_u128 = |field: &str| -> ApiResult<u128> {
+        let value = read_submission_value(field)?;
+        value.trim().parse::<u128>().map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid finalized submission value {field}: {e}"),
+            )
+        })
+    };
+
+    let qtm_activation = match parse_submission_u64("manifold.activations") {
         Ok(value) => value,
-        Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to decode persisted exile response: {e}"),
-            );
-        }
+        Err(e) => return e,
     };
 
-    let heritage = match exile
-        .pointer("/frame/event/heritage")
-    {
-        Some(value) => value,
-        None => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile response is missing heritage",
-            );
-        }
+    let dimension = match parse_submission_u64("manifold.dimension") {
+        Ok(value) => value,
+        Err(e) => return e,
     };
 
-    let post_activation = match heritage
-        .pointer("/state/activations")
-        .and_then(Value::as_u64)
-    {
-        Some(value) => value,
-        None => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile heritage is missing its post-state activation",
-            );
-        }
+    let structural_value =
+        match parse_submission_u128("manifold.structural_value") {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
+
+    let commitment_hex = match read_submission_value("qtm.commitment") {
+        Ok(value) => value,
+        Err(e) => return e,
     };
 
-    let dimension = match heritage
-    .pointer("/state/dimension")
-    .and_then(Value::as_str)
-    .and_then(|value| value.parse::<u64>().ok())
-{
-    Some(value) => value,
-    None => {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "persisted exile heritage has an invalid dimension",
-        );
-    }
-};
-
-    let structural_value = match heritage
-        .pointer("/state/structural_value")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<u128>().ok())
-    {
-        Some(value) => value,
-        None => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile heritage has an invalid structural value",
-            );
-        }
-    };
-
-    let qtm = exile
-        .pointer("/frame/qtm/qtm")
-        .or_else(|| exile.pointer("/frame/quantum_transaction/qtm/qtm"));
-
-    let qtm = match qtm {
-        Some(value) => value,
-        None => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile response is missing QTM values",
-            );
-        }
-    };
-
-    let commitment_hex = match qtm
-        .get("commitment")
-        .and_then(Value::as_str)
-    {
-        Some(value) => value,
-        None => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile QTM is missing commitment",
-            );
-        }
-    };
-
-    let commitment_bytes = match hex::decode(commitment_hex) {
+    let commitment_bytes = match hex::decode(commitment_hex.trim()) {
         Ok(bytes) => bytes,
         Err(e) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid persisted exile commitment: {e}"),
+                format!("invalid finalized submission commitment: {e}"),
             );
         }
     };
@@ -1097,30 +1030,22 @@ async fn handle_derive_submission(
         Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile commitment must contain exactly 32 bytes",
+                "finalized submission commitment must contain exactly 32 bytes",
             );
         }
     };
 
-    let coordinate_hex = match qtm
-        .get("coordinate")
-        .and_then(Value::as_str)
-    {
-        Some(value) => value,
-        None => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile QTM is missing coordinate",
-            );
-        }
+    let coordinate_hex = match read_submission_value("qtm.coordinate") {
+        Ok(value) => value,
+        Err(e) => return e,
     };
 
-    let coordinate_bytes = match hex::decode(coordinate_hex) {
+    let coordinate_bytes = match hex::decode(coordinate_hex.trim()) {
         Ok(bytes) => bytes,
         Err(e) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid persisted exile coordinate: {e}"),
+                format!("invalid finalized submission coordinate: {e}"),
             );
         }
     };
@@ -1130,12 +1055,10 @@ async fn handle_derive_submission(
         Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "persisted exile coordinate must contain exactly 32 bytes",
+                "finalized submission coordinate must contain exactly 32 bytes",
             );
         }
     };
-
-    let qtm_activation = post_activation;
 
     let authorization = Authorization::new(
         commitment,
@@ -1146,69 +1069,53 @@ async fn handle_derive_submission(
         },
     );
 
-    // Discover networks from existing submission child directories.
-    // Registered networks without a directory are not available here.
-    let entries = match std::fs::read_dir(&base) {
-        Ok(entries) => entries,
+    let activation_path = commands::substrate_root()
+        .join(&name)
+        .join("activation");
+
+    let post_activation_value = match required_file(&activation_path) {
+        Ok(value) => value,
+        Err(e) => return e,
+    };
+
+    let post_activation = match post_activation_value.trim().parse::<u64>() {
+        Ok(value) => value,
         Err(e) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "unable to enumerate submission directory {}: {e}",
-                    base.display()
-                ),
+                format!("invalid persisted post-Exile activation: {e}"),
             );
         }
     };
 
-    let mut networks = Vec::new();
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read submission directory entry: {e}"),
-                );
-            }
-        };
-
-        let directory = entry.path();
-
-        if !directory.is_dir() {
-            continue;
-        }
-
-        let network_id = entry.file_name().to_string_lossy().into_owned();
-
-        if !valid_observation_network_id(&network_id) {
-            continue;
-        }
-
-        let Some(network) = selected_network(&network_id) else {
-            continue;
-        };
-
-        networks.push((network_id, network, directory));
-    }
-
-    networks.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if networks.is_empty() {
+    if commands::exile_path_at_activation(&name, post_activation).is_none() {
         return error(
-            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
             format!(
-                "no registered network directories exist for submission {}",
-                base.display()
+                "no persisted Exile state exists for substrate={name} activation={post_activation}"
             ),
         );
     }
 
-    // Master keys are common to all networks in this submission.
-    let has_bitcoin_network = networks
-        .iter()
-        .any(|(network_id, _, _)| is_bitcoin_network_id(network_id));
+    let mut pipelines = match bitminer_process_list(&name, post_activation).await {
+        Ok(pipelines) => pipelines,
+        Err(e) => return e,
+    };
+
+    pipelines.sort_by(|a, b| a.network.cmp(&b.network));
+
+    if pipelines.is_empty() {
+        return error(
+            StatusCode::CONFLICT,
+            format!(
+                "no running observation pipelines for post-Exile state: substrate={name} activation={post_activation}"
+            ),
+        );
+    }
+
+    let has_bitcoin_network = pipelines.iter().any(|pipeline| {
+        is_bitcoin_network_id(&pipeline.network)
+    });
 
     let keys = if has_bitcoin_network {
         match bitblock_qtm_master_keys(
@@ -1229,9 +1136,42 @@ async fn handle_derive_submission(
         None
     };
 
-    let mut results = Vec::with_capacity(networks.len());
+    let mut results = Vec::with_capacity(pipelines.len());
 
-    for (network_id, network, directory) in networks {
+    for pipeline in pipelines {
+        let network_id = pipeline.network;
+
+        if !valid_observation_network_id(&network_id) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid pipeline network identifier: {network_id}"),
+            );
+        }
+
+        let Some(network) = selected_network(&network_id) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("pipeline network is not registered: {network_id}"),
+            );
+        };
+
+        let directory = match commands::persist_submission_network(
+            &name,
+            activation,
+            submission,
+            &network_id,
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to prepare submission network directory for {network_id}: {e}"
+                    ),
+                );
+            }
+        };
+
         if !is_bitcoin_network_id(&network_id) {
             results.push(json!({
                 "network": network_id,
@@ -1261,7 +1201,6 @@ async fn handle_derive_submission(
             continue;
         }
 
-        // Reuse persisted values when the complete derivation already exists.
         let persisted_fields = [
             "network",
             "qtm.activation",
@@ -1364,8 +1303,6 @@ async fn handle_derive_submission(
             }
         }
 
-        // Preserve an existing authorization state. Create the initial
-        // authorization only when this network has no persisted state yet.
         let auth_directory =
             authorization_directory(&name, activation, submission, &network_id);
 
@@ -1380,7 +1317,6 @@ async fn handle_derive_submission(
             }
         }
 
-        // Read the persisted values so the response reflects what is on disk.
         let read_network_value = |field: &str| -> ApiResult<String> {
             required_file(&directory.join(field))
         };
@@ -1454,12 +1390,12 @@ async fn handle_derive_submission(
             "submission": submission,
             "commitment": hex::encode(commitment),
             "qtm_activation": qtm_activation,
+            "post_activation": post_activation,
             "directory": base.display().to_string(),
             "networks": results,
         }),
     )
 }
-
 
 #[cfg(feature = "bit-miner")]
 fn handle_get_submission_value(
