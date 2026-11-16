@@ -4199,13 +4199,7 @@ handle_list_event_payloads((*name).to_string(), (*record).to_string())
 (Method::POST, ["wallets", name, "transit"]) => {
     handle_transit_wallet((*name).to_string(), req).await
 }
-(Method::POST, ["wallets", name, "receive"]) => {
-    handle_receive_wallet(
-        (*name).to_string(),
-        receive_submission,
-        req,
-    )
-    .await
+(Method::POST, ["wallets", name, "receive"]) => handle_receive_wallet((*name).to_string(), req).await
 }
 (Method::GET, ["wallets", name, "exile", "depth"]) => handle_exile_depth((*name).to_string()),
 (Method::POST, ["wallets", name, "exile"]) => handle_exile_wallet((*name).to_string()),
