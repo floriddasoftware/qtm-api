@@ -3370,10 +3370,6 @@ async fn handle_receive_wallet(
     submission: u64,
     body: ReceiveRequest,
 ) -> HttpResponse {
-    let body: ReceiveRequest = match parse_json_body(req).await {
-        Ok(body) => body,
-        Err(e) => return e,
-    };
 
     if body.amount == 0 || body.ordinal == 0 || submission == 0 {
         return error(
@@ -4201,7 +4197,7 @@ handle_list_event_payloads((*name).to_string(), (*record).to_string())
     handle_transit_wallet((*name).to_string(), req).await
 }
 (Method::POST, ["wallets", name, "receive"]) => {
-    match parse_json_body(req).await {
+    match parse_json_body::<ReceiveRequest>(req).await {
         Ok(body) => {
             let submission = body.ordinal;
             handle_receive_wallet(
