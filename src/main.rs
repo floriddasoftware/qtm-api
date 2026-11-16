@@ -3365,16 +3365,20 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
 
 
 /// POST /wallets/:name/receive
-async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResponse {
+async fn handle_receive_wallet(
+    name: String,
+    submission: u64,
+    req: Request<Incoming>,
+) -> HttpResponse {
     let body: ReceiveRequest = match parse_json_body(req).await {
         Ok(body) => body,
         Err(e) => return e,
     };
 
-    if body.amount == 0 || body.ordinal == 0 {
+    if body.amount == 0 || body.ordinal == 0 || submission == 0 {
         return error(
             StatusCode::BAD_REQUEST,
-            "amount and ordinal must be greater than zero",
+            "amount, ordinal, and submission must be greater than zero",
         );
     }
 
@@ -3465,9 +3469,8 @@ async fn handle_receive_wallet(name: String, req: Request<Incoming>) -> HttpResp
         Err(e) => return e,
     };
 
-    // Capture the activation before moving event.heritage into EventPayload.
-    let activation = event.heritage.state.activations();
-    let submission = body.ordinal;
+    // The submission directory is scoped to the ordinal activation.
+    let activation = body.ordinal;
 
     // Release the receive lock before invoking the derivation handler.
     // handle_derive_submission acquires this same substrate lock.
@@ -4193,9 +4196,17 @@ Err(e) => e,
 handle_list_event_payloads((*name).to_string(), (*record).to_string())
 }
 
-(Method::POST, ["wallets", name, "transit"]) => handle_transit_wallet((*name).to_string(), req).await,
-(Method::POST, ["wallets", name, "receive"]) => handle_receive_wallet((*name).to_string(), req).await,
-
+(Method::POST, ["wallets", name, "transit"]) => {
+    handle_transit_wallet((*name).to_string(), req).await
+}
+(Method::POST, ["wallets", name, "receive"]) => {
+    handle_receive_wallet(
+        (*name).to_string(),
+        receive_submission,
+        req,
+    )
+    .await
+}
 (Method::GET, ["wallets", name, "exile", "depth"]) => handle_exile_depth((*name).to_string()),
 (Method::POST, ["wallets", name, "exile"]) => handle_exile_wallet((*name).to_string()),
 
