@@ -141,6 +141,9 @@ subsec_nanos: u32,
 }
 #[derive(Serialize)]
 struct ReceiveResponse {
+    substrate: String,
+    post_activation: u64,
+    networks: Vec<String>,
     frame: QuantumTransactionFrame,
     #[serde(skip_serializing_if = "Option::is_none")]
     derivation: Option<Value>,
@@ -3887,6 +3890,21 @@ async fn handle_exile_wallet(
             constant: "exile".to_string(),
             constant_delta: constant_delta.to_string(),
         };
+        
+        let post_activation = event.heritage.state.activations();
+
+let pipelines = match bitminer_process_list(&name, post_activation).await {
+    Ok(pipelines) => pipelines,
+    Err(e) => return e,
+};
+
+let mut networks = pipelines
+    .into_iter()
+    .map(|pipeline| pipeline.network)
+    .collect::<Vec<_>>();
+
+networks.sort();
+networks.dedup();
 
         let event = match guarded("receive", || transaction.receive(&name, flow)) {
             Ok(event) => event,
@@ -3900,15 +3918,18 @@ async fn handle_exile_wallet(
         );
 
         return json_response(
-            StatusCode::OK,
-            &ReceiveResponse {
-                frame: QuantumTransactionFrame {
-                    quantum_transaction: transaction_response,
-                    event: event_map_response(payload, qtm),
-                },
-                derivation: None,
-            },
-        );
+    StatusCode::OK,
+    &ReceiveResponse {
+        substrate: name,
+        post_activation,
+        networks,
+        frame: QuantumTransactionFrame {
+            quantum_transaction: transaction_response,
+            event: event_map_response(payload, qtm),
+        },
+        derivation: None,
+    },
+);
     }
 
     // Ordinary Exile operates on the current activation.
