@@ -3466,7 +3466,9 @@ async fn handle_receive_wallet(
     };
 
     // The submission directory is scoped to the ordinal activation.
-    let activation = body.ordinal;
+    let activation = body.amount;
+    
+    let submission= body.ordinal;
 
     // Release the receive lock before invoking the derivation handler.
     // handle_derive_submission acquires this same substrate lock.
