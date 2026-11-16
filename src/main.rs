@@ -3874,6 +3874,209 @@ async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse
     }
 }
 
+
+
+/// POST /wallets/:name/receive
+/// POST /wallets/:name/exile
+async fn handle_exile_wallet(
+    name: String,
+    request: Option<ReceiveRequest>,
+) -> HttpResponse {
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_existing_substrate(&name) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    // Receive executes the explicitly selected persisted ordinal.
+    if let Some(body) = request {
+        if body.amount == 0 || body.ordinal == 0 {
+            return error(StatusCode::BAD_REQUEST, "amount and ordinal must be greater than zero");
+        }
+        if body.ordinal > body.amount {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("ordinal exceeds receive amount: maximum={}", body.amount),
+            );
+        }
+
+        let change_requested = match body.flow.trim().to_ascii_lowercase().as_str() {
+            "receive" => false,
+            "change" => true,
+            _ => return error(StatusCode::BAD_REQUEST, "flow must be receive or change"),
+        };
+
+        if commands::event_path_at_activation(&name, body.ordinal).is_none() {
+            return error(
+                StatusCode::NOT_FOUND,
+                format!("receive requires a persisted transit at ordinal {}", body.ordinal),
+            );
+        }
+
+        let transaction = match guarded("receive", || {
+            QuantumTransaction::send(&name, body.ordinal)
+        }) {
+            Ok(transaction) => transaction,
+            Err(e) => return e,
+        };
+
+        let constant_delta = match &transaction.constant {
+            qp_hd::PersistedEvent::Exile(event) => event.heritage.transition.delta,
+            qp_hd::PersistedEvent::Transit(..) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "QuantumTransaction::send returned a transit constant; expected persisted exile provenance",
+                );
+            }
+        };
+
+        let flow = if change_requested {
+            Flow::Change(constant_delta)
+        } else {
+            Flow::Receive
+        };
+
+        let qtm = QtmResponse {
+            commitment: hex::encode(transaction.qtm.commitment),
+            coordinate: hex::encode(transaction.qtm.coordinate),
+            sigma: transaction.qtm.sigma.to_string(),
+            network: transaction.qtm.net_work.to_string(),
+        };
+
+        let transaction_response = QuantumTransactionResponse {
+            amount: transaction.amount,
+            qtm: qtm_frame(qtm.clone()),
+            constant: "exile".to_string(),
+            constant_delta: constant_delta.to_string(),
+        };
+
+        let event = match guarded("receive", || transaction.receive(&name, flow)) {
+            Ok(event) => event,
+            Err(e) => return e,
+        };
+
+        let payload = EventPayload::from_heritage(
+            event.heritage,
+            event.depth,
+            Scale::Local,
+        );
+
+        return json_response(
+            StatusCode::OK,
+            &ReceiveResponse {
+                frame: QuantumTransactionFrame {
+                    quantum_transaction: transaction_response,
+                    event: event_map_response(payload, qtm),
+                },
+                derivation: None,
+            },
+        );
+    }
+
+    // Ordinary Exile operates on the current activation.
+    let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
+        Ok(activation) => activation,
+        Err(e) => return e,
+    };
+
+    let event = if let Some(exile_path) =
+        commands::exile_path_at_activation(&name, activation)
+    {
+        match guarded("exile event lookup", || {
+            commands::load_event_at_activation(&name, activation)
+        }) {
+            Ok(qp_hd::PersistedEvent::Exile(event)) => event,
+            Ok(qp_hd::PersistedEvent::Transit(..)) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "persisted exile path contains a transit event at activation {activation}: {}",
+                        exile_path.display(),
+                    ),
+                );
+            }
+            Err(e) => return e,
+        }
+    } else {
+        let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
+            return error(
+                StatusCode::NOT_FOUND,
+                format!("no persisted transit or exile event exists at activation {activation}"),
+            );
+        };
+
+        let entries = match std::fs::read_dir(&transit_path) {
+            Ok(entries) => entries,
+            Err(e) => return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect transit payloads: {e}"),
+            ),
+        };
+
+        let mut network_ids = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect transit network: {e}"),
+                ),
+            };
+
+            let payload = entry.path().join("payload");
+            if payload.join("depth.path").is_file()
+                && payload.join("depth.objects").is_file()
+            {
+                network_ids.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+
+        network_ids.sort();
+        network_ids.dedup();
+
+        let event = match guarded("exile", || commands::qtm_exile(&name)) {
+            Ok(event) => event,
+            Err(e) => return e,
+        };
+
+        let record_path = match canonical_record_path(
+            &substrate_path,
+            "exile",
+            event.heritage.state.activations(),
+            u128::from(event.heritage.state.dimension()),
+        ) {
+            Ok(path) => path,
+            Err(e) => return e,
+        };
+
+        for network_id in &network_ids {
+            if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
+                return e;
+            }
+        }
+
+        event
+    };
+
+    let qtm = QtmResponse {
+        commitment: hex::encode(event.qtm.commitment),
+        coordinate: hex::encode(event.qtm.coordinate),
+        sigma: event.qtm.sigma.to_string(),
+        network: event.qtm.net_work.to_string(),
+    };
+
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
+
+    json_response(StatusCode::OK, &direction_response(payload, None, qtm))
+}
+
+
 /// GET /wallets/:name/exile/depth
 fn handle_exile_depth(name: String) -> HttpResponse {
     let lock = substrate_lock(&name);
