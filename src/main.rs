@@ -973,18 +973,121 @@ async fn handle_derive_submission(
         );
     }
 
-    // Load the QTM state persisted for this specific submission.
-    let commitment_hex = match required_file(&base.join("qtm.commitment")) {
-        Ok(value) => value,
-        Err(e) => return e,
+        let exile_response = handle_exile_wallet(
+        name.clone(),
+        Some(ReceiveRequest {
+            amount: activation,
+            flow: "receive".to_string(),
+            ordinal: submission,
+        }),
+    )
+    .await;
+
+    if !exile_response.status().is_success() {
+        return exile_response;
+    }
+
+    let exile_bytes = match exile_response.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(never) => match never {},
     };
 
-    let commitment_bytes = match hex::decode(&commitment_hex) {
+    let exile: Value = match serde_json::from_slice(&exile_bytes) {
+        Ok(value) => value,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to decode persisted exile response: {e}"),
+            );
+        }
+    };
+
+    let heritage = match exile
+        .pointer("/frame/event/heritage")
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile response is missing heritage",
+            );
+        }
+    };
+
+    let post_activation = match heritage
+        .pointer("/state/activations")
+        .and_then(Value::as_u64)
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile heritage is missing its post-state activation",
+            );
+        }
+    };
+
+    let dimension = match heritage
+        .pointer("/state/dimension")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u128>().ok())
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile heritage has an invalid dimension",
+            );
+        }
+    };
+
+    let structural_value = match heritage
+        .pointer("/state/structural_value")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u128>().ok())
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile heritage has an invalid structural value",
+            );
+        }
+    };
+
+    let qtm = exile
+        .pointer("/frame/qtm/qtm")
+        .or_else(|| exile.pointer("/frame/quantum_transaction/qtm/qtm"));
+
+    let qtm = match qtm {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile response is missing QTM values",
+            );
+        }
+    };
+
+    let commitment_hex = match qtm
+        .get("commitment")
+        .and_then(Value::as_str)
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile QTM is missing commitment",
+            );
+        }
+    };
+
+    let commitment_bytes = match hex::decode(commitment_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid submission commitment: {e}"),
+                format!("invalid persisted exile commitment: {e}"),
             );
         }
     };
@@ -994,22 +1097,30 @@ async fn handle_derive_submission(
         Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "submission commitment must contain exactly 32 bytes",
+                "persisted exile commitment must contain exactly 32 bytes",
             );
         }
     };
 
-    let coordinate_hex = match required_file(&base.join("qtm.coordinate")) {
-        Ok(value) => value,
-        Err(e) => return e,
+    let coordinate_hex = match qtm
+        .get("coordinate")
+        .and_then(Value::as_str)
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "persisted exile QTM is missing coordinate",
+            );
+        }
     };
 
-    let coordinate_bytes = match hex::decode(&coordinate_hex) {
+    let coordinate_bytes = match hex::decode(coordinate_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid submission coordinate: {e}"),
+                format!("invalid persisted exile coordinate: {e}"),
             );
         }
     };
@@ -1019,50 +1130,12 @@ async fn handle_derive_submission(
         Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "submission coordinate must contain exactly 32 bytes",
+                "persisted exile coordinate must contain exactly 32 bytes",
             );
         }
     };
 
-    let qtm_activation = match required_file(&base.join("manifold.activations")) {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(value) => value,
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("invalid submission activation count: {e}"),
-                );
-            }
-        },
-        Err(e) => return e,
-    };
-
-    let dimension = match required_file(&base.join("manifold.dimension")) {
-        Ok(value) => match value.parse() {
-            Ok(value) => value,
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("invalid submission dimension: {e}"),
-                );
-            }
-        },
-        Err(e) => return e,
-    };
-
-    let structural_value =
-        match required_file(&base.join("manifold.structural_value")) {
-            Ok(value) => match value.parse() {
-                Ok(value) => value,
-                Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("invalid submission structural value: {e}"),
-                    );
-                }
-            },
-            Err(e) => return e,
-        };
+    let qtm_activation = post_activation;
 
     let authorization = Authorization::new(
         commitment,
@@ -3361,270 +3434,6 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
     let event_payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
 
     json_response(StatusCode::OK, &direction_response(event_payload, Some(selection), qtm))
-}
-
-
-/// POST /wallets/:name/receive
-async fn handle_receive_wallet(
-    name: String,
-    submission: u64,
-    body: ReceiveRequest,
-) -> HttpResponse {
-
-    if body.amount == 0 || body.ordinal == 0 || submission == 0 {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "amount, ordinal, and submission must be greater than zero",
-        );
-    }
-
-    if body.ordinal > body.amount {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "ordinal exceeds receive amount: maximum={}",
-                body.amount
-            ),
-        );
-    }
-
-    let change_requested = match body.flow.trim().to_ascii_lowercase().as_str() {
-        "receive" => false,
-        "change" => true,
-        _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "flow must be receive or change",
-            );
-        }
-    };
-
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-    if let Err(e) = ensure_existing_substrate(&name) {
-        return e;
-    }
-
-    // An ordinal remains a transit until that exact ordinal is executed.
-    // Do not reconstruct it from the current activation or substitute another event.
-    if commands::event_path_at_activation(&name, body.ordinal).is_none() {
-        return error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "receive requires a persisted transit at ordinal {}",
-                body.ordinal
-            ),
-        );
-    }
-
-    let transaction = match guarded("receive", || {
-        QuantumTransaction::send(&name, body.ordinal)
-    }) {
-        Ok(transaction) => transaction,
-        Err(e) => return e,
-    };
-
-    let constant_delta = match &transaction.constant {
-        qp_hd::PersistedEvent::Exile(event) => {
-            event.heritage.transition.delta
-        }
-        qp_hd::PersistedEvent::Transit(..) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "QuantumTransaction::send returned a transit constant; expected persisted exile provenance",
-            );
-        }
-    };
-
-    let flow = if change_requested {
-        Flow::Change(constant_delta)
-    } else {
-        Flow::Receive
-    };
-
-    let qtm = QtmResponse {
-        commitment: hex::encode(transaction.qtm.commitment),
-        coordinate: hex::encode(transaction.qtm.coordinate),
-        sigma: transaction.qtm.sigma.to_string(),
-        network: transaction.qtm.net_work.to_string(),
-    };
-
-    let transaction_response = QuantumTransactionResponse {
-        amount: transaction.amount,
-        qtm: qtm_frame(qtm.clone()),
-        constant: "exile".to_string(),
-        constant_delta: constant_delta.to_string(),
-    };
-
-    // Execute only the selected ordinal. Preserve its persisted event state and depth.
-    let event = match guarded("receive", || {
-        transaction.receive(&name, flow)
-    }) {
-        Ok(event) => event,
-        Err(e) => return e,
-    };
-
-    // The submission directory is scoped to the ordinal activation.
-    let activation = body.amount;
-    
-    let submission= body.ordinal;
-
-    // Release the receive lock before invoking the derivation handler.
-    // handle_derive_submission acquires this same substrate lock.
-    drop(_guard);
-
-    #[cfg(feature = "bit-miner")]
-    let derivation = {
-        let response = handle_derive_submission(
-            name.clone(),
-            activation,
-            submission,
-        )
-        .await;
-
-        if !response.status().is_success() {
-            return response;
-        }
-
-        let bytes = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(never) => match never {},
-        };
-
-        match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to decode submission derivation response: {e}"),
-                );
-            }
-        }
-    };
-
-    #[cfg(not(feature = "bit-miner"))]
-    let derivation: Option<serde_json::Value> = None;
-
-    let payload = EventPayload::from_heritage(
-        event.heritage,
-        event.depth,
-        Scale::Local,
-    );
-
-    json_response(
-        StatusCode::OK,
-        &ReceiveResponse {
-            frame: QuantumTransactionFrame {
-                quantum_transaction: transaction_response,
-                event: event_map_response(payload, qtm),
-            },
-            derivation,
-        },
-    )
-}
-
-/// POST /wallets/:name/exile
-fn handle_exile_wallet(name: String) -> HttpResponse {
-    let lock = substrate_lock(&name);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-    let substrate_path = match ensure_existing_substrate(&name) {
-        Ok(path) => path,
-        Err(e) => return e,
-    };
-
-    let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
-        Ok(activation) => activation,
-        Err(e) => return e,
-    };
-
-    // Preserve an already-executed ordinal. Only a persisted transit
-    // may be consumed by exile.
-    let event = if let Some(exile_path) = commands::exile_path_at_activation(&name, activation) {
-        match guarded("exile event lookup", || commands::load_event_at_activation(&name, activation)) {
-            Ok(qp_hd::PersistedEvent::Exile(event)) => event,
-            Ok(qp_hd::PersistedEvent::Transit(..)) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "persisted exile path contains a transit event at activation {activation}: {}",
-                        exile_path.display(),
-                    ),
-                );
-            }
-            Err(e) => return e,
-        }
-    } else {
-        let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
-            return error(
-                StatusCode::NOT_FOUND,
-                format!("no persisted transit or exile event exists at activation {activation}"),
-            );
-        };
-
-        // Preserve the network-specific depth payloads when the transit
-        // is materialized as an exile.
-        let mut network_ids = Vec::new();
-
-        let entries = match std::fs::read_dir(&transit_path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit payloads: {e}"));
-            }
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    return error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect transit network: {e}"));
-                }
-            };
-
-            let payload = entry.path().join("payload");
-
-            if payload.join("depth.path").is_file() && payload.join("depth.objects").is_file() {
-                network_ids.push(entry.file_name().to_string_lossy().to_string());
-            }
-        }
-
-        network_ids.sort();
-        network_ids.dedup();
-
-        // Execute this ordinal once. qtm_exile consumes its persisted transit.
-        let event = match guarded("exile", || commands::qtm_exile(&name)) {
-            Ok(event) => event,
-            Err(e) => return e,
-        };
-
-        let resulting_activation = event.heritage.state.activations();
-        let dimension = event.heritage.state.dimension();
-
-        let record_path = match canonical_record_path(&substrate_path, "exile", resulting_activation, u128::from(dimension)) {
-            Ok(path) => path,
-            Err(e) => return e,
-        };
-
-        for network_id in &network_ids {
-            if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
-                return e;
-            }
-        }
-
-        event
-    };
-
-    let qtm = QtmResponse {
-        commitment: hex::encode(event.qtm.commitment),
-        coordinate: hex::encode(event.qtm.coordinate),
-        sigma: event.qtm.sigma.to_string(),
-        network: event.qtm.net_work.to_string(),
-    };
-
-    let payload = EventPayload::from_heritage(event.heritage, event.depth, Scale::Local);
-
-    json_response(StatusCode::OK, &direction_response(payload, None, qtm))
 }
 
 fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<WirePacketsResponse> {
