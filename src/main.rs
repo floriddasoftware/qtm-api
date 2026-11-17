@@ -962,39 +962,28 @@ async fn handle_derive_submission(
         .join("activations")
         .join(activation.to_string());
 
-    if commands::exile_path_at_activation(&name, activation).is_none() {
-        return error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "no persisted Exile event exists for substrate={name} activation={activation}"
-            ),
-        );
-    }
-
-    // The persisted Exile event is authoritative for the post-state.
-    let event = match guarded("post-state event lookup", || {
+    // Both persisted Transit and Exile events provide the
+    // authoritative heritage and QTM commitment for this activation.
+    let (heritage, qtm) = match guarded("activation event lookup", || {
         commands::load_event_at_activation(&name, activation)
     }) {
-        Ok(qp_hd::PersistedEvent::Exile(event)) => event,
-        Ok(qp_hd::PersistedEvent::Transit(..)) => {
-            return error(
-                StatusCode::CONFLICT,
-                format!(
-                    "activation {activation} contains a Transit event, not an Exile event"
-                ),
-            );
+        Ok(qp_hd::PersistedEvent::Transit(event)) => {
+            (event.heritage, event.qtm)
+        }
+        Ok(qp_hd::PersistedEvent::Exile(event)) => {
+            (event.heritage, event.qtm)
         }
         Err(e) => return e,
     };
 
-    let state = &event.heritage.state;
+    let state = &heritage.state;
 
     let qtm_activation = state.activations();
     let dimension = state.dimension();
     let structural_value = state.structural_value();
 
-    let commitment = event.qtm.commitment;
-    let coordinate = event.qtm.coordinate;
+    let commitment = qtm.commitment;
+    let coordinate = qtm.coordinate;
 
     let authorization = Authorization::new(
         commitment,
@@ -1018,7 +1007,7 @@ async fn handle_derive_submission(
         return error(
             StatusCode::CONFLICT,
             format!(
-                "no running observation pipelines for post-state: substrate={name} activation={activation}"
+                "no running observation pipelines for substrate={name} activation={activation}"
             ),
         );
     }
@@ -1065,7 +1054,6 @@ async fn handle_derive_submission(
             );
         };
 
-        // Network derivation data belongs directly to this activation.
         let directory = base.join(&network_id);
 
         if let Err(e) = std::fs::create_dir_all(&directory) {
@@ -1303,7 +1291,6 @@ async fn handle_derive_submission(
         }),
     )
 }
-
 
 
 #[cfg(feature = "bit-miner")]
@@ -3723,8 +3710,6 @@ async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse
 
 
 
-
-
 /// POST /wallets/:name/receive
 /// POST /wallets/:name/exile
 async fn handle_exile_wallet(
@@ -3834,77 +3819,25 @@ async fn handle_exile_wallet(
         );
 
         // Receive has completed. Release the substrate lock before
-        // awaiting derivation and the pipeline registry.
+        // awaiting the pipeline registry.
         drop(_guard);
 
-        // Derivation is authoritative for the activation's networks
-        // and persisted network-specific values.
-        let derivation_response =
-            handle_derive_submission(name.clone(), post_activation).await;
-
-        let derivation_status = derivation_response.status();
-
-        if !derivation_status.is_success() {
-            return derivation_response;
-        }
-
-        let derivation_body = match derivation_response
-            .into_body()
-            .collect()
-            .await
-        {
-            Ok(body) => body.to_bytes(),
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read activation derivation response: {e}"),
-                );
-            }
-        };
-
-        let derivation: Value =
-            match serde_json::from_slice(&derivation_body) {
-                Ok(value) => value,
-                Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("invalid activation derivation response: {e}"),
-                    );
-                }
+        // The received event is authoritative for this response.
+        // Obtain network identifiers from pipelines at its activation;
+        // do not require a separately persisted Exile event.
+        let mut pipelines =
+            match bitminer_process_list(&name, post_activation).await {
+                Ok(pipelines) => pipelines,
+                Err(e) => return e,
             };
 
-        let networks = match derivation
-            .get("networks")
-            .and_then(Value::as_array)
-        {
-            Some(entries) => {
-                let mut networks = Vec::with_capacity(entries.len());
+        pipelines.sort_by(|a, b| a.network.cmp(&b.network));
+        pipelines.dedup_by(|a, b| a.network == b.network);
 
-                for entry in entries {
-                    let Some(network) = entry
-                        .get("network")
-                        .and_then(Value::as_str)
-                    else {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "activation derivation response contains a network entry without an identifier",
-                        );
-                    };
-
-                    networks.push(network.to_string());
-                }
-
-                networks.sort();
-                networks.dedup();
-                networks
-            }
-            None => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "activation derivation response does not contain a networks array",
-                );
-            }
-        };
+        let networks: Vec<String> = pipelines
+            .into_iter()
+            .map(|pipeline| pipeline.network)
+            .collect();
 
         return json_response(
             StatusCode::OK,
@@ -3916,7 +3849,7 @@ async fn handle_exile_wallet(
                     quantum_transaction: transaction_response,
                     event: event_map_response(payload, qtm),
                 },
-                derivation: Some(derivation),
+                derivation: None,
             },
         );
     }
