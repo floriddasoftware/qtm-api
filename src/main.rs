@@ -1731,7 +1731,7 @@ impl WirePacketPrevoutResolver {
     fn resolve_packet(&self, requested: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<WirePacket, std::io::Error> {
         use std::io::{Error, ErrorKind};
 
-   let path = commands::wirepackets_path( &self.substrate, self.activation,submission,&self.network,);
+   let path = commands::wirepackets_path( &self.substrate, self.activation,&self.network,);
 
         let bytes = std::fs::read(&path).map_err(|e| {
             Error::new(
@@ -2493,7 +2493,7 @@ continue;
 if max_events.is_some_and(|limit| submission >= limit) {
 continue;
 }
-let path = commands::wirepackets_path(name, activation, submission, network);
+let path = commands::wirepackets_path(name, activation, network);
 match std::fs::metadata(&path) {
 Ok(m) if m.is_file() => return Ok(true),
 Ok(_) => {}
@@ -2670,7 +2670,6 @@ fn has_persisted_wirepackets_any_network(
             let path = commands::wirepackets_path(
                 name,
                 activation,
-                submission,
                 &network,
             );
 
@@ -3306,7 +3305,7 @@ fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<Wir
     let mut total_bytes = 0u64;
 
     for submission in 1..=budget.max_events {
-        let path = commands::wirepackets_path(name, activation, submission, &network,);
+        let path = commands::wirepackets_path(name, activation, &network,);
 
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => metadata,
@@ -3415,7 +3414,7 @@ fn handle_get_wirepackets_file(name: String, activation: u64, network: String) -
 
     if persisted {
         for submission in 1..=budget.max_events {
-            let path = commands::wirepackets_path(&name, activation, submission, &network);
+            let path = commands::wirepackets_path(&name, activation, &network);
 
             let metadata = match std::fs::metadata(&path) {
                 Ok(metadata) => metadata,
