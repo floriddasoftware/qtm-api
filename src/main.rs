@@ -968,7 +968,7 @@ async fn derive_network_data(
 
     let networks = match &event {
         qp_hd::PersistedEvent::Exile(event) => {
-            vec![event.qtm.network.to_string()]
+            vec![event.qtm.net_work.to_string()]
         }
 
         qp_hd::PersistedEvent::Transit(event) => {
