@@ -943,10 +943,10 @@ fn authorization_directory(
 
 
 #[cfg(feature = "bit-miner")]
-async fn derive_submission_data(
+async fn derive_network_data(
     name: &str,
     activation: u64,
-) -> ApiResult<(Value, Vec<String>)> {
+) -> ApiResult<(qp_hd::PersistedEvent, Vec<String>)> {
     if activation == 0 {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -958,427 +958,287 @@ async fn derive_submission_data(
         return Err(e);
     }
 
-    let base = commands::substrate_root()
-        .join(name)
-        .join("activations")
-        .join(activation.to_string());
-
-    let (heritage, qtm, depth) = match guarded(
-        "activation event lookup",
+    let event = match guarded(
+        "persisted event lookup",
         || commands::load_event_at_activation(name, activation),
     ) {
-        Ok(qp_hd::PersistedEvent::Transit(event)) => {
-            (event.heritage, event.qtm, event.depth)
-        }
-        Ok(qp_hd::PersistedEvent::Exile(event)) => {
-            (event.heritage, event.qtm, event.depth)
-        }
+        Ok(event) => event,
         Err(e) => return Err(e),
     };
 
-    let state = &heritage.state;
-
-    let qtm_activation = state.activations();
-    let dimension = state.dimension();
-    let structural_value = state.structural_value();
-
-    let commitment = qtm.commitment;
-    let coordinate = qtm.coordinate;
-
-    let authorization = Authorization::new(
-        commitment,
-        qtm_activation,
-        LockedStructure {
-            dimension,
-            structural_value,
-        },
-    );
-
-    let depth_objects = depth
-        .objects()
-        .map(|(position, identifier, retain)| {
-            (
-                position,
-                identifier.to_string(),
-                retain.mass,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let identifiers = [
-        "purpose",
-        "coin",
-        "account",
-        "change",
-        "external",
-    ];
-
-    let path_component_mass = |component: &str| -> Option<u128> {
-        let (number, hardened) = match component.strip_suffix('\'') {
-            Some(number) => (number, true),
-            None => (component, false),
-        };
-
-        let value = number.parse::<u128>().ok()?;
-
-        if hardened {
-            value.checked_add(HARDENED_OFFSET)
-        } else {
-            Some(value)
-        }
-    };
-
-    let matches_depth = |network: &NetworkOption| -> bool {
-        if depth.path() != "qp44/wallet"
-            || depth_objects.len() != identifiers.len()
-        {
-            return false;
+    let networks = match &event {
+        qp_hd::PersistedEvent::Exile(event) => {
+            vec![event.qtm.network.to_string()]
         }
 
-        let Some(path) = network.path.strip_prefix("m/") else {
-            return false;
-        };
+        qp_hd::PersistedEvent::Transit(event) => {
+            let depth = &event.depth;
 
-        let components = path.split('/').collect::<Vec<_>>();
-
-        if components.len() != identifiers.len() {
-            return false;
-        }
-
-        depth_objects
-            .iter()
-            .zip(identifiers.iter())
-            .zip(components.iter())
-            .enumerate()
-            .all(
-                |(expected_position, ((object, identifier), component))| {
-                    let (position, actual_identifier, mass) = object;
-
-                    *position == expected_position
-                        && actual_identifier == identifier
-                        && path_component_mass(component) == Some(*mass)
-                },
-            )
-    };
-
-    let networks = registered_networks()
-        .networks
-        .into_iter()
-        .filter(matches_depth)
-        .collect::<Vec<_>>();
-
-    if networks.is_empty() {
-        return Err(error(
-            StatusCode::CONFLICT,
-            format!(
-                "persisted depth does not match a registered network path: substrate={name} activation={activation} depth={}",
-                depth.path(),
-            ),
-        ));
-    }
-
-    let network_ids = networks
-        .iter()
-        .map(|network| network.id.clone())
-        .collect::<Vec<_>>();
-
-    let has_bitcoin_network = networks
-        .iter()
-        .any(|network| is_bitcoin_network_id(&network.id));
-
-    let master_keys = if has_bitcoin_network {
-        match bitblock_qtm_master_keys(
-            coordinate,
-            commitment,
-            qtm_activation,
-            NetworkKind::Main,
-        ) {
-            Ok(keys) => Some(keys),
-            Err(e) => {
-                return Err(error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("extended-key derivation failed: {e}"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
-
-    let mut results = Vec::with_capacity(networks.len());
-
-    for network in networks {
-        let network_id = network.id.clone();
-        let directory = base.join(&network_id);
-
-        if let Err(e) = std::fs::create_dir_all(&directory) {
-            return Err(error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "unable to prepare activation network directory for {network_id}: {e}"
-                ),
-            ));
-        }
-
-        if !is_bitcoin_network_id(&network_id) {
-            results.push(json!({
-                "network": network_id,
-                "name": network.name,
-                "coin": network.coin,
-                "purpose": network.purpose,
-                "derivation_path": network.path,
-                "supported": false,
-                "available": true,
-                "message": "network derivation currently requires a Bitcoin network",
-                "directory": directory.display().to_string(),
-            }));
-
-            continue;
-        }
-
-        if network.purpose != 44 && network.purpose != 84 {
-            results.push(json!({
-                "network": network_id,
-                "name": network.name,
-                "coin": network.coin,
-                "purpose": network.purpose,
-                "derivation_path": network.path,
-                "supported": false,
-                "available": true,
-                "message": format!(
-                    "unsupported Bitcoin script purpose: {}",
-                    network.purpose
-                ),
-                "directory": directory.display().to_string(),
-            }));
-
-            continue;
-        }
-
-        let persisted_fields = [
-            "network",
-            "qtm.activation",
-            "derivation.path",
-            "fingerprint",
-            "scriptpubkey",
-            "xpriv",
-            "xpub",
-            "zpub",
-            "address",
-        ];
-
-        let persisted = persisted_fields
-            .iter()
-            .all(|field| directory.join(field).is_file());
-
-        if !persisted {
-            let private_key = match bitblock_derive_qtm_child(
-                coordinate,
-                commitment,
-                qtm_activation,
-                &network.path,
-                NetworkKind::Main,
-            ) {
-                Ok(key) => key,
-                Err(e) => {
-                    return Err(error(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "activation child derivation failed for {network_id}: {e}"
-                        ),
-                    ));
-                }
-            };
-
-            let script = match network.purpose {
-                44 => bitblock_p2pkh_script(private_key),
-                84 => bitblock_p2wpkh_script(private_key),
-                _ => unreachable!(),
-            };
-
-            let script = match script {
-                Ok(script) => script,
-                Err(e) => {
-                    return Err(error(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "scriptPubKey derivation failed for {network_id}: {e}"
-                        ),
-                    ));
-                }
-            };
-
-            let address = match network.purpose {
-                44 => bitblock_qtm_bip44_address(
-                    coordinate,
-                    commitment,
-                    qtm_activation,
-                    &network.path,
-                ),
-                84 => bitblock_qtm_bip84_address(
-                    coordinate,
-                    commitment,
-                    qtm_activation,
-                    &network.path,
-                ),
-                _ => unreachable!(),
-            };
-
-            let address = match address {
-                Ok(address) => address.to_string(),
-                Err(e) => {
-                    return Err(error(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!("address derivation failed for {network_id}: {e}"),
-                    ));
-                }
-            };
-
-            let Some(keys) = master_keys.as_ref() else {
-                return Err(error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Bitcoin master keys were not initialized",
-                ));
-            };
-
-            let persisted_values = [
-                ("network", network_id.clone()),
-                ("qtm.activation", qtm_activation.to_string()),
-                ("derivation.path", network.path.clone()),
-                ("fingerprint", keys.fingerprint.clone()),
-                ("scriptpubkey", hex::encode(script.as_bytes())),
-                ("xpriv", keys.xpriv.clone()),
-                ("xpub", keys.xpub.clone()),
-                ("zpub", keys.zpub.clone()),
-                ("address", address),
+            let identifiers = [
+                "purpose",
+                "coin",
+                "account",
+                "change",
+                "external",
             ];
 
-            for (filename, value) in persisted_values {
-                if let Err(e) =
-                    write_atomic(&directory.join(filename), value.as_bytes())
-                {
-                    return Err(e);
+            let depth_objects = depth
+                .objects()
+                .map(|(position, identifier, retain)| {
+                    (position, identifier.to_string(), retain.mass)
+                })
+                .collect::<Vec<_>>();
+
+            let path_component_mass = |component: &str| -> Option<u128> {
+                let (number, hardened) = match component.strip_suffix('\'') {
+                    Some(number) => (number, true),
+                    None => (component, false),
+                };
+
+                let value = number.parse::<u128>().ok()?;
+
+                if hardened {
+                    value.checked_add(HARDENED_OFFSET)
+                } else {
+                    Some(value)
                 }
+            };
+
+            let networks = registered_networks()
+                .networks
+                .into_iter()
+                .filter(|network| {
+                    if depth.path() != "qp44/wallet"
+                        || depth_objects.len() != identifiers.len()
+                    {
+                        return false;
+                    }
+
+                    let Some(path) = network.path.strip_prefix("m/") else {
+                        return false;
+                    };
+
+                    let components = path.split('/').collect::<Vec<_>>();
+
+                    if components.len() != identifiers.len() {
+                        return false;
+                    }
+
+                    depth_objects
+                        .iter()
+                        .zip(identifiers.iter())
+                        .zip(components.iter())
+                        .enumerate()
+                        .all(
+                            |(expected_position, ((object, identifier), component))| {
+                                let (position, actual_identifier, mass) = object;
+
+                                *position == expected_position
+                                    && actual_identifier == identifier
+                                    && path_component_mass(component) == Some(*mass)
+                            },
+                        )
+                })
+                .map(|network| network.id)
+                .collect::<Vec<_>>();
+
+            if networks.is_empty() {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "persisted transit depth does not match a registered network path: substrate={name} activation={activation} depth={}",
+                        depth.path(),
+                    ),
+                ));
             }
+            networks
         }
+    };
+    Ok((event, networks))
+}
 
-        let auth_directory =
-            authorization_directory(name, activation, &network_id);
 
-        if !auth_directory.join("state").is_file() {
-            if let Err(e) = persist_authorization(
-                &auth_directory,
-                &authorization,
-                AuthorizationState::Authorized,
-                SettlementState::Pending,
-            ) {
-                return Err(e);
-            }
+#[cfg(feature = "bit-miner")]
+async fn handle_derive_submission(
+    name: String,
+    network: String,
+    event: qp_hd::PersistedEvent,
+) -> HttpResponse {
+    const FIELDS: [&str; 6] = [
+        "fingerprint",
+        "scriptpubkey",
+        "xpriv",
+        "xpub",
+        "zpub",
+        "address",
+    ];
+
+    if !valid_observation_network_id(&network) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid network identifier",
+        );
+    }
+
+    let Some(network_option) = selected_network(&network) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("network is not registered: {network}"),
+        );
+    };
+
+    if !is_bitcoin_network_id(&network) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("network is not a Bitcoin network: {network}"),
+        );
+    }
+
+    if network_option.purpose != 44 && network_option.purpose != 84 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported Bitcoin script purpose: {}",
+                network_option.purpose
+            ),
+        );
+    }
+
+    let (coordinate, commitment, activation) = match &event {
+        qp_hd::PersistedEvent::Transit(event) => (
+            event.qtm.coordinate,
+            event.qtm.commitment,
+            event.heritage.state.activations(),
+        ),
+        qp_hd::PersistedEvent::Exile(event) => (
+            event.qtm.coordinate,
+            event.qtm.commitment,
+            event.heritage.state.activations(),
+        ),
+    };
+
+    let directory = commands::substrate_root()
+        .join(&name)
+        .join("activations")
+        .join(activation.to_string())
+        .join(&network);
+
+    if let Err(e) = std::fs::create_dir_all(&directory) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "unable to prepare activation network directory: {e}"
+            ),
+        );
+    }
+
+    let keys = match bitblock_qtm_master_keys(
+        coordinate,
+        commitment,
+        activation,
+        NetworkKind::Main,
+    ) {
+        Ok(keys) => keys,
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("extended-key derivation failed: {e}"),
+            );
         }
+    };
 
-        let read_network_value = |field: &str| -> ApiResult<String> {
-            required_file(&directory.join(field))
-        };
+    let private_key = match bitblock_derive_qtm_child(
+        coordinate,
+        commitment,
+        activation,
+        &network_option.path,
+        NetworkKind::Main,
+    ) {
+        Ok(key) => key,
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("activation child derivation failed: {e}"),
+            );
+        }
+    };
 
-        let fingerprint = match read_network_value("fingerprint") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+    let script = match network_option.purpose {
+        44 => bitblock_p2pkh_script(private_key),
+        84 => bitblock_p2wpkh_script(private_key),
+        _ => unreachable!(),
+    };
 
-        let scriptpubkey = match read_network_value("scriptpubkey") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+    let script = match script {
+        Ok(script) => script,
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("scriptPubKey derivation failed: {e}"),
+            );
+        }
+    };
 
-        let xpriv = match read_network_value("xpriv") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+    let address = match network_option.purpose {
+        44 => bitblock_qtm_bip44_address(
+            coordinate,
+            commitment,
+            activation,
+            &network_option.path,
+        ),
+        84 => bitblock_qtm_bip84_address(
+            coordinate,
+            commitment,
+            activation,
+            &network_option.path,
+        ),
+        _ => unreachable!(),
+    };
 
-        let xpub = match read_network_value("xpub") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+    let address = match address {
+        Ok(address) => address.to_string(),
+        Err(e) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("address derivation failed: {e}"),
+            );
+        }
+    };
 
-        let zpub = match read_network_value("zpub") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
+    let values = [
+        ("fingerprint", keys.fingerprint.to_string()),
+        ("scriptpubkey", hex::encode(script.as_bytes())),
+        ("xpriv", keys.xpriv.clone()),
+        ("xpub", keys.xpub.clone()),
+        ("zpub", keys.zpub.clone()),
+        ("address", address),
+    ];
 
-        let address = match read_network_value("address") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
-
-        let derivation_path = match read_network_value("derivation.path") {
-            Ok(value) => value,
-            Err(e) => return Err(e),
-        };
-
-        results.push(json!({
-            "network": network_id,
-            "name": network.name,
-            "coin": network.coin,
-            "purpose": network.purpose,
-            "supported": true,
-            "available": true,
-            "authorization_state": read_trim(&auth_directory.join("state"))
-                .unwrap_or_else(|| "authorized".to_string()),
-            "settlement_state": read_trim(&auth_directory.join("settlement.state"))
-                .unwrap_or_else(|| "pending".to_string()),
-            "authorization": {
-                "commitment": hex::encode(authorization.commitment),
-                "activation": authorization.activation,
-                "dimension": authorization.locked.dimension,
-                "structural_value": authorization.locked.structural_value,
-            },
-            "derivation_path": derivation_path,
-            "directory": directory.display().to_string(),
-            "fingerprint": fingerprint,
-            "scriptpubkey": scriptpubkey,
-            "xpriv": xpriv,
-            "xpub": xpub,
-            "zpub": zpub,
-            "address": address,
-        }));
+    for (field, value) in &values {
+        if let Err(e) = write_atomic(
+            &directory.join(field),
+            value.as_bytes(),
+        ) {
+            return e;
+        }
     }
 
     let response = json!({
         "substrate": name,
         "activation": activation,
-        "commitment": hex::encode(commitment),
-        "qtm_activation": qtm_activation,
-        "post_activation": activation,
-        "depth": {
-            "path": depth.path(),
-            "objects": depth_objects.iter().map(
-                |(position, identifier, mass)| {
-                    json!({
-                        "position": position,
-                        "identifier": identifier,
-                        "mass": mass.to_string(),
-                    })
-                }
-            ).collect::<Vec<_>>(),
-        },
-        "directory": base.display().to_string(),
-        "networks": results,
+        "network": network,
+        "derivation_path": network_option.path,
+        "directory": directory.display().to_string(),
+        "fields": FIELDS,
+        "fingerprint": values[0].1,
+        "scriptpubkey": values[1].1,
+        "xpriv": values[2].1,
+        "xpub": values[3].1,
+        "zpub": values[4].1,
+        "address": values[5].1,
     });
 
-    Ok((response, network_ids))
-}
-
-#[cfg(feature = "bit-miner")]
-async fn handle_derive_submission(
-    name: String,
-    activation: u64,
-) -> HttpResponse {
-    match derive_submission_data(&name, activation).await {
-        Ok((response, _networks)) => {
-            json_response(StatusCode::OK, &response)
-        }
-        Err(e) => e,
-    }
+    json_response(StatusCode::OK, &response)
 }
 
 
@@ -1419,10 +1279,30 @@ fn handle_get_submission_value(
         );
     }
 
-    if selected_network(&network).is_none() {
+    let network_option = match selected_network(&network) {
+        Some(network) => network,
+        None => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("network is not registered: {network}"),
+            );
+        }
+    };
+
+    if !is_bitcoin_network_id(&network) {
         return error(
             StatusCode::BAD_REQUEST,
-            format!("network is not registered: {network}"),
+            format!("network is not a Bitcoin network: {network}"),
+        );
+    }
+
+    if network_option.purpose != 44 && network_option.purpose != 84 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported Bitcoin script purpose: {}",
+                network_option.purpose
+            ),
         );
     }
 
@@ -1479,6 +1359,7 @@ fn handle_get_submission_value(
 
     response
 }
+
 
 fn scale_name(scale: Scale) -> &'static str {
 match scale {
