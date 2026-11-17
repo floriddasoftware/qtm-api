@@ -865,28 +865,6 @@ fn bitblock_qtm_bip84_address(coordinate: [u8; 32], commitment: [u8; 32], activa
 // current substrate activation or the latest wallet state.
 // =============================================================================
 
-#[cfg(feature = "bit-miner")]
-fn submission_directory(name: &str, activation: u64, submission: u64) -> PathBuf {
-    commands::substrate_root()
-        .join(name)
-        .join("activations")
-        .join(activation.to_string())
-        .join("event")
-        .join(submission.to_string())
-}
-
-
-#[cfg(feature = "bit-miner")]
-fn authorization_directory(
-    name: &str,
-    activation: u64,
-    submission: u64,
-    network: &str,
-) -> PathBuf {
-    submission_directory(name, activation, submission)
-        .join(network)
-        .join("authorization")
-}
 
 #[cfg(feature = "bit-miner")]
 fn authorization_state_name(state: AuthorizationState) -> &'static str {
@@ -948,16 +926,30 @@ fn persist_authorization(
 
 
 
+
+#[cfg(feature = "bit-miner")]
+fn authorization_directory(
+    name: &str,
+    activation: u64,
+    network: &str,
+) -> PathBuf {
+    commands::substrate_root()
+        .join(name)
+        .join("activations")
+        .join(activation.to_string())
+        .join(network)
+        .join("authorization")
+}
+
 #[cfg(feature = "bit-miner")]
 async fn handle_derive_submission(
     name: String,
     activation: u64,
-    submission: u64,
 ) -> HttpResponse {
-    if activation == 0 || submission == 0 {
+    if activation == 0 {
         return error(
             StatusCode::BAD_REQUEST,
-            "activation and submission must be greater than zero",
+            "activation must be greater than zero",
         );
     }
 
@@ -965,104 +957,44 @@ async fn handle_derive_submission(
         return e;
     }
 
-    let base = submission_directory(&name, activation, submission);
+    let base = commands::substrate_root()
+        .join(&name)
+        .join("activations")
+        .join(activation.to_string());
 
-    if !base.is_dir() {
+    if commands::exile_path_at_activation(&name, activation).is_none() {
         return error(
             StatusCode::NOT_FOUND,
-            format!("submission directory does not exist: {}", base.display()),
+            format!(
+                "no persisted Exile event exists for substrate={name} activation={activation}"
+            ),
         );
     }
 
-    let read_submission_value = |field: &str| -> ApiResult<String> {
-        required_file(&base.join(field))
-    };
-
-    let parse_u64 = |field: &str| -> ApiResult<u64> {
-        let value = read_submission_value(field)?;
-        value.trim().parse::<u64>().map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid finalized submission value {field}: {e}"),
-            )
-        })
-    };
-
-    let parse_u128 = |field: &str| -> ApiResult<u128> {
-        let value = read_submission_value(field)?;
-        value.trim().parse::<u128>().map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid finalized submission value {field}: {e}"),
-            )
-        })
-    };
-
-    // The finalized observation receipt is authoritative for QTM data.
-    let qtm_activation = match parse_u64("manifold.activations") {
-        Ok(value) => value,
-        Err(e) => return e,
-    };
-
-    let dimension = match parse_u64("manifold.dimension") {
-        Ok(value) => value,
-        Err(e) => return e,
-    };
-
-    let structural_value = match parse_u128("manifold.structural_value") {
-        Ok(value) => value,
-        Err(e) => return e,
-    };
-
-    let commitment_hex = match read_submission_value("qtm.commitment") {
-        Ok(value) => value,
-        Err(e) => return e,
-    };
-
-    let commitment_bytes = match hex::decode(commitment_hex.trim()) {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    // The persisted Exile event is authoritative for the post-state.
+    let event = match guarded("post-state event lookup", || {
+        commands::load_event_at_activation(&name, activation)
+    }) {
+        Ok(qp_hd::PersistedEvent::Exile(event)) => event,
+        Ok(qp_hd::PersistedEvent::Transit(..)) => {
             return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid finalized submission commitment: {e}"),
+                StatusCode::CONFLICT,
+                format!(
+                    "activation {activation} contains a Transit event, not an Exile event"
+                ),
             );
         }
-    };
-
-    let commitment: [u8; 32] = match commitment_bytes.try_into() {
-        Ok(value) => value,
-        Err(_) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "finalized submission commitment must contain exactly 32 bytes",
-            );
-        }
-    };
-
-    let coordinate_hex = match read_submission_value("qtm.coordinate") {
-        Ok(value) => value,
         Err(e) => return e,
     };
 
-    let coordinate_bytes = match hex::decode(coordinate_hex.trim()) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid finalized submission coordinate: {e}"),
-            );
-        }
-    };
+    let state = &event.heritage.state;
 
-    let coordinate: [u8; 32] = match coordinate_bytes.try_into() {
-        Ok(value) => value,
-        Err(_) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "finalized submission coordinate must contain exactly 32 bytes",
-            );
-        }
-    };
+    let qtm_activation = state.activations();
+    let dimension = state.dimension();
+    let structural_value = state.structural_value();
+
+    let commitment = event.qtm.commitment;
+    let coordinate = event.qtm.coordinate;
 
     let authorization = Authorization::new(
         commitment,
@@ -1073,26 +1005,8 @@ async fn handle_derive_submission(
         },
     );
 
-    // The persisted substrate activation identifies the post-Exile state.
-    let post_activation =
-        match guarded("post-Exile activation lookup", || {
-            commands::load_activation(&name)
-        }) {
-            Ok(value) => value,
-            Err(e) => return e,
-        };
-
-    if commands::exile_path_at_activation(&name, post_activation).is_none() {
-        return error(
-            StatusCode::CONFLICT,
-            format!(
-                "no persisted Exile state exists for substrate={name} activation={post_activation}"
-            ),
-        );
-    }
-
     // Each live pipeline instance contributes its own network.
-    let mut pipelines = match bitminer_process_list(&name, post_activation).await {
+    let mut pipelines = match bitminer_process_list(&name, activation).await {
         Ok(pipelines) => pipelines,
         Err(e) => return e,
     };
@@ -1104,7 +1018,7 @@ async fn handle_derive_submission(
         return error(
             StatusCode::CONFLICT,
             format!(
-                "no running observation pipelines for post-Exile state: substrate={name} activation={post_activation}"
+                "no running observation pipelines for post-state: substrate={name} activation={activation}"
             ),
         );
     }
@@ -1151,23 +1065,17 @@ async fn handle_derive_submission(
             );
         };
 
-        // Persist network derivation data under the original receipt identity.
-        let directory = match commands::persist_submission_network(
-            &name,
-            activation,
-            submission,
-            &network_id,
-        ) {
-            Ok(path) => path,
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "unable to prepare submission network directory for {network_id}: {e}"
-                    ),
-                );
-            }
-        };
+        // Network derivation data belongs directly to this activation.
+        let directory = base.join(&network_id);
+
+        if let Err(e) = std::fs::create_dir_all(&directory) {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to prepare activation network directory for {network_id}: {e}"
+                ),
+            );
+        }
 
         if !is_bitcoin_network_id(&network_id) {
             results.push(json!({
@@ -1175,7 +1083,7 @@ async fn handle_derive_submission(
                 "name": network.name,
                 "supported": false,
                 "available": true,
-                "message": "submission derivation currently requires a Bitcoin network",
+                "message": "network derivation currently requires a Bitcoin network",
                 "directory": directory.display().to_string(),
             }));
             continue;
@@ -1225,7 +1133,7 @@ async fn handle_derive_submission(
                     return error(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         format!(
-                            "submission child derivation failed for {network_id}: {e}"
+                            "activation child derivation failed for {network_id}: {e}"
                         ),
                     );
                 }
@@ -1304,7 +1212,7 @@ async fn handle_derive_submission(
         }
 
         let auth_directory =
-            authorization_directory(&name, activation, submission, &network_id);
+            authorization_directory(&name, activation, &network_id);
 
         if !auth_directory.join("state").is_file() {
             if let Err(e) = persist_authorization(
@@ -1387,21 +1295,21 @@ async fn handle_derive_submission(
         &json!({
             "substrate": name,
             "activation": activation,
-            "submission": submission,
             "commitment": hex::encode(commitment),
             "qtm_activation": qtm_activation,
-            "post_activation": post_activation,
+            "post_activation": activation,
             "directory": base.display().to_string(),
             "networks": results,
         }),
     )
 }
 
+
+
 #[cfg(feature = "bit-miner")]
 fn handle_get_submission_value(
     name: String,
     activation: u64,
-    submission: u64,
     network: String,
     field: String,
 ) -> HttpResponse {
@@ -1414,10 +1322,17 @@ fn handle_get_submission_value(
         "address",
     ];
 
+    if activation == 0 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "activation must be greater than zero",
+        );
+    }
+
     if !FIELDS.contains(&field.as_str()) {
         return error(
             StatusCode::BAD_REQUEST,
-            format!("unsupported submission value: {field}"),
+            format!("unsupported activation network value: {field}"),
         );
     }
 
@@ -1435,25 +1350,21 @@ fn handle_get_submission_value(
         return e;
     }
 
-    let base = submission_directory(&name, activation, submission);
-    let network_directory = base.join(&network);
+    let directory = commands::substrate_root()
+        .join(&name)
+        .join("activations")
+        .join(activation.to_string())
+        .join(&network);
 
-    let directory = if network_directory.join("network").is_file() {
-        network_directory
-    } else if base.join("network").is_file()
-        && read_trim(&base.join("network")).as_deref()
-            == Some(network.as_str())
-    {
-        base
-    } else {
+    if !directory.is_dir() {
         return error(
             StatusCode::NOT_FOUND,
             format!(
-                "submission derivation not found: activation={} submission={} network={}",
-                activation, submission, network
+                "activation network directory does not exist: activation={} network={}",
+                activation, network
             ),
         );
-    };
+    }
 
     let value = match read_trim(&directory.join(&field)) {
         Some(value) if !value.is_empty() => value,
@@ -1461,7 +1372,7 @@ fn handle_get_submission_value(
             return error(
                 StatusCode::NOT_FOUND,
                 format!(
-                    "submission value has not been derived: {}",
+                    "activation network value has not been derived: {}",
                     field
                 ),
             );
@@ -1485,6 +1396,7 @@ fn handle_get_submission_value(
 
     response
 }
+
 fn scale_name(scale: Scale) -> &'static str {
 match scale {
 Scale::Minimal => "Minimal",
@@ -3813,6 +3725,7 @@ async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse
 
 
 
+
 /// POST /wallets/:name/receive
 /// POST /wallets/:name/exile
 async fn handle_exile_wallet(
@@ -3827,7 +3740,6 @@ async fn handle_exile_wallet(
         Err(e) => return e,
     };
 
-    // Receive executes the explicitly selected persisted ordinal.
     if let Some(body) = request {
         if body.amount == 0 || body.ordinal == 0 {
             return error(
@@ -3907,7 +3819,6 @@ async fn handle_exile_wallet(
             constant_delta: constant_delta.to_string(),
         };
 
-        // Execute Receive before reading its resulting state.
         let event = match guarded("receive", || {
             transaction.receive(&name, flow)
         }) {
@@ -3915,36 +3826,86 @@ async fn handle_exile_wallet(
             Err(e) => return e,
         };
 
-        // The received heritage supplies the post-state activation.
         let post_activation = event.heritage.state.activations();
-        
-        // Receive has completed; release the synchronous substrate lock
-
-        // before awaiting the pipeline registry.
-
-        drop(_guard);
-
-
-        // Each running pipeline instance supplies its own network.
-        let pipelines =
-            match bitminer_process_list(&name, post_activation).await {
-                Ok(pipelines) => pipelines,
-                Err(e) => return e,
-            };
-
-        let mut networks = pipelines
-            .into_iter()
-            .map(|pipeline| pipeline.network)
-            .collect::<Vec<_>>();
-
-        networks.sort();
-        networks.dedup();
 
         let payload = EventPayload::from_heritage(
             event.heritage,
             event.depth,
             Scale::Local,
         );
+
+        // Receive has completed. Release the substrate lock before
+        // awaiting derivation and the pipeline registry.
+        drop(_guard);
+
+        // Derivation is authoritative for the activation's networks
+        // and persisted network-specific values.
+        let derivation_response =
+            handle_derive_submission(name.clone(), post_activation).await;
+
+        let derivation_status = derivation_response.status();
+
+        if !derivation_status.is_success() {
+            return derivation_response;
+        }
+
+        let derivation_body = match derivation_response
+            .into_body()
+            .collect()
+            .await
+        {
+            Ok(body) => body.to_bytes(),
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to read activation derivation response: {e}"),
+                );
+            }
+        };
+
+        let derivation: Value =
+            match serde_json::from_slice(&derivation_body) {
+                Ok(value) => value,
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("invalid activation derivation response: {e}"),
+                    );
+                }
+            };
+
+        let networks = match derivation
+            .get("networks")
+            .and_then(Value::as_array)
+        {
+            Some(entries) => {
+                let mut networks = Vec::with_capacity(entries.len());
+
+                for entry in entries {
+                    let Some(network) = entry
+                        .get("network")
+                        .and_then(Value::as_str)
+                    else {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "activation derivation response contains a network entry without an identifier",
+                        );
+                    };
+
+                    networks.push(network.to_string());
+                }
+
+                networks.sort();
+                networks.dedup();
+                networks
+            }
+            None => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "activation derivation response does not contain a networks array",
+                );
+            }
+        };
 
         return json_response(
             StatusCode::OK,
@@ -3956,7 +3917,7 @@ async fn handle_exile_wallet(
                     quantum_transaction: transaction_response,
                     event: event_map_response(payload, qtm),
                 },
-                derivation: None,
+                derivation: Some(derivation),
             },
         );
     }
@@ -4179,19 +4140,30 @@ Err(e) => e,
 }
 
 
+
 // ---------- Hyper Route Dispatcher ---------- */
 async fn dispatch(req: Request<Incoming>) -> HttpResponse {
     let method = req.method().clone();
-    if method == Method::OPTIONS { return handle_preflight(); }
-    if method == Method::GET && req.uri().path().trim_end_matches('/') == "/electrum" {
+
+    if method == Method::OPTIONS {
+        return handle_preflight();
+    }
+
+    if method == Method::GET
+        && req.uri().path().trim_end_matches('/') == "/electrum"
+    {
         return handle_electrum_websocket(req).await;
     }
 
     let raw = req.uri().path().to_owned();
     let trimmed = raw.trim_end_matches('/');
     let path = if trimmed.is_empty() { "/" } else { trimmed };
-    let segments: Vec<&str> = path.trim_start_matches('/')
-        .split('/').filter(|s| !s.is_empty()).collect();
+
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
 
     match (method, segments.as_slice()) {
         (Method::GET, ["health"]) => handle_health(),
@@ -4208,100 +4180,184 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
 
         (Method::GET, ["wallets", name, "events"]) =>
             handle_list_events((*name).to_string()),
+
         (Method::GET, ["wallets", name, "events", record, "payloads"]) =>
-            handle_list_event_payloads((*name).to_string(), (*record).to_string()),
+            handle_list_event_payloads(
+                (*name).to_string(),
+                (*record).to_string(),
+            ),
 
         (Method::POST, ["wallets", name, "transit"]) =>
             handle_transit_wallet((*name).to_string(), req).await,
+
         (Method::POST, ["wallets", name, "receive"]) =>
             match parse_json_body::<ReceiveRequest>(req).await {
-                Ok(body) => handle_exile_wallet((*name).to_string(), Some(body)).await,
+                Ok(body) => {
+                    handle_exile_wallet((*name).to_string(), Some(body)).await
+                }
                 Err(e) => e,
             },
 
         (Method::GET, ["wallets", name, "exile", "depth"]) =>
             handle_exile_depth((*name).to_string()),
+
         (Method::POST, ["wallets", name, "exile"]) =>
             handle_exile_wallet((*name).to_string(), None).await,
 
         (Method::GET, ["wallets", name, "activations", act, "budgets"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_list_activation_budgets((*name).to_string(), a),
+                Ok(a) => {
+                    handle_list_activation_budgets((*name).to_string(), a)
+                }
                 Err(e) => e,
             },
+
         (Method::PUT, ["wallets", name, "activations", act, "budgets", net]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_update_activation_network_budget(
-                    (*name).to_string(), a, (*net).to_string(), req,
-                ).await,
+                Ok(a) => {
+                    handle_update_activation_network_budget(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                        req,
+                    )
+                    .await
+                }
                 Err(e) => e,
             },
 
         (Method::GET, ["wallets", name, "activations", act, "observations"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_list_bitcoin_observations((*name).to_string(), a).await,
+                Ok(a) => {
+                    handle_list_bitcoin_observations(
+                        (*name).to_string(),
+                        a,
+                    )
+                    .await
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name, "activations", act, "payload-board"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_get_payload_board((*name).to_string(), a).await,
+                Ok(a) => {
+                    handle_get_payload_board((*name).to_string(), a).await
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name, "activations", act, "networks", net, "observation"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_get_bitminer_status((*name).to_string(), a, (*net).to_string()).await,
+                Ok(a) => {
+                    handle_get_bitminer_status(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                    .await
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name]) =>
             handle_get_wallet((*name).to_string()),
 
         (Method::POST, ["wallets", name, "activations", act, "networks", net, "observation"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_start_bitminer((*name).to_string(), a, (*net).to_string()).await,
+                Ok(a) => {
+                    handle_start_bitminer(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                    .await
+                }
                 Err(e) => e,
             },
+
         (Method::DELETE, ["wallets", name, "activations", act, "networks", net, "observation"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_stop_bitminer((*name).to_string(), a, (*net).to_string()).await,
+                Ok(a) => {
+                    handle_stop_bitminer(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                    .await
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name, "activations", act, "networks", net, "observation", "log"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_get_bitminer_log((*name).to_string(), a, (*net).to_string()),
+                Ok(a) => {
+                    handle_get_bitminer_log(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepackets"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_get_wirepackets((*name).to_string(), a, (*net).to_string()),
+                Ok(a) => {
+                    handle_get_wirepackets(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepackets", "file"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_get_wirepackets_file((*name).to_string(), a, (*net).to_string()),
+                Ok(a) => {
+                    handle_get_wirepackets_file(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                }
                 Err(e) => e,
             },
+
         (Method::GET, ["wallets", name, "activations", act, "networks", net, "payload-board"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_get_payload_board_for_network(
-                    (*name).to_string(), a, (*net).to_string(),
-                ).await,
+                Ok(a) => {
+                    handle_get_payload_board_for_network(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                    )
+                    .await
+                }
                 Err(e) => e,
             },
 
         #[cfg(feature = "bit-miner")]
-        (Method::POST, ["wallets", name, "activations", act, "submissions", sub, "derive"]) =>
-            match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
-                (Ok(a), Ok(s)) => handle_derive_submission((*name).to_string(), a, s).await,
-                (Err(e), _) | (_, Err(e)) => e,
+        (Method::POST, ["wallets", name, "activations", act, "derive"]) =>
+            match parse_u64_param(act, "activation") {
+                Ok(a) => {
+                    handle_derive_submission((*name).to_string(), a).await
+                }
+                Err(e) => e,
             },
 
         #[cfg(feature = "bit-miner")]
-        (Method::GET, ["wallets", name, "activations", act, "submissions", sub, "networks", net, field]) =>
-            match (parse_u64_param(act, "activation"), parse_u64_param(sub, "submission")) {
-                (Ok(a), Ok(s)) => handle_get_submission_value(
-                    (*name).to_string(), a, s, (*net).to_string(), (*field).to_string(),
-                ),
-                (Err(e), _) | (_, Err(e)) => e,
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, field]) =>
+            match parse_u64_param(act, "activation") {
+                Ok(a) => {
+                    handle_get_submission_value(
+                        (*name).to_string(),
+                        a,
+                        (*net).to_string(),
+                        (*field).to_string(),
+                    )
+                }
+                Err(e) => e,
             },
 
         _ => error(StatusCode::NOT_FOUND, "route not found"),
