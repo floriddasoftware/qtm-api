@@ -3917,6 +3917,13 @@ async fn handle_exile_wallet(
 
         // The received heritage supplies the post-state activation.
         let post_activation = event.heritage.state.activations();
+        
+        // Receive has completed; release the synchronous substrate lock
+
+        // before awaiting the pipeline registry.
+
+        drop(_guard);
+
 
         // Each running pipeline instance supplies its own network.
         let pipelines =
