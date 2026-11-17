@@ -947,6 +947,7 @@ fn persist_authorization(
 
 
 
+
 #[cfg(feature = "bit-miner")]
 async fn handle_derive_submission(
     name: String,
@@ -977,7 +978,7 @@ async fn handle_derive_submission(
         required_file(&base.join(field))
     };
 
-    let parse_submission_u64 = |field: &str| -> ApiResult<u64> {
+    let parse_u64 = |field: &str| -> ApiResult<u64> {
         let value = read_submission_value(field)?;
         value.trim().parse::<u64>().map_err(|e| {
             error(
@@ -987,7 +988,7 @@ async fn handle_derive_submission(
         })
     };
 
-    let parse_submission_u128 = |field: &str| -> ApiResult<u128> {
+    let parse_u128 = |field: &str| -> ApiResult<u128> {
         let value = read_submission_value(field)?;
         value.trim().parse::<u128>().map_err(|e| {
             error(
@@ -997,21 +998,21 @@ async fn handle_derive_submission(
         })
     };
 
-    let qtm_activation = match parse_submission_u64("manifold.activations") {
+    // The finalized observation receipt is authoritative for QTM data.
+    let qtm_activation = match parse_u64("manifold.activations") {
         Ok(value) => value,
         Err(e) => return e,
     };
 
-    let dimension = match parse_submission_u64("manifold.dimension") {
+    let dimension = match parse_u64("manifold.dimension") {
         Ok(value) => value,
         Err(e) => return e,
     };
 
-    let structural_value =
-        match parse_submission_u128("manifold.structural_value") {
-            Ok(value) => value,
-            Err(e) => return e,
-        };
+    let structural_value = match parse_u128("manifold.structural_value") {
+        Ok(value) => value,
+        Err(e) => return e,
+    };
 
     let commitment_hex = match read_submission_value("qtm.commitment") {
         Ok(value) => value,
@@ -1072,24 +1073,14 @@ async fn handle_derive_submission(
         },
     );
 
-    let activation_path = commands::substrate_root()
-        .join(&name)
-        .join("activation");
-
-    let post_activation_value = match required_file(&activation_path) {
-        Ok(value) => value,
-        Err(e) => return e,
-    };
-
-    let post_activation = match post_activation_value.trim().parse::<u64>() {
-        Ok(value) => value,
-        Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid persisted post-Exile activation: {e}"),
-            );
-        }
-    };
+    // The persisted substrate activation identifies the post-Exile state.
+    let post_activation =
+        match guarded("post-Exile activation lookup", || {
+            commands::load_activation(&name)
+        }) {
+            Ok(value) => value,
+            Err(e) => return e,
+        };
 
     if commands::exile_path_at_activation(&name, post_activation).is_none() {
         return error(
@@ -1100,12 +1091,14 @@ async fn handle_derive_submission(
         );
     }
 
+    // Each live pipeline instance contributes its own network.
     let mut pipelines = match bitminer_process_list(&name, post_activation).await {
         Ok(pipelines) => pipelines,
         Err(e) => return e,
     };
 
     pipelines.sort_by(|a, b| a.network.cmp(&b.network));
+    pipelines.dedup_by(|a, b| a.network == b.network);
 
     if pipelines.is_empty() {
         return error(
@@ -1116,11 +1109,11 @@ async fn handle_derive_submission(
         );
     }
 
-    let has_bitcoin_network = pipelines.iter().any(|pipeline| {
-        is_bitcoin_network_id(&pipeline.network)
-    });
+    let has_bitcoin_network = pipelines
+        .iter()
+        .any(|pipeline| is_bitcoin_network_id(&pipeline.network));
 
-    let keys = if has_bitcoin_network {
+    let master_keys = if has_bitcoin_network {
         match bitblock_qtm_master_keys(
             coordinate,
             commitment,
@@ -1158,6 +1151,7 @@ async fn handle_derive_submission(
             );
         };
 
+        // Persist network derivation data under the original receipt identity.
         let directory = match commands::persist_submission_network(
             &name,
             activation,
@@ -1184,7 +1178,6 @@ async fn handle_derive_submission(
                 "message": "submission derivation currently requires a Bitcoin network",
                 "directory": directory.display().to_string(),
             }));
-
             continue;
         }
 
@@ -1200,7 +1193,6 @@ async fn handle_derive_submission(
                 ),
                 "directory": directory.display().to_string(),
             }));
-
             continue;
         }
 
@@ -1283,7 +1275,12 @@ async fn handle_derive_submission(
                 }
             };
 
-            let keys = keys.as_ref().expect("Bitcoin master keys were derived");
+            let Some(keys) = master_keys.as_ref() else {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Bitcoin master keys were not initialized",
+                );
+            };
 
             let persisted_values = [
                 ("network", network_id.clone()),
@@ -3815,6 +3812,7 @@ async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse
 
 
 
+
 /// POST /wallets/:name/receive
 /// POST /wallets/:name/exile
 async fn handle_exile_wallet(
@@ -3832,25 +3830,41 @@ async fn handle_exile_wallet(
     // Receive executes the explicitly selected persisted ordinal.
     if let Some(body) = request {
         if body.amount == 0 || body.ordinal == 0 {
-            return error(StatusCode::BAD_REQUEST, "amount and ordinal must be greater than zero");
-        }
-        if body.ordinal > body.amount {
             return error(
                 StatusCode::BAD_REQUEST,
-                format!("ordinal exceeds receive amount: maximum={}", body.amount),
+                "amount and ordinal must be greater than zero",
             );
         }
 
-        let change_requested = match body.flow.trim().to_ascii_lowercase().as_str() {
-            "receive" => false,
-            "change" => true,
-            _ => return error(StatusCode::BAD_REQUEST, "flow must be receive or change"),
-        };
+        if body.ordinal > body.amount {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "ordinal exceeds receive amount: maximum={}",
+                    body.amount
+                ),
+            );
+        }
+
+        let change_requested =
+            match body.flow.trim().to_ascii_lowercase().as_str() {
+                "receive" => false,
+                "change" => true,
+                _ => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "flow must be receive or change",
+                    );
+                }
+            };
 
         if commands::event_path_at_activation(&name, body.ordinal).is_none() {
             return error(
                 StatusCode::NOT_FOUND,
-                format!("receive requires a persisted transit at ordinal {}", body.ordinal),
+                format!(
+                    "receive requires a persisted transit at ordinal {}",
+                    body.ordinal
+                ),
             );
         }
 
@@ -3862,7 +3876,9 @@ async fn handle_exile_wallet(
         };
 
         let constant_delta = match &transaction.constant {
-            qp_hd::PersistedEvent::Exile(event) => event.heritage.transition.delta,
+            qp_hd::PersistedEvent::Exile(event) => {
+                event.heritage.transition.delta
+            }
             qp_hd::PersistedEvent::Transit(..) => {
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -3890,26 +3906,32 @@ async fn handle_exile_wallet(
             constant: "exile".to_string(),
             constant_delta: constant_delta.to_string(),
         };
-        
-        let post_activation = event.heritage.state.activations();
 
-let pipelines = match bitminer_process_list(&name, post_activation).await {
-    Ok(pipelines) => pipelines,
-    Err(e) => return e,
-};
-
-let mut networks = pipelines
-    .into_iter()
-    .map(|pipeline| pipeline.network)
-    .collect::<Vec<_>>();
-
-networks.sort();
-networks.dedup();
-
-        let event = match guarded("receive", || transaction.receive(&name, flow)) {
+        // Execute Receive before reading its resulting state.
+        let event = match guarded("receive", || {
+            transaction.receive(&name, flow)
+        }) {
             Ok(event) => event,
             Err(e) => return e,
         };
+
+        // The received heritage supplies the post-state activation.
+        let post_activation = event.heritage.state.activations();
+
+        // Each running pipeline instance supplies its own network.
+        let pipelines =
+            match bitminer_process_list(&name, post_activation).await {
+                Ok(pipelines) => pipelines,
+                Err(e) => return e,
+            };
+
+        let mut networks = pipelines
+            .into_iter()
+            .map(|pipeline| pipeline.network)
+            .collect::<Vec<_>>();
+
+        networks.sort();
+        networks.dedup();
 
         let payload = EventPayload::from_heritage(
             event.heritage,
@@ -3918,25 +3940,28 @@ networks.dedup();
         );
 
         return json_response(
-    StatusCode::OK,
-    &ReceiveResponse {
-        substrate: name,
-        post_activation,
-        networks,
-        frame: QuantumTransactionFrame {
-            quantum_transaction: transaction_response,
-            event: event_map_response(payload, qtm),
-        },
-        derivation: None,
-    },
-);
+            StatusCode::OK,
+            &ReceiveResponse {
+                substrate: name,
+                post_activation,
+                networks,
+                frame: QuantumTransactionFrame {
+                    quantum_transaction: transaction_response,
+                    event: event_map_response(payload, qtm),
+                },
+                derivation: None,
+            },
+        );
     }
 
     // Ordinary Exile operates on the current activation.
-    let activation = match guarded("activation lookup", || commands::load_activation(&name)) {
-        Ok(activation) => activation,
-        Err(e) => return e,
-    };
+    let activation =
+        match guarded("activation lookup", || {
+            commands::load_activation(&name)
+        }) {
+            Ok(activation) => activation,
+            Err(e) => return e,
+        };
 
     let event = if let Some(exile_path) =
         commands::exile_path_at_activation(&name, activation)
@@ -3957,43 +3982,57 @@ networks.dedup();
             Err(e) => return e,
         }
     } else {
-        let Some(transit_path) = commands::event_path_at_activation(&name, activation) else {
+        let Some(transit_path) =
+            commands::event_path_at_activation(&name, activation)
+        else {
             return error(
                 StatusCode::NOT_FOUND,
-                format!("no persisted transit or exile event exists at activation {activation}"),
+                format!(
+                    "no persisted transit or exile event exists at activation {activation}"
+                ),
             );
         };
 
         let entries = match std::fs::read_dir(&transit_path) {
             Ok(entries) => entries,
-            Err(e) => return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect transit payloads: {e}"),
-            ),
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to inspect transit payloads: {e}"),
+                );
+            }
         };
 
         let mut network_ids = Vec::new();
+
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(e) => return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect transit network: {e}"),
-                ),
+                Err(e) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unable to inspect transit network: {e}"),
+                    );
+                }
             };
 
             let payload = entry.path().join("payload");
+
             if payload.join("depth.path").is_file()
                 && payload.join("depth.objects").is_file()
             {
-                network_ids.push(entry.file_name().to_string_lossy().to_string());
+                network_ids.push(
+                    entry.file_name().to_string_lossy().to_string(),
+                );
             }
         }
 
         network_ids.sort();
         network_ids.dedup();
 
-        let event = match guarded("exile", || commands::qtm_exile(&name)) {
+        let event = match guarded("exile", || {
+            commands::qtm_exile(&name)
+        }) {
             Ok(event) => event,
             Err(e) => return e,
         };
@@ -4009,7 +4048,9 @@ networks.dedup();
         };
 
         for network_id in &network_ids {
-            if let Err(e) = write_depth_payload(&record_path, network_id, &event.depth) {
+            if let Err(e) =
+                write_depth_payload(&record_path, network_id, &event.depth)
+            {
                 return e;
             }
         }
@@ -4030,7 +4071,10 @@ networks.dedup();
         Scale::Local,
     );
 
-    json_response(StatusCode::OK, &direction_response(payload, None, qtm))
+    json_response(
+        StatusCode::OK,
+        &direction_response(payload, None, qtm),
+    )
 }
 
 
