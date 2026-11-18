@@ -4176,14 +4176,7 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
                 Err(e) => e,
             },
 
-        #[cfg(feature = "bit-miner")]
-        (Method::POST, ["wallets", name, "activations", act, "derive"]) =>
-            match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_derive_submission((*name).to_string(), a).await
-                }
-                Err(e) => e,
-            },
+
 
         #[cfg(feature = "bit-miner")]
         (Method::GET, ["wallets", name, "activations", act, "networks", net, field]) =>
