@@ -1062,7 +1062,7 @@ async fn derive_network_data(
 async fn handle_derive_submission(
     name: String,
     network: String,
-    event: qp_hd::PersistedEvent,
+    event: &qp_hd::PersistedEvent,
 ) -> HttpResponse {
     const FIELDS: [&str; 6] = [
         "fingerprint",
@@ -1104,7 +1104,7 @@ async fn handle_derive_submission(
         );
     }
 
-    let (coordinate, commitment, activation) = match &event {
+    let (coordinate, commitment, activation) = match event {
         qp_hd::PersistedEvent::Transit(event) => (
             event.qtm.coordinate,
             event.qtm.commitment,
@@ -3753,7 +3753,7 @@ async fn handle_exile_wallet(
     };
 
     let transaction = match guarded("receive", || {
-        QuantumTransaction::send(&name, body.ordinal)
+        QuantumTransaction::send(&name, amount)
     }) {
         Ok(transaction) => transaction,
         Err(e) => return e,
