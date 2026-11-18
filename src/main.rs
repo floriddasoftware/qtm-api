@@ -3687,6 +3687,7 @@ async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse
 
 
 
+
 /// POST /wallets/:name/receive
 /// POST /wallets/:name/exile
 async fn handle_exile_wallet(
@@ -3696,99 +3697,118 @@ async fn handle_exile_wallet(
     let is_receive_request = request.is_some();
 
     let lock = substrate_lock(&name);
-    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    if let Err(e) = ensure_existing_substrate(&name) {
-        return e;
-    }
+    let (
+        amount,
+        flow,
+        transaction,
+        constant_delta,
+        qtm,
+        transaction_response,
+    ) = {
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    let (amount, flow) = match request {
-        Some(body) => {
-            if body.amount == 0 || body.ordinal == 0 {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "amount and ordinal must be greater than zero",
-                );
-            }
+        if let Err(e) = ensure_existing_substrate(&name) {
+            return e;
+        }
 
-            if body.ordinal > body.amount {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "ordinal exceeds receive amount: maximum={}",
-                        body.amount
-                    ),
-                );
-            }
-
-            let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
-                "receive" => Flow::Receive,
-                "change" => Flow::Change(0),
-                _ => {
+        let (amount, flow) = match request {
+            Some(body) => {
+                if body.amount == 0 || body.ordinal == 0 {
                     return error(
                         StatusCode::BAD_REQUEST,
-                        "flow must be receive or change",
+                        "amount and ordinal must be greater than zero",
                     );
                 }
-            };
 
-            (body.ordinal, Some((body.amount, flow)))
-        }
-        None => {
-            let activation = match guarded("activation lookup", || {
-                commands::load_activation(&name)
-            }) {
-                Ok(activation) if activation > 0 => activation,
-                Ok(_) => {
+                if body.ordinal > body.amount {
                     return error(
-                        StatusCode::NOT_FOUND,
-                        "no persisted activation exists",
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "ordinal exceeds receive amount: maximum={}",
+                            body.amount
+                        ),
                     );
                 }
-                Err(e) => return e,
-            };
 
-            (activation, None)
-        }
-    };
+                let flow = match body.flow.trim().to_ascii_lowercase().as_str() {
+                    "receive" => Flow::Receive,
+                    "change" => Flow::Change(0),
+                    _ => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "flow must be receive or change",
+                        );
+                    }
+                };
 
-    let transaction = match guarded("receive", || {
-        QuantumTransaction::send(&name, amount)
-    }) {
-        Ok(transaction) => transaction,
-        Err(e) => return e,
-    };
+                (body.ordinal, Some((body.amount, flow)))
+            }
+            None => {
+                let activation = match guarded("activation lookup", || {
+                    commands::load_activation(&name)
+                }) {
+                    Ok(activation) if activation > 0 => activation,
+                    Ok(_) => {
+                        return error(
+                            StatusCode::NOT_FOUND,
+                            "no persisted activation exists",
+                        );
+                    }
+                    Err(e) => return e,
+                };
 
-    let constant_delta = match &transaction.constant {
-        qp_hd::PersistedEvent::Exile(event) => {
-            event.heritage.transition.delta
-        }
-        qp_hd::PersistedEvent::Transit(_) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "QuantumTransaction::send returned a transit constant; expected exile provenance",
-            );
-        }
-    };
+                (activation, None)
+            }
+        };
 
-    let flow = match flow {
-        Some((_, Flow::Change(_))) => Flow::Change(constant_delta),
-        Some((_, flow)) => flow,
-        None => Flow::Receive,
-    };
+        let transaction = match guarded("receive", || {
+            QuantumTransaction::send(&name, amount)
+        }) {
+            Ok(transaction) => transaction,
+            Err(e) => return e,
+        };
 
-    let qtm = QtmResponse {
-        commitment: hex::encode(transaction.qtm.commitment),
-        coordinate: hex::encode(transaction.qtm.coordinate),
-        sigma: transaction.qtm.sigma.to_string(),
-        network: transaction.qtm.net_work.to_string(),
-    };
+        let constant_delta = match &transaction.constant {
+            qp_hd::PersistedEvent::Exile(event) => {
+                event.heritage.transition.delta
+            }
+            qp_hd::PersistedEvent::Transit(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "QuantumTransaction::send returned a transit constant; expected exile provenance",
+                );
+            }
+        };
+
+        let flow = match flow {
+            Some((_, Flow::Change(_))) => Flow::Change(constant_delta),
+            Some((_, flow)) => flow,
+            None => Flow::Receive,
+        };
+
+        let qtm = QtmResponse {
+            commitment: hex::encode(transaction.qtm.commitment),
+            coordinate: hex::encode(transaction.qtm.coordinate),
+            sigma: transaction.qtm.sigma.to_string(),
+            network: transaction.qtm.net_work.to_string(),
+        };
 
         let transaction_response = QuantumTransactionResponse {
-        amount: transaction.amount,
-        qtm: qtm_frame(qtm.clone()),
-        constant: "exile".to_string(),
-        constant_delta: constant_delta.to_string(),
+            amount: transaction.amount,
+            qtm: qtm_frame(qtm.clone()),
+            constant: "exile".to_string(),
+            constant_delta: constant_delta.to_string(),
+        };
+
+        (
+            amount,
+            flow,
+            transaction,
+            constant_delta,
+            qtm,
+            transaction_response,
+        )
     };
 
     let (persisted_event, networks) =
@@ -3804,7 +3824,11 @@ async fn handle_exile_wallet(
         );
     }
 
-    let event = transaction.receive(&name, flow);
+    let event = {
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        transaction.receive(&name, flow)
+    };
 
     let post_activation = event.heritage.state.activations();
 
@@ -3813,9 +3837,6 @@ async fn handle_exile_wallet(
         event.depth,
         Scale::Local,
     );
-
-    drop(guard);
-
 
     let mut derivations = Vec::with_capacity(networks.len());
 
@@ -3879,6 +3900,7 @@ async fn handle_exile_wallet(
         },
     )
 }
+
 
 
 /// GET /wallets/:name/exile/depth
