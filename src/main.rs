@@ -3784,39 +3784,15 @@ async fn handle_exile_wallet(
         network: transaction.qtm.net_work.to_string(),
     };
 
-    let transaction_response = QuantumTransactionResponse {
+        let transaction_response = QuantumTransactionResponse {
         amount: transaction.amount,
         qtm: qtm_frame(qtm.clone()),
         constant: "exile".to_string(),
         constant_delta: constant_delta.to_string(),
     };
 
-let event = transaction.receive(&name, flow);
-
-let post_activation = event.heritage.state.activations();
-let dimension = event.heritage.state.dimension();
-
-let receive_event_path = FsPath::new(&name)
-    .join("events")
-    .join(format!(
-        "event_{post_activation}_{dimension}"
-    ));
-
-persist_heritage(
-    &receive_event_path,
-    &event,
-);
-
-let payload = EventPayload::from_heritage(
-    event.heritage,
-    event.depth,
-    Scale::Local,
-);
-
-drop(guard);
-
     let (persisted_event, networks) =
-        match derive_network_data(&name, post_activation).await {
+        match derive_network_data(&name, amount).await {
             Ok(result) => result,
             Err(e) => return e,
         };
@@ -3827,6 +3803,19 @@ drop(guard);
             "persisted event has no registered network",
         );
     }
+
+    let event = transaction.receive(&name, flow);
+
+    let post_activation = event.heritage.state.activations();
+
+    let payload = EventPayload::from_heritage(
+        event.heritage,
+        event.depth,
+        Scale::Local,
+    );
+
+    drop(guard);
+
 
     let mut derivations = Vec::with_capacity(networks.len());
 
