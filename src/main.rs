@@ -11,11 +11,11 @@ Method, Request, Response, StatusCode,
 use hyper_util::rt::TokioIo;
 use payload::EventPayload;
 use qp_hd::{
-commands,
-economic_gate::QuantumTransaction,
-pathsregistry::{CoinType, PathsRegistry, HARDENED_OFFSET},
-purpose::{BIP39Handler, BIP39Language},
-qp44::{Flow, TotalMass},
+    commands::{self, persist_heritage},
+    economic_gate::QuantumTransaction,
+    pathsregistry::{CoinType, PathsRegistry, HARDENED_OFFSET},
+    purpose::{BIP39Handler, BIP39Language},
+    qp44::{Flow, TotalMass},
 };
 use qtm_graph::graph::{frame::Depth, Scale};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -3791,7 +3791,9 @@ async fn handle_exile_wallet(
         constant_delta: constant_delta.to_string(),
     };
 
-    let post_activation = event.heritage.state.activations();
+let event = transaction.receive(&name, flow);
+
+let post_activation = event.heritage.state.activations();
 let dimension = event.heritage.state.dimension();
 
 let receive_event_path = FsPath::new(&name)
@@ -3800,7 +3802,7 @@ let receive_event_path = FsPath::new(&name)
         "event_{post_activation}_{dimension}"
     ));
 
-commands::persist_heritage(
+persist_heritage(
     &receive_event_path,
     &event,
 );
