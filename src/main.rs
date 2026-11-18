@@ -4226,8 +4226,6 @@ fn run_bit_miner(args: &[String]) -> ! {
 
     eprintln!("bit-miner: pipeline ready substrate={substrate} activation={activation} network={pipeline_network}");
 
-let resolver =
-    WirePacketPrevoutResolver::new(&substrate, activation, pipeline_network);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -4245,7 +4243,7 @@ let resolver =
             };
 
             loop {
-                match observation_stream.stream(&substrate, &mut pipeline, &resolver).await {
+                match observation_stream.stream(&substrate, &mut pipeline,).await {
                     Ok(Ok(Some(_))) => {
                         eprintln!("bit-miner: transaction processed substrate={substrate} activation={activation}");
                     }
