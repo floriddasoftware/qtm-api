@@ -3791,22 +3791,27 @@ async fn handle_exile_wallet(
         constant_delta: constant_delta.to_string(),
     };
 
-    let event = match guarded("receive", || {
-        transaction.receive(&name, flow)
-    }) {
-        Ok(event) => event,
-        Err(e) => return e,
-    };
-
     let post_activation = event.heritage.state.activations();
+let dimension = event.heritage.state.dimension();
 
-    let payload = EventPayload::from_heritage(
-        event.heritage,
-        event.depth,
-        Scale::Local,
-    );
+let receive_event_path = FsPath::new(&name)
+    .join("events")
+    .join(format!(
+        "event_{post_activation}_{dimension}"
+    ));
 
-    drop(guard);
+commands::persist_heritage(
+    &receive_event_path,
+    &event,
+);
+
+let payload = EventPayload::from_heritage(
+    event.heritage,
+    event.depth,
+    Scale::Local,
+);
+
+drop(guard);
 
     let (persisted_event, networks) =
         match derive_network_data(&name, post_activation).await {
