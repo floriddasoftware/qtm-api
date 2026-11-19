@@ -3651,6 +3651,7 @@ async fn handle_get_payload_board(name: String, activation: u64) -> HttpResponse
 
 
 
+
 /// POST /wallets/:name/receive
 /// POST /wallets/:name/exile
 async fn handle_exile_wallet(
@@ -3666,6 +3667,7 @@ async fn handle_exile_wallet(
         flow,
         transaction,
         constant_delta,
+        constant_activation,
         qtm,
         transaction_response,
     ) = {
@@ -3707,6 +3709,7 @@ async fn handle_exile_wallet(
 
                 (body.ordinal, Some((body.amount, flow)))
             }
+
             None => {
                 let activation = match guarded("activation lookup", || {
                     commands::load_activation(&name)
@@ -3732,17 +3735,20 @@ async fn handle_exile_wallet(
             Err(e) => return e,
         };
 
-        let constant_delta = match &transaction.constant {
-            qp_hd::PersistedEvent::Exile(event) => {
-                event.heritage.transition.delta
-            }
-            qp_hd::PersistedEvent::Transit(_) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "QuantumTransaction::send returned a transit constant; expected exile provenance",
-                );
-            }
-        };
+        let (constant_delta, constant_activation) =
+            match &transaction.constant {
+                qp_hd::PersistedEvent::Exile(event) => (
+                    event.heritage.transition.delta,
+                    event.heritage.state.activations(),
+                ),
+
+                qp_hd::PersistedEvent::Transit(_) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "QuantumTransaction::send returned a transit constant; expected exile provenance",
+                    );
+                }
+            };
 
         let flow = match flow {
             Some((_, Flow::Change(_))) => Flow::Change(constant_delta),
@@ -3769,13 +3775,16 @@ async fn handle_exile_wallet(
             flow,
             transaction,
             constant_delta,
+            constant_activation,
             qtm,
             transaction_response,
         )
     };
 
+    // Recover network data using the activation from the
+    // exile provenance, never the receive ordinal.
     let (persisted_event, networks) =
-        match derive_network_data(&name, amount).await {
+        match derive_network_data(&name, constant_activation).await {
             Ok(result) => result,
             Err(e) => return e,
         };
@@ -3783,7 +3792,9 @@ async fn handle_exile_wallet(
     if networks.is_empty() {
         return error(
             StatusCode::CONFLICT,
-            "persisted event has no registered network",
+            format!(
+                "persisted event has no network: activation={constant_activation}"
+            ),
         );
     }
 
@@ -3863,6 +3874,7 @@ async fn handle_exile_wallet(
         },
     )
 }
+
 
 
 
