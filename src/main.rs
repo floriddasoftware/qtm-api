@@ -3778,8 +3778,9 @@ async fn handle_exile_wallet(
 
     // Network recovery AFTER receive.
     // derive_network_data already differentiates Transit vs Exile — no extra matching here.
+    // amount is body.ordinal on the receive path and the persisted activation on the pure-exile path.
     let (persisted_event, networks) =
-        match derive_network_data(&name, constant_activation).await {
+        match derive_network_data(&name, amount).await {
             Ok(result) => result,
             Err(e) => return e,
         };
@@ -3857,7 +3858,6 @@ async fn handle_exile_wallet(
         },
     )
 }
-
 
 /// GET /wallets/:name/exile/depth
 fn handle_exile_depth(name: String) -> HttpResponse {
