@@ -4119,6 +4119,31 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
                 }
                 Err(e) => e,
             },
+            
+            
+(Method::GET, [
+    "wallets",
+    name,
+    "activations",
+    act,
+    "networks",
+    net,
+    "wirepacket",
+    commitment,
+    "signing",
+]) =>
+    match parse_u64_param(act, "activation") {
+        Ok(a) => {
+            handle_get_wirepacket_signing(
+                (*name).to_string(),
+                a,
+                (*net).to_string(),
+                (*commitment).to_string(),
+            )
+        }
+        Err(e) => e,
+    },
+
 
         (Method::GET, ["wallets", name, "activations", act, "networks", net, "payload-board"]) =>
             match parse_u64_param(act, "activation") {
