@@ -942,6 +942,7 @@ fn authorization_directory(
 }
 
 
+
 #[cfg(feature = "bit-miner")]
 async fn derive_network_data(
     name: &str,
@@ -974,7 +975,23 @@ async fn derive_network_data(
         qp_hd::PersistedEvent::Transit(event) => {
             let depth = &event.depth;
 
-            let identifiers = [
+            let depth_objects = depth
+                .objects()
+                .map(|(position, identifier, retain)| {
+                    (
+                        position,
+                        identifier.to_string(),
+                        retain.mass,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let identifiers = depth_objects
+                .iter()
+                .map(|(_, identifier, _)| identifier.as_str())
+                .collect::<Vec<_>>();
+
+            let registered_identifiers = [
                 "purpose",
                 "coin",
                 "account",
@@ -982,80 +999,39 @@ async fn derive_network_data(
                 "external",
             ];
 
-            let depth_objects = depth
-                .objects()
-                .map(|(position, identifier, retain)| {
-                    (position, identifier.to_string(), retain.mass)
-                })
-                .collect::<Vec<_>>();
+            let depth_is_registered = depth.path() == "qp44/wallet"
+                && identifiers.len() == registered_identifiers.len()
+                && identifiers
+                    .iter()
+                    .zip(registered_identifiers.iter())
+                    .enumerate()
+                    .all(|(position, (actual, expected))| {
+                        depth_objects[position].0 == position
+                            && actual == expected
+                    });
 
-            let path_component_mass = |component: &str| -> Option<u128> {
-                let (number, hardened) = match component.strip_suffix('\'') {
-                    Some(number) => (number, true),
-                    None => (component, false),
-                };
+            if !depth_is_registered {
+                Vec::new()
+            } else {
+                registered_networks()
+                    .networks
+                    .into_iter()
+                    .filter(|network| {
+                        let Some(path) = network.path.strip_prefix("m/") else {
+                            return false;
+                        };
 
-                let value = number.parse::<u128>().ok()?;
-
-                if hardened {
-                    value.checked_add(HARDENED_OFFSET)
-                } else {
-                    Some(value)
-                }
-            };
-
-            let networks = registered_networks()
-                .networks
-                .into_iter()
-                .filter(|network| {
-                    if depth.path() != "qp44/wallet"
-                        || depth_objects.len() != identifiers.len()
-                    {
-                        return false;
-                    }
-
-                    let Some(path) = network.path.strip_prefix("m/") else {
-                        return false;
-                    };
-
-                    let components = path.split('/').collect::<Vec<_>>();
-
-                    if components.len() != identifiers.len() {
-                        return false;
-                    }
-
-                    depth_objects
-                        .iter()
-                        .zip(identifiers.iter())
-                        .zip(components.iter())
-                        .enumerate()
-                        .all(
-                            |(expected_position, ((object, identifier), component))| {
-                                let (position, actual_identifier, mass) = object;
-
-                                *position == expected_position
-                                    && actual_identifier == identifier
-                                    && path_component_mass(component) == Some(*mass)
-                            },
-                        )
-                })
-                .map(|network| network.id)
-                .collect::<Vec<_>>();
-
-            if networks.is_empty() {
-                return Err(error(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "persisted transit depth does not match a registered network path: substrate={name} activation={activation} depth={}",
-                        depth.path(),
-                    ),
-                ));
+                        path.split('/').count() == depth_objects.len()
+                    })
+                    .map(|network| network.id)
+                    .collect()
             }
-            networks
         }
     };
+
     Ok((event, networks))
 }
+
 
 
 #[cfg(feature = "bit-miner")]
