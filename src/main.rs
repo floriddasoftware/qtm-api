@@ -943,6 +943,7 @@ fn authorization_directory(
 
 
 
+
 #[cfg(feature = "bit-miner")]
 async fn derive_network_data(
     name: &str,
@@ -986,12 +987,7 @@ async fn derive_network_data(
                 })
                 .collect::<Vec<_>>();
 
-            let identifiers = depth_objects
-                .iter()
-                .map(|(_, identifier, _)| identifier.as_str())
-                .collect::<Vec<_>>();
-
-            let registered_identifiers = [
+            let identifiers = [
                 "purpose",
                 "coin",
                 "account",
@@ -1000,31 +996,40 @@ async fn derive_network_data(
             ];
 
             let depth_is_registered = depth.path() == "qp44/wallet"
-                && identifiers.len() == registered_identifiers.len()
-                && identifiers
+                && depth_objects.len() == identifiers.len()
+                && depth_objects
                     .iter()
-                    .zip(registered_identifiers.iter())
+                    .zip(identifiers.iter())
                     .enumerate()
-                    .all(|(position, (actual, expected))| {
-                        depth_objects[position].0 == position
-                            && actual == expected
+                    .all(|(position, (object, identifier))| {
+                        object.0 == position
+                            && object.1 == *identifier
                     });
 
             if !depth_is_registered {
                 Vec::new()
             } else {
-                registered_networks()
-                    .networks
-                    .into_iter()
-                    .filter(|network| {
-                        let Some(path) = network.path.strip_prefix("m/") else {
-                            return false;
-                        };
+                let mass_for = |identifier: &str| {
+                    depth_objects
+                        .iter()
+                        .find(|object| object.1 == identifier)
+                        .map(|object| object.2)
+                };
 
-                        path.split('/').count() == depth_objects.len()
-                    })
-                    .map(|network| network.id)
-                    .collect()
+                match (mass_for("purpose"), mass_for("coin")) {
+                    (Some(purpose), Some(coin)) => {
+                        registered_networks()
+                            .networks
+                            .into_iter()
+                            .filter(|network| {
+                                network.purpose as u128 == purpose
+                                    && network.coin as u128 == coin
+                            })
+                            .map(|network| network.id)
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                }
             }
         }
     };
