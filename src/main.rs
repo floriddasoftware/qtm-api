@@ -942,9 +942,6 @@ fn authorization_directory(
 }
 
 
-
-
-
 #[cfg(feature = "bit-miner")]
 async fn derive_network_data(
     name: &str,
@@ -965,14 +962,19 @@ async fn derive_network_data(
         qp_hd::PersistedEvent::Exile(event) => &event.depth,
     };
 
+    // Depth::path() is only the outer frame identifier ("qp44/wallet").
+    // Network coordinates live in the retained objects inserted by TotalMass::deep():
+    //   purpose  @ 0  (hardened)
+    //   coin     @ 1  (hardened)
+    //   account  @ 2  (hardened)
+    //   change   @ 3
+    //   external @ 4
     let objects = depth
         .objects()
-        .map(|(_, identifier, retain)| {
-            (identifier.to_string(), retain.mass)
-        })
+        .map(|(_, identifier, retain)| (identifier.to_string(), retain.mass))
         .collect::<Vec<_>>();
 
-    let mass = |identifier: &str| {
+    let mass = |identifier: &str| -> Option<u128> {
         objects
             .iter()
             .find(|(id, _)| id == identifier)
@@ -980,43 +982,25 @@ async fn derive_network_data(
     };
 
     let networks = match (mass("purpose"), mass("coin")) {
-        (Some(purpose), Some(coin)) => {
-            let registered = registered_networks()
+        (Some(purpose_mass), Some(coin_mass)) => {
+            // Values were inserted hardened; registry stores the base values.
+            let purpose = purpose_mass.saturating_sub(HARDENED_OFFSET);
+            let coin = coin_mass.saturating_sub(HARDENED_OFFSET);
+
+            registered_networks()
                 .networks
                 .into_iter()
                 .filter(|network| {
-                    network.purpose as u128 == purpose
-                        && network.coin as u128 == coin
+                    network.purpose as u128 == purpose && network.coin as u128 == coin
                 })
                 .map(|network| network.id)
-                .collect::<Vec<_>>();
-
-            if registered.is_empty() {
-                let total_mass: u128 =
-                    objects.iter().map(|(_, mass)| *mass).sum();
-
-                vec![format!(
-                    "unregistered:{}/{}",
-                    total_mass,
-                    objects.len()
-                )]
-            } else {
-                registered
-            }
+                .collect::<Vec<_>>()
         }
-
-        _ => {
-            let total_mass: u128 =
-                objects.iter().map(|(_, mass)| *mass).sum();
-
-            vec![format!(
-                "unregistered:{}/{}",
-                total_mass,
-                objects.len()
-            )]
-        }
+        _ => Vec::new(),
     };
 
+    // Empty list is the correct signal when no registered network matches.
+    // Never fabricate "unregistered:…/…" — it fails valid_observation_network_id.
     Ok((event, networks))
 }
 
