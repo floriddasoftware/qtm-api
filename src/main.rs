@@ -1037,12 +1037,11 @@ async fn handle_derive_submission(
     ];
 
     if !valid_observation_network_id(&network) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid network identifier",
-        );
-    }
-
+    return error(
+        StatusCode::BAD_REQUEST,
+        format!("invalid network identifier: {network:?}"),
+    );
+   }
     let Some(network_option) = selected_network(&network) else {
         return error(
             StatusCode::BAD_REQUEST,
