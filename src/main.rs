@@ -950,12 +950,6 @@ async fn derive_network_data(
     name: &str,
     activation: u64,
 ) -> ApiResult<(qp_hd::PersistedEvent, Vec<String>)> {
-    if activation == 0 {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "activation must be greater than zero",
-        ));
-    }
 
     ensure_existing_substrate(name)?;
 
