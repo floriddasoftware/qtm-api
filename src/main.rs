@@ -950,7 +950,6 @@ async fn derive_network_data(
     name: &str,
     activation: u64,
 ) -> ApiResult<(qp_hd::PersistedEvent, Vec<String>)> {
-
     ensure_existing_substrate(name)?;
 
     let event = match guarded(
@@ -961,58 +960,65 @@ async fn derive_network_data(
         Err(e) => return Err(e),
     };
 
-    let networks = match &event {
-        qp_hd::PersistedEvent::Exile(event) => {
-            vec![event.qtm.net_work.to_string()]
-        }
+    let depth = match &event {
+        qp_hd::PersistedEvent::Transit(event) => &event.depth,
+        qp_hd::PersistedEvent::Exile(event) => &event.depth,
+    };
 
-        qp_hd::PersistedEvent::Transit(event) => {
-            let depth = &event.depth;
+    let objects = depth
+        .objects()
+        .map(|(_, identifier, retain)| {
+            (identifier.to_string(), retain.mass)
+        })
+        .collect::<Vec<_>>();
 
-            let objects = depth
-                .objects()
-                .map(|(_, identifier, retain)| {
-                    (identifier.to_string(), retain.mass)
+    let mass = |identifier: &str| {
+        objects
+            .iter()
+            .find(|(id, _)| id == identifier)
+            .map(|(_, mass)| *mass)
+    };
+
+    let networks = match (mass("purpose"), mass("coin")) {
+        (Some(purpose), Some(coin)) => {
+            let registered = registered_networks()
+                .networks
+                .into_iter()
+                .filter(|network| {
+                    network.purpose as u128 == purpose
+                        && network.coin as u128 == coin
                 })
+                .map(|network| network.id)
                 .collect::<Vec<_>>();
 
-            let mass = |identifier: &str| {
-                objects
-                    .iter()
-                    .find(|(id, _)| id == identifier)
-                    .map(|(_, mass)| *mass)
-            };
+            if registered.is_empty() {
+                let total_mass: u128 =
+                    objects.iter().map(|(_, mass)| *mass).sum();
 
-            match (mass("purpose"), mass("coin")) {
-                (Some(purpose), Some(coin)) => {
-                    registered_networks()
-                        .networks
-                        .into_iter()
-                        .filter(|network| {
-                            network.purpose as u128 == purpose
-                                && network.coin as u128 == coin
-                        })
-                        .map(|network| network.id)
-                        .collect()
-                }
-
-                _ => {
-                    let total_mass: u128 =
-                        objects.iter().map(|(_, mass)| mass).sum();
-
-                    vec![format!(
-                        "unregistered:{}/{}",
-                        total_mass,
-                        objects.len()
-                    )]
-                }
+                vec![format!(
+                    "unregistered:{}/{}",
+                    total_mass,
+                    objects.len()
+                )]
+            } else {
+                registered
             }
+        }
+
+        _ => {
+            let total_mass: u128 =
+                objects.iter().map(|(_, mass)| *mass).sum();
+
+            vec![format!(
+                "unregistered:{}/{}",
+                total_mass,
+                objects.len()
+            )]
         }
     };
 
     Ok((event, networks))
 }
-
 
 
 #[cfg(feature = "bit-miner")]
