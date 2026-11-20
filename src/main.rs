@@ -1638,51 +1638,75 @@ impl WirePacketPrevoutResolver {
         }
     }
 
-    fn resolve_packet(&self, requested: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<WirePacket, std::io::Error> {
-        use std::io::{Error, ErrorKind};
+fn resolve_packet(
+    &self,
+    requested: &OutPoint,
+    submission: u64,
+    commitment: [u8; 32],
+) -> Result<WirePacket, std::io::Error> {
+    use std::io::{Error, ErrorKind};
 
-   let path = commands::wirepackets_path( &self.substrate, self.activation,&self.network,);
+    let path = commands::wirepackets_path(
+        &self.substrate,
+        self.activation,
+        &self.network,
+        submission,
+    );
 
-        let bytes = std::fs::read(&path).map_err(|e| {
-            Error::new(
-                e.kind(),
-                format!(
-                    "unable to load parent wirepackets: substrate={} activation={} submission={} outpoint={}:{}: {e}",
-                    self.substrate, self.activation, submission, requested.txid, requested.vout,
-                ),
-            )
-        })?;
+    let bytes = std::fs::read(&path).map_err(|e| {
+        Error::new(
+            e.kind(),
+            format!(
+                "unable to load parent wirepackets: substrate={} activation={} network={} submission={} outpoint={}:{}: {e}",
+                self.substrate,
+                self.activation,
+                self.network,
+                submission,
+                requested.txid,
+                requested.vout,
+            ),
+        )
+    })?;
 
-        let packets = decode_wirepackets(&bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    let packets = decode_wirepackets(&bytes)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 
-        for packet in packets {
-            if packet.outpoint != *requested {
-                continue;
-            }
-
-            if packet.commitment != commitment {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "parent commitment mismatch: substrate={} activation={} submission={} outpoint={}:{}",
-                        self.substrate, self.activation, submission, requested.txid, requested.vout,
-                    ),
-                ));
-            }
-
-            return Ok(packet);
+    for packet in packets {
+        if packet.outpoint != *requested {
+            continue;
         }
 
-        Err(Error::new(
-            ErrorKind::NotFound,
-            format!(
-                "previous output not found: substrate={} activation={} submission={} outpoint={}:{}",
-                self.substrate, self.activation, submission, requested.txid, requested.vout,
-            ),
-        ))
-    }
-}
+        if packet.commitment != commitment {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "parent commitment mismatch: substrate={} activation={} network={} submission={} outpoint={}:{}",
+                    self.substrate,
+                    self.activation,
+                    self.network,
+                    submission,
+                    requested.txid,
+                    requested.vout,
+                ),
+            ));
+        }
 
+        return Ok(packet);
+    }
+
+    Err(Error::new(
+        ErrorKind::NotFound,
+        format!(
+            "previous output not found: substrate={} activation={} network={} submission={} outpoint={}:{}",
+            self.substrate,
+            self.activation,
+            self.network,
+            submission,
+            requested.txid,
+            requested.vout,
+        ),
+    ))
+}
 #[cfg(feature = "bit-miner")]
 impl PrevoutResolver for WirePacketPrevoutResolver {
     fn resolve(&self, outpoint: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<ResolvedPrevout, Box<dyn std::error::Error + Send + Sync>> {
