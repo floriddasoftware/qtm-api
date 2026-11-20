@@ -1707,6 +1707,8 @@ fn resolve_packet(
         ),
     ))
 }
+}
+
 #[cfg(feature = "bit-miner")]
 impl PrevoutResolver for WirePacketPrevoutResolver {
     fn resolve(&self, outpoint: &OutPoint, submission: u64, commitment: [u8; 32]) -> Result<ResolvedPrevout, Box<dyn std::error::Error + Send + Sync>> {
