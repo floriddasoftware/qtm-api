@@ -1700,6 +1700,71 @@ impl PrevoutResolver for WirePacketPrevoutResolver {
     }
 }
 
+
+fn handle_get_wirepacket_signing(
+    name: String,
+    activation: u64,
+    network: String,
+    commitment: String,
+) -> HttpResponse {
+    if let Err(e) = validate_wirepackets_scope(&name, &network) {
+        return e;
+    }
+
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
+
+    if hex::decode(&commitment)
+        .map(|bytes| bytes.len() != 32)
+        .unwrap_or(true)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid wire-packet commitment",
+        );
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    match commands::load_wirepacket_signing(
+        &name,
+        activation,
+        &network,
+        &commitment,
+    ) {
+        Ok(contents) => {
+            bytes_response(
+                StatusCode::OK,
+                "application/json",
+                contents,
+            )
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "signing record not found: activation={activation} network={network} commitment={commitment}"
+                ),
+            )
+        }
+        Err(e) if e.kind() == ErrorKind::InvalidInput => {
+            error(
+                StatusCode::BAD_REQUEST,
+                e.to_string(),
+            )
+        }
+        Err(e) => {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to load signing record: {e}"),
+            )
+        }
+    }
+}
+
+
 fn electrum_port() -> u16 {
     std::env::var("ELECTRUM_PORT")
         .ok()
