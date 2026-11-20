@@ -2446,37 +2446,38 @@ Ok(())
 fn bit_minner_enabled() -> bool {
 cfg!(feature = "bit-miner")
 }
-fn has_persisted_wirepackets(name: &str, activation: u64, network:&str, max_events: Option<u64>) -> ApiResult<bool> {
-let event_root = commands::substrate_root()
-.join(name)
-.join("activations")
-.join(activation.to_string())
-.join("event");
-let entries = match std::fs::read_dir(&event_root) {
-Ok(entries) => entries,
-Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
-Err(e) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect WirePackets: {e}"))),
-};
-for entry in entries {
-let entry = entry.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read entry: {e}")))?;
-if !entry.file_type().map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("entry error: {e}"))).map(|t| t.is_dir())? {
-continue;
-}
-let Some(submission) = entry.file_name().to_str().and_then(|v| v.parse::<u64>().ok()) else {
-continue;
-};
-if max_events.is_some_and(|limit| submission >= limit) {
-continue;
-}
-let path = commands::wirepackets_path(name, activation, network);
-match std::fs::metadata(&path) {
-Ok(m) if m.is_file() => return Ok(true),
-Ok(_) => {}
-Err(e) if e.kind() == ErrorKind::NotFound => {}
-Err(e) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to inspect WirePackets: {e}"))),
-}
-}
-Ok(false)
+fn has_persisted_wirepackets(
+    name: &str,
+    activation: u64,
+    network: &str,
+    max_events: Option<u64>,
+) -> ApiResult<bool> {
+    let limit = max_events.unwrap_or(u64::MAX);
+
+    for submission in 1..=limit {
+        let path = commands::wirepackets_path(
+            name,
+            activation,
+            network,
+            submission,
+        );
+
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect WirePackets: substrate={name} activation={activation} network={network} submission={submission}: {e}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 fn build_payload_board(
@@ -2564,99 +2565,100 @@ fn has_persisted_wirepackets_any_network(
     activation: u64,
     max_events: Option<u64>,
 ) -> ApiResult<bool> {
-    let event_root = commands::substrate_root()
+    let network_root = commands::substrate_root()
         .join(name)
         .join("activations")
         .join(activation.to_string())
-        .join("event");
+        .join("network");
 
-    let entries = match std::fs::read_dir(&event_root) {
+    let networks = match std::fs::read_dir(&network_root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
         Err(e) => {
             return Err(error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect submission directories: {e}"),
+                format!("unable to inspect activation networks: {e}"),
             ));
         }
     };
 
-    for entry in entries {
-        let entry = entry.map_err(|e| {
+    for network_entry in networks {
+        let network_entry = network_entry.map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to read submission entry: {e}"),
+                format!("unable to read network entry: {e}"),
             )
         })?;
 
-        if !entry.file_type().map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect submission entry: {e}"),
-            )
-        })?.is_dir() {
-            continue;
-        }
-
-        let Some(submission) = entry
-            .file_name()
-            .to_str()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-
-        if max_events.is_some_and(|limit| submission > limit) {
-            continue;
-        }
-
-        let networks = std::fs::read_dir(entry.path()).map_err(|e| {
-            error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to inspect submission {submission} networks: {e}"),
-            )
-        })?;
-
-        for network_entry in networks {
-            let network_entry = network_entry.map_err(|e| {
+        if !network_entry
+            .file_type()
+            .map_err(|e| {
                 error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to read network directory: {e}"),
+                    format!("unable to inspect network entry: {e}"),
+                )
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let network = network_entry
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+
+        if !valid_observation_network_id(&network)
+            || !is_bitcoin_network_id(&network)
+        {
+            continue;
+        }
+
+        let wirepackets_dir = network_entry
+            .path()
+            .join("wirepackets");
+
+        let submissions = match std::fs::read_dir(&wirepackets_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect WirePackets: network={network}: {e}"
+                    ),
+                ));
+            }
+        };
+
+        for submission_entry in submissions {
+            let submission_entry = submission_entry.map_err(|e| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("unable to read WirePackets submission: {e}"),
                 )
             })?;
 
-            if !network_entry.file_type().map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect network directory: {e}"),
-                )
-            })?.is_dir() {
+            let Some(submission) = submission_entry
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+
+            if max_events.is_some_and(|limit| submission > limit) {
                 continue;
             }
 
-            let network = network_entry.file_name().to_string_lossy().into_owned();
-
-            if !valid_observation_network_id(&network)
-                || !is_bitcoin_network_id(&network)
-            {
-                continue;
-            }
-
-            let path = commands::wirepackets_path(
-                name,
-                activation,
-                &network,
-            );
-
-            match std::fs::metadata(path) {
-                Ok(metadata) if metadata.is_file() => return Ok(true),
+            match submission_entry.file_type() {
+                Ok(file_type) if file_type.is_file() => return Ok(true),
                 Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(e) => {
                     return Err(error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!(
-                            "unable to inspect submission {submission} network {network}: {e}"
+                            "unable to inspect WirePackets submission {submission}: {e}"
                         ),
                     ));
                 }
@@ -3258,7 +3260,11 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
     json_response(StatusCode::OK, &direction_response(event_payload, Some(selection), qtm))
 }
 
-fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<WirePacketsResponse> {
+fn load_wirepackets(
+    name: &str,
+    activation: u64,
+    network: &str,
+) -> ApiResult<WirePacketsResponse> {
     validate_wirepackets_scope(name, network)?;
 
     let lock = substrate_lock(name);
@@ -3266,21 +3272,36 @@ fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<Wir
 
     let substrate_path = ensure_existing_substrate(name)?;
 
-    let budget = load_network_budget(&substrate_path, activation, network)?.ok_or_else(|| {
-        error(StatusCode::NOT_FOUND, "no WirePackets budget configured for this activation and network")
+    let budget = load_network_budget(
+        &substrate_path,
+        activation,
+        network,
+    )?
+    .ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            "no WirePackets budget configured for this activation and network",
+        )
     })?;
 
-    let event_path = commands::substrate_root()
+    let wirepackets_dir = commands::substrate_root()
         .join(name)
         .join("activations")
         .join(activation.to_string())
-        .join("event");
+        .join("network")
+        .join(network)
+        .join("wirepackets");
 
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
 
     for submission in 1..=budget.max_events {
-        let path = commands::wirepackets_path(name, activation, &network,);
+        let path = commands::wirepackets_path(
+            name,
+            activation,
+            network,
+            submission,
+        );
 
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => metadata,
@@ -3289,41 +3310,55 @@ fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<Wir
             Err(e) => {
                 return Err(error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to inspect submission {submission}: {e}"),
+                    format!(
+                        "unable to inspect WirePackets submission {submission}: {e}"
+                    ),
                 ));
             }
         };
 
         let bytes = std::fs::read(&path).map_err(|e| {
-            error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read submission {submission}: {e}"))
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to read WirePackets submission {submission}: {e}"
+                ),
+            )
         })?;
 
         let next_size = total_bytes
             .checked_add(bytes.len() as u64)
-            .ok_or_else(|| error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size overflow"))?;
+            .ok_or_else(|| {
+                error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "combined WirePackets size overflow",
+                )
+            })?;
 
         if next_size > WIREPACKETS_MAX_BYTES {
             return Err(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"),
+                format!(
+                    "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
+                ),
             ));
         }
 
         let packets = decode_wirepackets(&bytes).map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid WirePackets for activation {activation}, submission {submission}: {e}"),
+                format!(
+                    "invalid WirePackets: activation={activation} submission={submission}: {e}"
+                ),
             )
         })?;
-
-        let packet_count = packets.len();
 
         entries.push(WirePacketEntry {
             submission,
             name: submission.to_string(),
             path: path.display().to_string(),
             bytes: metadata.len(),
-            packet_count,
+            packet_count: packets.len(),
             packets: wire_packet_value_entries(&packets),
         });
 
@@ -3337,7 +3372,7 @@ fn load_wirepackets(name: &str, activation: u64, network: &str) -> ApiResult<Wir
         activation,
         network: network.to_owned(),
         scope: "activation",
-        path: event_path.display().to_string(),
+        path: wirepackets_dir.display().to_string(),
         exists,
         bytes: exists.then_some(total_bytes),
         file_route: Some(format!(
@@ -3354,7 +3389,11 @@ fn handle_get_wirepackets(name: String, activation: u64, network: String) -> Htt
     }
 }
 
-fn handle_get_wirepackets_file(name: String, activation: u64, network: String) -> HttpResponse {
+fn handle_get_wirepackets_file(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
     if let Err(e) = validate_wirepackets_scope(&name, &network) {
         return e;
     }
@@ -3367,79 +3406,106 @@ fn handle_get_wirepackets_file(name: String, activation: u64, network: String) -
         Err(e) => return e,
     };
 
-    let budget = match load_network_budget(&substrate_path, activation, &network) {
+    let budget = match load_network_budget(
+        &substrate_path,
+        activation,
+        &network,
+    ) {
         Ok(Some(budget)) => budget,
         Ok(None) => {
-            return error(StatusCode::NOT_FOUND, "no WirePackets budget configured for this activation and network");
+            return error(
+                StatusCode::NOT_FOUND,
+                "no WirePackets budget configured for this activation and network",
+            );
         }
         Err(e) => return e,
     };
 
-    let persisted = match has_persisted_wirepackets(
-    &name,
-    activation,
-    &network,
-    Some(budget.max_events),
-) {
-    Ok(persisted) => persisted,
-    Err(e) => return e,
-};
-
     let mut combined = Vec::new();
 
-    if persisted {
-        for submission in 1..=budget.max_events {
-            let path = commands::wirepackets_path(&name, activation, &network);
+    for submission in 1..=budget.max_events {
+        let path = commands::wirepackets_path(
+            &name,
+            activation,
+            &network,
+            submission,
+        );
 
-            let metadata = match std::fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("unable to inspect submission {submission}: {e}"),
-                    );
-                }
-            };
-
-            if !metadata.is_file() {
-                continue;
-            }
-
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("unable to read submission {submission}: {e}"),
-                    );
-                }
-            };
-
-            let next_size = match (combined.len() as u64).checked_add(bytes.len() as u64) {
-                Some(size) => size,
-                None => {
-                    return error(StatusCode::PAYLOAD_TOO_LARGE, "combined WirePackets size overflow");
-                }
-            };
-
-            if next_size > WIREPACKETS_MAX_BYTES {
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
                 return error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to inspect WirePackets submission {submission}: {e}"
+                    ),
                 );
             }
+        };
 
-            combined.extend_from_slice(&bytes);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "unable to read WirePackets submission {submission}: {e}"
+                    ),
+                );
+            }
+        };
+
+        if bytes.is_empty() {
+            continue;
         }
+
+        if let Err(e) = decode_wirepackets(&bytes) {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "invalid WirePackets submission {submission}: {e}"
+                ),
+            );
+        }
+
+        let next_size = match (combined.len() as u64)
+            .checked_add(metadata.len())
+        {
+            Some(size) => size,
+            None => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "combined WirePackets size overflow",
+                );
+            }
+        };
+
+        if next_size > WIREPACKETS_MAX_BYTES {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
+                ),
+            );
+        }
+
+        combined.extend_from_slice(&bytes);
     }
 
     if combined.is_empty() {
-        return error(StatusCode::NOT_FOUND, "no persisted WirePackets submissions within configured budget");
+        return error(
+            StatusCode::NOT_FOUND,
+            "no persisted WirePackets submissions within configured budget",
+        );
     }
 
-    bytes_response(StatusCode::OK, "application/octet-stream", combined)
+    bytes_response(
+        StatusCode::OK,
+        "application/octet-stream",
+        combined,
+    )
 }
 
 async fn handle_start_bitminer(name: String, activation: u64, network: String) -> HttpResponse {
