@@ -17,6 +17,7 @@ use qp_hd::{
     purpose::{BIP39Handler, BIP39Language},
     qp44::{Flow, TotalMass},
 };
+
 use qtm_graph::graph::{frame::Depth, Scale};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
