@@ -2706,12 +2706,35 @@ empty_response(StatusCode::NO_CONTENT)
 fn handle_list_networks() -> HttpResponse {
 json_response(StatusCode::OK, &registered_networks())
 }
+
 fn handle_list_wallets() -> HttpResponse {
-match list_substrates() {
-Ok(res) => json_response(StatusCode::OK, &res),
-Err(err) => err,
+    let started = std::time::Instant::now();
+
+    println!(
+        "[substrates-api] request_start method=GET route=/wallets"
+    );
+
+    match list_substrates() {
+        Ok(res) => {
+            println!(
+                "[substrates-api] request_complete status=200 count={} elapsed_ms={}",
+                res.substrates.len(),
+                started.elapsed().as_millis()
+            );
+
+            json_response(StatusCode::OK, &res)
+        }
+        Err(err) => {
+            eprintln!(
+                "[substrates-api] request_failed route=/wallets elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+
+            err
+        }
+    }
 }
-}
+
 fn handle_head_wallets() -> HttpResponse {
 match list_substrates() {
 Ok(_) => empty_response(StatusCode::OK),
