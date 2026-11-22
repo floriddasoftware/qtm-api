@@ -655,39 +655,250 @@ format!("substrate state is incomplete: missing {}", file.display()),
 }
 Ok(path)
 }
+
 fn list_substrates() -> ApiResult<SubstrateListResponse> {
-let root = commands::substrate_root();
-if !root.is_dir() {
-return Ok(SubstrateListResponse { substrates: Vec::new() });
+    // Always resolve the authoritative substrate root.
+    let root = commands::substrate_root();
+
+    println!(
+        "[substrates] list_start root={}",
+        root.display()
+    );
+
+    if !root.exists() {
+        eprintln!(
+            "[substrates] root_missing path={}",
+            root.display()
+        );
+
+        return Ok(SubstrateListResponse {
+            substrates: Vec::new(),
+        });
+    }
+
+    if !root.is_dir() {
+        eprintln!(
+            "[substrates] root_invalid_not_directory path={}",
+            root.display()
+        );
+
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "substrate root is not a directory: {}",
+                root.display()
+            ),
+        ));
+    }
+
+    let entries = std::fs::read_dir(&root).map_err(|e| {
+        eprintln!(
+            "[substrates] root_read_failed path={} error={}",
+            root.display(),
+            e
+        );
+
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "unable to enumerate substrate root {}: {e}",
+                root.display()
+            ),
+        )
+    })?;
+
+    let mut substrates = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "[substrates] entry_read_failed root={} error={}",
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                eprintln!(
+                    "[substrates] entry_type_failed path={} error={}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        if !file_type.is_dir() {
+            println!(
+                "[substrates] entry_skipped_not_directory path={}",
+                path.display()
+            );
+            continue;
+        }
+
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => {
+                eprintln!(
+                    "[substrates] entry_skipped_invalid_utf8 path={}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        if !valid_substrate_name(&name) {
+            eprintln!(
+                "[substrates] entry_skipped_invalid_name name={:?} path={}",
+                name,
+                path.display()
+            );
+            continue;
+        }
+
+        // Validate the persisted substrate files.
+        let mut invalid = false;
+
+        for filename in SUBSTRATE_FILES {
+            let file = path.join(filename);
+
+            match std::fs::read_to_string(&file) {
+                Ok(contents) if !contents.trim().is_empty() => {}
+
+                Ok(_) => {
+                    eprintln!(
+                        "[substrates] substrate_skipped_empty_file name={} file={}",
+                        name,
+                        file.display()
+                    );
+                    invalid = true;
+                    break;
+                }
+
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    eprintln!(
+                        "[substrates] substrate_skipped_missing_file name={} file={}",
+                        name,
+                        file.display()
+                    );
+                    invalid = true;
+                    break;
+                }
+
+                Err(e) => {
+                    eprintln!(
+                        "[substrates] substrate_skipped_unreadable_file name={} file={} error={}",
+                        name,
+                        file.display(),
+                        e
+                    );
+                    invalid = true;
+                    break;
+                }
+            }
+        }
+
+        if invalid {
+            continue;
+        }
+
+        // Read dimension independently so the precise failure is logged.
+        let dimension_path = path.join("perm.dimension");
+
+        let dimension = match std::fs::read_to_string(&dimension_path) {
+            Ok(value) if !value.trim().is_empty() => {
+                value.trim().to_string()
+            }
+
+            Ok(_) => {
+                eprintln!(
+                    "[substrates] substrate_skipped_invalid_dimension name={} file={} reason=empty",
+                    name,
+                    dimension_path.display()
+                );
+                continue;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "[substrates] substrate_skipped_dimension_read name={} file={} error={}",
+                    name,
+                    dimension_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        let activation_path = path.join("activation");
+
+        let activations = match std::fs::read_to_string(&activation_path) {
+            Ok(value) if !value.trim().is_empty() => {
+                value.trim().to_string()
+            }
+
+            Ok(_) => {
+                eprintln!(
+                    "[substrates] activation_empty name={} default=0",
+                    name
+                );
+                "0".to_string()
+            }
+
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                eprintln!(
+                    "[substrates] activation_missing name={} default=0",
+                    name
+                );
+                "0".to_string()
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "[substrates] activation_read_failed name={} error={} default=0",
+                    name,
+                    e
+                );
+                "0".to_string()
+            }
+        };
+
+        println!(
+            "[substrates] substrate_loaded name={} path={} dimension={} activations={}",
+            name,
+            path.display(),
+            dimension,
+            activations
+        );
+
+        substrates.push(SubstrateEntry {
+            name,
+            dimension,
+            activations,
+        });
+    }
+
+    substrates.sort_by(|a, b| a.name.cmp(&b.name));
+
+    println!(
+        "[substrates] list_complete root={} loaded={}",
+        root.display(),
+        substrates.len()
+    );
+
+    Ok(SubstrateListResponse {
+        substrates,
+    })
 }
-let entries = std::fs::read_dir(&root)
-.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to list substrates: {e}")))?;
-let mut substrates = Vec::new();
-for entry in entries {
-let entry = entry.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("unable to read entry: {e}")))?;
-let path = entry.path();
-if !path.is_dir() {
-continue;
-}
-let name = match entry.file_name().into_string() {
-Ok(n) if valid_substrate_name(&n) => n,
-_ => continue,
-};
-if !path.join("perm.indices").is_file()
-|| !path.join("perm.entropy").is_file()
-|| !path.join("perm.dimension").is_file()
-{
-continue;
-}
-substrates.push(SubstrateEntry {
-name,
-dimension: required_file(&path.join("perm.dimension"))?,
-activations: read_trim(&path.join("activation")).unwrap_or_else(|| "0".to_string()),
-});
-}
-substrates.sort_by(|a, b| a.name.cmp(&b.name));
-Ok(SubstrateListResponse { substrates })
-}
+
 fn network_option(id: &str, name: &str, coin: CoinType, purpose: u64, path: &str) -> NetworkOption {
     NetworkOption {
         id: id.to_string(),
