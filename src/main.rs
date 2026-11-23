@@ -1222,10 +1222,9 @@ async fn derive_network_data(
 #[cfg(feature = "bit-miner")]
 async fn handle_get_activation_networks(name: String, activation: u64) -> HttpResponse {
     match derive_network_data(&name, activation).await {
-        Ok((event, networks)) => json_response(StatusCode::OK, &serde_json::json!({
+        Ok((_, networks)) => json_response(StatusCode::OK, &serde_json::json!({
             "substrate": name,
             "activation": activation,
-            "event": event,
             "networks": networks,
         })),
         Err(e) => e,
