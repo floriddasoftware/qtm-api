@@ -658,6 +658,19 @@ format!("substrate state is incomplete: missing {}", file.display()),
 Ok(path)
 }
 
+fn ensure_substrate_namespace(name: &str) -> ApiResult<PathBuf> {
+    if !valid_substrate_name(name) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid substrate name"));
+    }
+
+    let path = commands::substrate_root().join(name);
+    if !path.is_dir() {
+        return Err(error(StatusCode::NOT_FOUND, format!("substrate does not exist: {name}")));
+    }
+
+    Ok(path)
+}
+
 fn list_substrates() -> ApiResult<SubstrateListResponse> {
     let root = commands::substrate_root();
     println!("[substrates] list_start root={}", root.display());
@@ -1039,7 +1052,7 @@ async fn derive_network_data(
     name: &str,
     activation: u64,
 ) -> ApiResult<(qp_hd::PersistedEvent, Vec<String>)> {
-    ensure_existing_substrate(name)?;
+    ensure_existing_substrate_namespace(name)?;
 
     let event = match guarded(
         "persisted event lookup",
