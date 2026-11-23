@@ -188,23 +188,24 @@ events: Vec<PersistedEventSummary>,
 runtime: RuntimeResponse,
 }
 
-
 #[derive(Serialize)]
 struct PersistedEventSummary {
-kind: String,
-record: String,
-activation: String,
-dimension: String,
-structural_value: String,
-depth_objects: usize,
-retained_mass: String,
-delta: String,
-tau: String,
-gross_work: String,
-net_work: String,
-commitment: String,
-coordinate: String,
+    kind: String,
+    record: String,
+    activation: String,
+    heritage: EventHeritageView,
+    dimension: String,
+    structural_value: String,
+    depth_objects: usize,
+    retained_mass: String,
+    delta: String,
+    tau: String,
+    gross_work: String,
+    net_work: String,
+    commitment: String,
+    coordinate: String,
 }
+
 #[derive(Serialize)]
 struct PersistedPayloadNetwork {
 id: String,
@@ -3050,11 +3051,17 @@ fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
     )
 }
 
+
 fn handle_list_events(name: String) -> HttpResponse {
+    if !valid_substrate_name(&name) {
+        return error(StatusCode::BAD_REQUEST, "invalid substrate name");
+    }
+
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    let substrate_path = match ensure_existing_substrate(&name) {
+    // Event history requires only the persisted substrate namespace.
+    let substrate_path = match ensure_substrate_namespace(&name) {
         Ok(path) => path,
         Err(err) => return err,
     };
@@ -3065,131 +3072,109 @@ fn handle_list_events(name: String) -> HttpResponse {
     if events_path.is_dir() {
         let entries = match std::fs::read_dir(&events_path) {
             Ok(entries) => entries,
-            Err(err) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("unable to list events: {err}"),
-                );
-            }
+            Err(e) => return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to list persisted events: {e}"),
+            ),
         };
 
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(err) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("unable to read event entry: {err}"),
-                    );
+                Err(e) => {
+                    eprintln!("[event-store] entry_read_failed substrate={} error={}", name, e);
+                    continue;
                 }
             };
 
             let record_path = entry.path();
-
             if !record_path.is_dir() {
                 continue;
             }
 
             let record = entry.file_name().to_string_lossy().to_string();
+            if !valid_record_name(&record) {
+                continue;
+            }
 
             let kind = if record.starts_with("exile_") {
                 "exile"
-            } else if record.starts_with("event_") {
-                "transit"
             } else {
+                "transit"
+            };
+
+            // An incomplete record must not prevent other persisted events loading.
+            let read = |field: &str| -> Option<String> {
+                let value = read_trim(&record_path.join(field));
+                if value.is_none() {
+                    eprintln!(
+                        "[event-store] incomplete_record substrate={} record={} missing={}",
+                        name, record, field
+                    );
+                }
+                value
+            };
+
+            let Some(activation) = read("manifold.activations") else {
+                continue;
+            };
+            let Ok(activation_number) = activation.parse::<u64>() else {
+                eprintln!(
+                    "[event-store] invalid_activation substrate={} record={} value={}",
+                    name, record, activation
+                );
                 continue;
             };
 
-            let read_persisted = |field: &str| -> ApiResult<String> {
-                read_trim(&record_path.join(field)).ok_or_else(|| {
-                    error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "missing persisted event field: record={} field={}",
-                            record,
-                            field,
-                        ),
-                    )
-                })
+            let (
+                Some(dimension),
+                Some(structural_value),
+                Some(retained_mass),
+                Some(delta),
+                Some(tau),
+                Some(gross_work),
+                Some(net_work),
+                Some(commitment),
+                Some(coordinate),
+                Some(depth_contents),
+            ) = (
+                read("manifold.dimension"),
+                read("manifold.structural_value"),
+                read("manifold.retained_mass"),
+                read("transition.delta"),
+                read("transition.tau"),
+                read("transition.gross_work"),
+                read("transition.net_work"),
+                read("qtm.commitment"),
+                read("qtm.coordinate"),
+                read("depth.objects"),
+            ) else {
+                continue;
             };
 
-            let activation = match read_persisted("manifold.activations") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let activation_number = match activation.parse::<u64>() {
-                Ok(value) => value,
-                Err(_) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "invalid persisted activation: record={} activation={}",
-                            record,
-                            activation,
-                        ),
-                    );
-                }
-            };
-
-            let dimension = match read_persisted("manifold.dimension") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let structural_value =
-                match read_persisted("manifold.structural_value") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
-            let retained_mass =
-                match read_persisted("manifold.retained_mass") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
-            let delta = match read_persisted("transition.delta") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let tau = match read_persisted("transition.tau") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let gross_work =
-                match read_persisted("transition.gross_work") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
-            let net_work =
-                match read_persisted("transition.net_work") {
-                    Ok(value) => value,
-                    Err(err) => return err,
-                };
-
-            let commitment = match read_persisted("qtm.commitment") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let coordinate = match read_persisted("qtm.coordinate") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
-
-            let depth_contents = match read_persisted("depth.objects") {
-                Ok(value) => value,
-                Err(err) => return err,
-            };
+            // Older records may not contain the persisted mirror.
+            let mirror_bytes = read("transition.mirror").unwrap_or_default();
 
             let depth_objects = depth_contents
                 .lines()
                 .filter(|line| !line.trim().is_empty())
                 .count();
+
+            let heritage = EventHeritageView {
+                state: EventStateView {
+                    dimension: dimension.clone(),
+                    structural_value: structural_value.clone(),
+                    retained_mass: retained_mass.clone(),
+                    activations: activation_number,
+                },
+                transition: EventTransitionView {
+                    tau: tau.clone(),
+                    delta: delta.clone(),
+                    gross_work: gross_work.clone(),
+                    net_work: net_work.clone(),
+                    mirror_bytes,
+                },
+            };
 
             events.push((
                 activation_number,
@@ -3197,6 +3182,7 @@ fn handle_list_events(name: String) -> HttpResponse {
                     kind: kind.to_string(),
                     record,
                     activation,
+                    heritage,
                     dimension,
                     structural_value,
                     depth_objects,
@@ -3217,10 +3203,7 @@ fn handle_list_events(name: String) -> HttpResponse {
             .then_with(|| a.1.record.cmp(&b.1.record))
     });
 
-    let events = events
-        .into_iter()
-        .map(|(_, event)| event)
-        .collect();
+    let events = events.into_iter().map(|(_, event)| event).collect();
 
     json_response(
         StatusCode::OK,
