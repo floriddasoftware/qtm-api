@@ -187,6 +187,8 @@ events_directory: String,
 events: Vec<PersistedEventSummary>,
 runtime: RuntimeResponse,
 }
+
+
 #[derive(Serialize)]
 struct PersistedEventSummary {
 kind: String,
@@ -1216,6 +1218,19 @@ async fn derive_network_data(
     Ok((event, networks))
 }
 
+
+#[cfg(feature = "bit-miner")]
+async fn handle_get_activation_networks(name: String, activation: u64) -> HttpResponse {
+    match derive_network_data(&name, activation).await {
+        Ok((event, networks)) => json_response(StatusCode::OK, &serde_json::json!({
+            "substrate": name,
+            "activation": activation,
+            "event": event,
+            "networks": networks,
+        })),
+        Err(e) => e,
+    }
+}
 
 #[cfg(feature = "bit-miner")]
 async fn handle_derive_submission(
@@ -4330,7 +4345,7 @@ Err(e) => e,
 
 
 
- // ---------- Hyper Route Dispatcher ---------- */
+// ---------- Hyper Route Dispatcher ----------
 async fn dispatch(req: Request<Incoming>) -> HttpResponse {
     let method = req.method().clone();
 
@@ -4338,88 +4353,61 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
         return handle_preflight();
     }
 
-    // Electrum WebSocket upgrade must retain the original request.
-    if method == Method::GET
-        && req.uri().path().trim_end_matches('/') == "/electrum"
-    {
+    if method == Method::GET && req.uri().path().trim_end_matches('/') == "/electrum" {
         return handle_electrum_websocket(req).await;
     }
 
-    // Normalize trailing slashes before matching.
     let raw = req.uri().path().to_owned();
-    let trimmed = raw.trim_end_matches('/');
-    let path = if trimmed.is_empty() {
-        "/"
-    } else {
-        trimmed
+    let path = match raw.trim_end_matches('/') {
+        "" => "/",
+        path => path,
     };
 
-    let segments: Vec<&str> = path
-        .trim_start_matches('/')
+    let segments: Vec<&str> = path.trim_start_matches('/')
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();
 
     match (method, segments.as_slice()) {
         // ---------- General ----------
-        (Method::GET, ["health"]) =>
-            handle_health(),
-
-        (Method::GET, ["networks"]) =>
-            handle_list_networks(),
+        (Method::GET, ["health"]) => handle_health(),
+        (Method::GET, ["networks"]) => handle_list_networks(),
 
         // ---------- Wallets / Substrates ----------
-        (Method::GET, ["wallets"]) =>
-            handle_list_wallets(),
-
-        (Method::HEAD, ["wallets"]) =>
-            handle_head_wallets(),
-
-        (Method::POST, ["wallets"]) =>
-            handle_create_wallet(req).await,
-
-        (Method::GET, ["wallets", name]) =>
-            handle_get_wallet((*name).to_string()),
-
-        (Method::GET, ["wallets", name, "events"]) =>
-            handle_list_events((*name).to_string()),
-
+        (Method::GET, ["wallets"]) => handle_list_wallets(),
+        (Method::HEAD, ["wallets"]) => handle_head_wallets(),
+        (Method::POST, ["wallets"]) => handle_create_wallet(req).await,
+        (Method::GET, ["wallets", name]) => handle_get_wallet((*name).to_string()),
+        (Method::GET, ["wallets", name, "events"]) => handle_list_events((*name).to_string()),
         (Method::GET, ["wallets", name, "events", record, "payloads"]) =>
-            handle_list_event_payloads(
-                (*name).to_string(),
-                (*record).to_string(),
-            ),
+            handle_list_event_payloads((*name).to_string(), (*record).to_string()),
+
+        // ---------- Activation-Derived Networks ----------
+        (Method::GET, ["wallets", name, "activations", act, "networks"]) =>
+            match parse_u64_param(act, "activation") {
+                Ok(a) => {
+                    #[cfg(feature = "bit-miner")]
+                    { handle_get_activation_networks((*name).to_string(), a).await }
+                    #[cfg(not(feature = "bit-miner"))]
+                    { error(StatusCode::NOT_IMPLEMENTED, "network derivation requires bit-miner") }
+                }
+                Err(e) => e,
+            },
 
         // ---------- Activation Open ----------
-        (
-            Method::GET,
-            ["wallets", name, "activations", act, "open"],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "open"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_open_wallet(
-                    (*name).to_string(),
-                    a,
-                ),
+                Ok(a) => handle_open_wallet((*name).to_string(), a),
                 Err(e) => e,
             },
 
         // ---------- Transit / Receive / Exile ----------
         (Method::POST, ["wallets", name, "transit"]) =>
-            handle_transit_wallet(
-                (*name).to_string(),
-                req,
-            )
-            .await,
+            handle_transit_wallet((*name).to_string(), req).await,
 
         (Method::POST, ["wallets", name, "receive"]) =>
             match parse_json_body::<ReceiveRequest>(req).await {
-                Ok(body) => {
-                    handle_exile_wallet(
-                        (*name).to_string(),
-                        Some(body),
-                    )
-                    .await
-                }
+                Ok(body) => handle_exile_wallet((*name).to_string(), Some(body)).await,
                 Err(e) => e,
             },
 
@@ -4427,318 +4415,103 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
             handle_exile_depth((*name).to_string()),
 
         (Method::POST, ["wallets", name, "exile"]) =>
-            handle_exile_wallet(
-                (*name).to_string(),
-                None,
-            )
-            .await,
+            handle_exile_wallet((*name).to_string(), None).await,
 
         // ---------- Activation Budgets ----------
-        (
-            Method::GET,
-            ["wallets", name, "activations", act, "budgets"],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "budgets"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => handle_list_activation_budgets(
-                    (*name).to_string(),
-                    a,
-                ),
+                Ok(a) => handle_list_activation_budgets((*name).to_string(), a),
                 Err(e) => e,
             },
 
-        (
-            Method::PUT,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "budgets",
-                net,
-            ],
-        ) =>
+        (Method::PUT, ["wallets", name, "activations", act, "budgets", net]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_update_activation_network_budget(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                        req,
-                    )
-                    .await
-                }
+                Ok(a) => handle_update_activation_network_budget((*name).to_string(), a, (*net).to_string(), req).await,
                 Err(e) => e,
             },
 
         // ---------- Bitcoin Observations ----------
-        (
-            Method::GET,
-            ["wallets", name, "activations", act, "observations"],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "observations"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_list_bitcoin_observations(
-                        (*name).to_string(),
-                        a,
-                    )
-                    .await
-                }
+                Ok(a) => handle_list_bitcoin_observations((*name).to_string(), a).await,
                 Err(e) => e,
             },
 
         // ---------- Activation Payload Board ----------
-        (
-            Method::GET,
-            ["wallets", name, "activations", act, "payload-board"],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "payload-board"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_payload_board(
-                        (*name).to_string(),
-                        a,
-                    )
-                    .await
-                }
+                Ok(a) => handle_get_payload_board((*name).to_string(), a).await,
                 Err(e) => e,
             },
 
         // ---------- Network Observation Status ----------
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "observation",
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, "observation"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_bitminer_status(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                    .await
-                }
+                Ok(a) => handle_get_bitminer_status((*name).to_string(), a, (*net).to_string()).await,
                 Err(e) => e,
             },
 
         // ---------- Start Bitcoin Observation ----------
-        (
-            Method::POST,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "observation",
-            ],
-        ) =>
+        (Method::POST, ["wallets", name, "activations", act, "networks", net, "observation"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_start_bitminer(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                    .await
-                }
+                Ok(a) => handle_start_bitminer((*name).to_string(), a, (*net).to_string()).await,
                 Err(e) => e,
             },
 
         // ---------- Stop Bitcoin Observation ----------
-        (
-            Method::DELETE,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "observation",
-            ],
-        ) =>
+        (Method::DELETE, ["wallets", name, "activations", act, "networks", net, "observation"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_stop_bitminer(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                    .await
-                }
+                Ok(a) => handle_stop_bitminer((*name).to_string(), a, (*net).to_string()).await,
                 Err(e) => e,
             },
 
         // ---------- Observation Log ----------
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "observation",
-                "log",
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, "observation", "log"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_bitminer_log(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                }
+                Ok(a) => handle_get_bitminer_log((*name).to_string(), a, (*net).to_string()),
                 Err(e) => e,
             },
 
         // ---------- Wirepackets ----------
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "wirepackets",
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepackets"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_wirepackets(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                }
+                Ok(a) => handle_get_wirepackets((*name).to_string(), a, (*net).to_string()),
                 Err(e) => e,
             },
 
         // ---------- Wirepacket File ----------
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "wirepackets",
-                "file",
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepackets", "file"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_wirepackets_file(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                }
+                Ok(a) => handle_get_wirepackets_file((*name).to_string(), a, (*net).to_string()),
                 Err(e) => e,
             },
 
         // ---------- Wirepacket Signing ----------
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "wirepacket",
-                commitment,
-                "signing",
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, "wirepacket", commitment, "signing"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_wirepacket_signing(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                        (*commitment).to_string(),
-                    )
-                }
+                Ok(a) => handle_get_wirepacket_signing((*name).to_string(), a, (*net).to_string(), (*commitment).to_string()),
                 Err(e) => e,
             },
 
         // ---------- Network Payload Board ----------
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                "payload-board",
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, "payload-board"]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_payload_board_for_network(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                    )
-                    .await
-                }
+                Ok(a) => handle_get_payload_board_for_network((*name).to_string(), a, (*net).to_string()).await,
                 Err(e) => e,
             },
 
         // ---------- Generic Network Submission Value ----------
         #[cfg(feature = "bit-miner")]
-        (
-            Method::GET,
-            [
-                "wallets",
-                name,
-                "activations",
-                act,
-                "networks",
-                net,
-                field,
-            ],
-        ) =>
+        (Method::GET, ["wallets", name, "activations", act, "networks", net, field]) =>
             match parse_u64_param(act, "activation") {
-                Ok(a) => {
-                    handle_get_submission_value(
-                        (*name).to_string(),
-                        a,
-                        (*net).to_string(),
-                        (*field).to_string(),
-                    )
-                }
+                Ok(a) => handle_get_submission_value((*name).to_string(), a, (*net).to_string(), (*field).to_string()),
                 Err(e) => e,
             },
 
         // ---------- Not Found ----------
-        _ =>
-            error(
-                StatusCode::NOT_FOUND,
-                "route not found",
-            ),
+        _ => error(StatusCode::NOT_FOUND, "route not found"),
     }
 }
-
-
 
 //---------- Bit-Miner Child Worker ---------- */
 #[cfg(feature = "bit-miner")]
