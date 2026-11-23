@@ -659,54 +659,23 @@ Ok(path)
 }
 
 fn list_substrates() -> ApiResult<SubstrateListResponse> {
-    // Always resolve the authoritative substrate root.
     let root = commands::substrate_root();
-
-    println!(
-        "[substrates] list_start root={}",
-        root.display()
-    );
+    println!("[substrates] list_start root={}", root.display());
 
     if !root.exists() {
-        eprintln!(
-            "[substrates] root_missing path={}",
-            root.display()
-        );
-
-        return Ok(SubstrateListResponse {
-            substrates: Vec::new(),
-        });
+        eprintln!("[substrates] root_missing path={}", root.display());
+        return Ok(SubstrateListResponse { substrates: Vec::new() });
     }
 
     if !root.is_dir() {
-        eprintln!(
-            "[substrates] root_invalid_not_directory path={}",
-            root.display()
-        );
-
-        return Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "substrate root is not a directory: {}",
-                root.display()
-            ),
-        ));
+        return Err(error(StatusCode::INTERNAL_SERVER_ERROR,
+            format!("substrate root is not a directory: {}", root.display())));
     }
 
     let entries = std::fs::read_dir(&root).map_err(|e| {
-        eprintln!(
-            "[substrates] root_read_failed path={} error={}",
-            root.display(),
-            e
-        );
-
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "unable to enumerate substrate root {}: {e}",
-                root.display()
-            ),
-        )
+        eprintln!("[substrates] root_read_failed path={} error={}", root.display(), e);
+        error(StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to enumerate substrate root {}: {e}", root.display()))
     })?;
 
     let mut substrates = Vec::new();
@@ -715,190 +684,99 @@ fn list_substrates() -> ApiResult<SubstrateListResponse> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                eprintln!(
-                    "[substrates] entry_read_failed root={} error={}",
-                    root.display(),
-                    e
-                );
+                eprintln!("[substrates] entry_read_failed root={} error={}", root.display(), e);
                 continue;
             }
         };
 
         let path = entry.path();
-
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(e) => {
-                eprintln!(
-                    "[substrates] entry_type_failed path={} error={}",
-                    path.display(),
-                    e
-                );
-                continue;
-            }
-        };
-
-        if !file_type.is_dir() {
-            println!(
-                "[substrates] entry_skipped_not_directory path={}",
-                path.display()
-            );
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
 
         let name = match entry.file_name().into_string() {
-            Ok(name) => name,
+            Ok(name) if valid_substrate_name(&name) => name,
+            Ok(name) => {
+                eprintln!("[substrates] entry_skipped_invalid_name name={:?}", name);
+                continue;
+            }
             Err(_) => {
-                eprintln!(
-                    "[substrates] entry_skipped_invalid_utf8 path={}",
-                    path.display()
-                );
+                eprintln!("[substrates] entry_skipped_invalid_utf8 path={}", path.display());
                 continue;
             }
         };
 
-        if !valid_substrate_name(&name) {
-            eprintln!(
-                "[substrates] entry_skipped_invalid_name name={:?} path={}",
-                name,
-                path.display()
-            );
+        // Lock only this substrate; directory discovery stays concurrent.
+        let lock = substrate_lock(&name);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        if !path.is_dir() {
             continue;
         }
 
-        // Validate the persisted substrate files.
         let mut invalid = false;
-
         for filename in SUBSTRATE_FILES {
             let file = path.join(filename);
-
-            match std::fs::read_to_string(&file) {
-                Ok(contents) if !contents.trim().is_empty() => {}
-
+            match std::fs::metadata(&file) {
+                Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
                 Ok(_) => {
-                    eprintln!(
-                        "[substrates] substrate_skipped_empty_file name={} file={}",
-                        name,
-                        file.display()
-                    );
+                    eprintln!("[substrates] substrate_skipped_invalid_file name={} file={}",
+                        name, file.display());
                     invalid = true;
                     break;
                 }
-
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    eprintln!(
-                        "[substrates] substrate_skipped_missing_file name={} file={}",
-                        name,
-                        file.display()
-                    );
-                    invalid = true;
-                    break;
-                }
-
                 Err(e) => {
-                    eprintln!(
-                        "[substrates] substrate_skipped_unreadable_file name={} file={} error={}",
-                        name,
-                        file.display(),
-                        e
-                    );
+                    eprintln!("[substrates] substrate_skipped_file name={} file={} error={}",
+                        name, file.display(), e);
                     invalid = true;
                     break;
                 }
             }
         }
-
         if invalid {
             continue;
         }
 
-        // Read dimension independently so the precise failure is logged.
         let dimension_path = path.join("perm.dimension");
-
         let dimension = match std::fs::read_to_string(&dimension_path) {
-            Ok(value) if !value.trim().is_empty() => {
-                value.trim().to_string()
-            }
-
+            Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
             Ok(_) => {
-                eprintln!(
-                    "[substrates] substrate_skipped_invalid_dimension name={} file={} reason=empty",
-                    name,
-                    dimension_path.display()
-                );
+                eprintln!("[substrates] substrate_skipped_empty_dimension name={}", name);
                 continue;
             }
-
             Err(e) => {
-                eprintln!(
-                    "[substrates] substrate_skipped_dimension_read name={} file={} error={}",
-                    name,
-                    dimension_path.display(),
-                    e
-                );
+                eprintln!("[substrates] dimension_read_failed name={} error={}", name, e);
                 continue;
             }
         };
 
         let activation_path = path.join("activation");
-
         let activations = match std::fs::read_to_string(&activation_path) {
-            Ok(value) if !value.trim().is_empty() => {
-                value.trim().to_string()
-            }
-
+            Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
             Ok(_) => {
-                eprintln!(
-                    "[substrates] activation_empty name={} default=0",
-                    name
-                );
+                eprintln!("[substrates] activation_empty name={} default=0", name);
                 "0".to_string()
             }
-
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                eprintln!(
-                    "[substrates] activation_missing name={} default=0",
-                    name
-                );
+                eprintln!("[substrates] activation_missing name={} default=0", name);
                 "0".to_string()
             }
-
             Err(e) => {
-                eprintln!(
-                    "[substrates] activation_read_failed name={} error={} default=0",
-                    name,
-                    e
-                );
+                eprintln!("[substrates] activation_read_failed name={} error={} default=0", name, e);
                 "0".to_string()
             }
         };
 
-        println!(
-            "[substrates] substrate_loaded name={} path={} dimension={} activations={}",
-            name,
-            path.display(),
-            dimension,
-            activations
-        );
+        println!("[substrates] substrate_loaded name={} dimension={} activations={}",
+            name, dimension, activations);
 
-        substrates.push(SubstrateEntry {
-            name,
-            dimension,
-            activations,
-        });
+        substrates.push(SubstrateEntry { name, dimension, activations });
     }
 
     substrates.sort_by(|a, b| a.name.cmp(&b.name));
+    println!("[substrates] list_complete root={} loaded={}", root.display(), substrates.len());
 
-    println!(
-        "[substrates] list_complete root={} loaded={}",
-        root.display(),
-        substrates.len()
-    );
-
-    Ok(SubstrateListResponse {
-        substrates,
-    })
+    Ok(SubstrateListResponse { substrates })
 }
 
 fn network_option(id: &str, name: &str, coin: CoinType, purpose: u64, path: &str) -> NetworkOption {
@@ -2932,30 +2810,38 @@ fn handle_list_networks() -> HttpResponse {
 json_response(StatusCode::OK, &registered_networks())
 }
 
-fn handle_list_wallets() -> HttpResponse {
+async fn handle_list_wallets() -> HttpResponse {
     let started = std::time::Instant::now();
+    println!("[substrates-api] request_start method=GET route=/wallets");
 
-    println!(
-        "[substrates-api] request_start method=GET route=/wallets"
-    );
-
-    match list_substrates() {
-        Ok(res) => {
+    match tokio::task::spawn_blocking(list_substrates).await {
+        Ok(Ok(response)) => {
+            let count = response.substrates.len();
             println!(
                 "[substrates-api] request_complete status=200 count={} elapsed_ms={}",
-                res.substrates.len(),
+                count,
                 started.elapsed().as_millis()
             );
-
-            json_response(StatusCode::OK, &res)
+            json_response(StatusCode::OK, &response)
         }
-        Err(err) => {
+        Ok(Err(response)) => {
             eprintln!(
-                "[substrates-api] request_failed route=/wallets elapsed_ms={}",
+                "[substrates-api] request_failed status={} elapsed_ms={}",
+                response.status(),
                 started.elapsed().as_millis()
             );
-
-            err
+            response
+        }
+        Err(join_error) => {
+            eprintln!(
+                "[substrates-api] enumeration_task_failed elapsed_ms={} error={}",
+                started.elapsed().as_millis(),
+                join_error
+            );
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("substrate enumeration task failed: {join_error}"),
+            )
         }
     }
 }
@@ -4373,7 +4259,7 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
         (Method::GET, ["networks"]) => handle_list_networks(),
 
         // ---------- Wallets / Substrates ----------
-        (Method::GET, ["wallets"]) => handle_list_wallets(),
+        (Method::GET, ["wallets"]) => handle_list_wallets().await,
         (Method::HEAD, ["wallets"]) => handle_head_wallets(),
         (Method::POST, ["wallets"]) => handle_create_wallet(req).await,
         (Method::GET, ["wallets", name]) => handle_get_wallet((*name).to_string()),
@@ -4616,28 +4502,48 @@ async fn serve() {
     let root = commands::substrate_root();
     println!("substrate_root={}", root.display());
 
-    if root.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            let mut discovered: Vec<String> = entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().is_dir())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| valid_substrate_name(name))
-                .collect();
+    std::fs::create_dir_all(&root).unwrap_or_else(|e| {
+        panic!("failed to initialize substrate root {}: {e}", root.display())
+    });
 
-            discovered.sort();
-            println!("substrates_discovered={}", discovered.len());
+    let mut discovered = Vec::new();
 
-            for substrate in discovered {
-                let commitment = read_trim(&root.join(&substrate).join("qtm.commitment"))
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "unavailable".to_string());
+    match std::fs::read_dir(&root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        eprintln!("substrate_entry_error: {e}");
+                        continue;
+                    }
+                };
 
-                println!("substrate={substrate} commitment={commitment}");
+                if !entry.path().is_dir() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if valid_substrate_name(&name) {
+                    discovered.push(name);
+                }
             }
         }
-    } else {
-        println!("substrates_discovered=0 (root does not exist; startup did not create it)");
+        Err(e) => eprintln!(
+            "substrate_discovery_failed root={} error={}",
+            root.display(), e
+        ),
+    }
+
+    discovered.sort();
+    println!("substrates_discovered={}", discovered.len());
+
+    for substrate in discovered {
+        let commitment = read_trim(&root.join(&substrate).join("qtm.commitment"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unavailable".to_string());
+
+        println!("substrate={substrate} commitment={commitment}");
     }
 
     let port = std::env::var("PORT")
@@ -4647,7 +4553,6 @@ async fn serve() {
         .unwrap_or(8080);
 
     let http_address = format!("0.0.0.0:{port}");
-
     let listener = TcpListener::bind(&http_address)
         .await
         .unwrap_or_else(|e| panic!("failed to bind qtm-api HTTP listener at {http_address}: {e}"));
@@ -4656,7 +4561,6 @@ async fn serve() {
         "qtm-api Hyper HTTP/1 listener bound at {}",
         listener.local_addr().expect("HTTP listener address unavailable")
     );
-
     println!("qtm-api Electrum WebSocket endpoint: /electrum");
 
     loop {
@@ -4670,12 +4574,9 @@ async fn serve() {
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-
-            let service = service_fn(
-                |req: Request<Incoming>| async move {
-                    Ok::<_, Infallible>(dispatch(req).await)
-                },
-            );
+            let service = service_fn(|req: Request<Incoming>| async move {
+                Ok::<_, Infallible>(dispatch(req).await)
+            });
 
             if let Err(e) = http1::Builder::new()
                 .serve_connection(io, service)
