@@ -1053,7 +1053,7 @@ async fn derive_network_data(
     name: &str,
     activation: u64,
 ) -> ApiResult<(qp_hd::PersistedEvent, Vec<String>)> {
-    ensure_existing_substrate_namespace(name)?;
+    ensure_substrate_namespace(name)?;
 
     let event = match guarded(
         "persisted event lookup",
