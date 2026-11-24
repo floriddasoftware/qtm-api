@@ -494,7 +494,7 @@ fn attach_cors(res: &mut HttpResponse) {
     let headers = res.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, HEAD, POST, PUT, DELETE, OPTIONS"));
-    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Accept, Content-Type, Authorization"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Accept, Content-Type, Authorization, Cache-Control, Pragma"));
     headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
 }
 
@@ -2635,7 +2635,12 @@ let commitment = read_trim(&substrate_path.join("qtm.commitment"));
 let (process_running, pid) = miner;
 let wirepackets_persisted = match network_filter {
 Some(network) => {
-has_persisted_wirepackets(name, activation, network, None)?
+let max_events = load_network_budget(&substrate_path, activation, network)?
+    .map(|budget| budget.max_events);
+match max_events {
+    Some(limit) => has_persisted_wirepackets(name, activation, network, Some(limit))?,
+    None => false,
+}
 }
 None => {
 has_persisted_wirepackets_any_network(name, activation, None)?
@@ -3051,6 +3056,128 @@ fn handle_open_wallet(name: String, activation: u64) -> HttpResponse {
     )
 }
 
+
+fn handle_get_event(name: String, activation: u64) -> HttpResponse {
+    if !valid_substrate_name(&name) {
+        return error(StatusCode::BAD_REQUEST, "invalid substrate name");
+    }
+
+    let lock = substrate_lock(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    let substrate_path = match ensure_substrate_namespace(&name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let events_path = substrate_path.join("events");
+    let entries = match std::fs::read_dir(&events_path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                format!("no persisted events for substrate {name}"),
+            )
+        }
+    };
+
+    let mut found: Option<PersistedEventSummary> = None;
+
+    for entry in entries.flatten() {
+        let record_path = entry.path();
+        if !record_path.is_dir() {
+            continue;
+        }
+
+        let record = entry.file_name().to_string_lossy().to_string();
+        if !valid_record_name(&record) {
+            continue;
+        }
+
+        let kind = if record.starts_with("exile_") { "exile" } else { "transit" };
+        let read = |field: &str| -> Option<String> { read_trim(&record_path.join(field)) };
+
+        let Some(activation_text) = read("manifold.activations") else {
+            continue;
+        };
+        if activation_text.parse::<u64>().ok() != Some(activation) {
+            continue;
+        }
+
+        let (
+            Some(dimension),
+            Some(structural_value),
+            Some(retained_mass),
+            Some(delta),
+            Some(tau),
+            Some(gross_work),
+            Some(net_work),
+            Some(commitment),
+            Some(coordinate),
+            Some(depth_contents),
+        ) = (
+            read("manifold.dimension"),
+            read("manifold.structural_value"),
+            read("manifold.retained_mass"),
+            read("transition.delta"),
+            read("transition.tau"),
+            read("transition.gross_work"),
+            read("transition.net_work"),
+            read("qtm.commitment"),
+            read("qtm.coordinate"),
+            read("depth.objects"),
+        ) else {
+            continue;
+        };
+
+        let mirror_bytes = read("transition.mirror").unwrap_or_default();
+        let depth_objects = depth_contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+
+        let heritage = EventHeritageView {
+            state: EventStateView {
+                dimension: dimension.clone(),
+                structural_value: structural_value.clone(),
+                retained_mass: retained_mass.clone(),
+                activations: activation,
+            },
+            transition: EventTransitionView {
+                tau: tau.clone(),
+                delta: delta.clone(),
+                gross_work: gross_work.clone(),
+                net_work: net_work.clone(),
+                mirror_bytes,
+            },
+        };
+
+        found = Some(PersistedEventSummary {
+            kind: kind.to_string(),
+            record,
+            activation: activation_text,
+            heritage,
+            dimension,
+            structural_value,
+            depth_objects,
+            retained_mass,
+            delta,
+            tau,
+            gross_work,
+            net_work,
+            commitment,
+            coordinate,
+        });
+    }
+
+    match found {
+        Some(summary) => json_response(StatusCode::OK, &summary),
+        None => error(
+            StatusCode::NOT_FOUND,
+            format!("no persisted event at activation {activation}"),
+        ),
+    }
+}
 
 fn handle_list_events(name: String) -> HttpResponse {
     if !valid_substrate_name(&name) {
@@ -4260,6 +4387,11 @@ async fn dispatch(req: Request<Incoming>) -> HttpResponse {
         (Method::POST, ["wallets"]) => handle_create_wallet(req).await,
         (Method::GET, ["wallets", name]) => handle_get_wallet((*name).to_string()),
         (Method::GET, ["wallets", name, "events"]) => handle_list_events((*name).to_string()),
+        (Method::GET, ["wallets", name, "activations", act, "event"]) =>
+            match parse_u64_param(act, "activation") {
+                Ok(a) => handle_get_event((*name).to_string(), a),
+                Err(e) => e,
+            },
         (Method::GET, ["wallets", name, "events", record, "payloads"]) =>
             handle_list_event_payloads((*name).to_string(), (*record).to_string()),
 
