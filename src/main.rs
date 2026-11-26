@@ -1049,6 +1049,68 @@ fn authorization_directory(
 
 
 #[cfg(feature = "bit-miner")]
+fn persisted_transit_networks(
+    name: &str,
+    activation: u64,
+) -> Vec<String> {
+    let Some(record_path) =
+        commands::event_path_at_activation(name, activation)
+    else {
+        return Vec::new();
+    };
+
+    let registered = registered_networks()
+        .networks
+        .into_iter()
+        .map(|network| network.id)
+        .collect::<std::collections::HashSet<_>>();
+
+    let Ok(entries) = std::fs::read_dir(&record_path) else {
+        return Vec::new();
+    };
+
+    let mut networks = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+
+            if !path.is_dir() {
+                return None;
+            }
+
+            let network = entry
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+
+            if !valid_observation_network_id(&network)
+                || !registered.contains(&network)
+            {
+                return None;
+            }
+
+            // Transit persists the selected network here:
+            // event_<activation>_<dimension>/<network>/payload/
+            let payload = path.join("payload");
+
+            if !payload.is_dir()
+                || !payload.join("depth.path").is_file()
+                || !payload.join("depth.objects").is_file()
+            {
+                return None;
+            }
+
+            Some(network)
+        })
+        .collect::<Vec<_>>();
+
+    networks.sort();
+    networks.dedup();
+    networks
+}
+
+
+#[cfg(feature = "bit-miner")]
 async fn derive_network_data(
     name: &str,
     activation: u64,
@@ -1068,16 +1130,11 @@ async fn derive_network_data(
         qp_hd::PersistedEvent::Exile(event) => &event.depth,
     };
 
-    // Depth::path() is only the outer frame identifier ("qp44/wallet").
-    // Network coordinates live in the retained objects inserted by TotalMass::deep():
-    //   purpose  @ 0  (hardened)
-    //   coin     @ 1  (hardened)
-    //   account  @ 2  (hardened)
-    //   change   @ 3
-    //   external @ 4
     let objects = depth
         .objects()
-        .map(|(_, identifier, retain)| (identifier.to_string(), retain.mass))
+        .map(|(_, identifier, retain)| {
+            (identifier.to_string(), retain.mass)
+        })
         .collect::<Vec<_>>();
 
     let mass = |identifier: &str| -> Option<u128> {
@@ -1087,38 +1144,65 @@ async fn derive_network_data(
             .map(|(_, mass)| *mass)
     };
 
-    let networks = match (mass("purpose"), mass("coin")) {
-        (Some(purpose_mass), Some(coin_mass)) => {
-            // Values were inserted hardened; registry stores the base values.
-            let purpose = purpose_mass.saturating_sub(HARDENED_OFFSET);
-            let coin = coin_mass.saturating_sub(HARDENED_OFFSET);
-
-            registered_networks()
-                .networks
-                .into_iter()
-                .filter(|network| {
-                    network.purpose as u128 == purpose && network.coin as u128 == coin
-                })
-                .map(|network| network.id)
-                .collect::<Vec<_>>()
+    let networks = match &event {
+        qp_hd::PersistedEvent::Transit(_) => {
+            // Transit network identity is authoritative in the
+            // network-specific payload persistence.
+            persisted_transit_networks(name, activation)
         }
-        _ => Vec::new(),
+
+        qp_hd::PersistedEvent::Exile(_) => {
+            // QTM exile removes the original transit record directory.
+            // Recovery from retained coordinates is safe only when
+            // purpose + coin uniquely identify a registered network.
+            match (mass("purpose"), mass("coin")) {
+                (Some(purpose_mass), Some(coin_mass)) => {
+                    let purpose =
+                        purpose_mass.saturating_sub(HARDENED_OFFSET);
+
+                    let coin =
+                        coin_mass.saturating_sub(HARDENED_OFFSET);
+
+                    let matches = registered_networks()
+                        .networks
+                        .into_iter()
+                        .filter(|network| {
+                            network.purpose as u128 == purpose
+                                && network.coin as u128 == coin
+                        })
+                        .map(|network| network.id)
+                        .collect::<Vec<_>>();
+
+                    if matches.len() == 1 {
+                        matches
+                    } else {
+                        Vec::new()
+                    }
+                }
+
+                _ => Vec::new(),
+            }
+        }
     };
 
-    // Empty list is the correct signal when no registered network matches.
-    // Never fabricate "unregistered:…/…" — it fails valid_observation_network_id.
     Ok((event, networks))
 }
 
 
 #[cfg(feature = "bit-miner")]
-async fn handle_get_activation_networks(name: String, activation: u64) -> HttpResponse {
+async fn handle_get_activation_networks(
+    name: String,
+    activation: u64,
+) -> HttpResponse {
     match derive_network_data(&name, activation).await {
-        Ok((_, networks)) => json_response(StatusCode::OK, &serde_json::json!({
-            "substrate": name,
-            "activation": activation,
-            "networks": networks,
-        })),
+        Ok((_, networks)) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "substrate": name,
+                "activation": activation,
+                "networks": networks,
+            }),
+        ),
         Err(e) => e,
     }
 }
