@@ -1195,14 +1195,34 @@ async fn handle_get_activation_networks(
     activation: u64,
 ) -> HttpResponse {
     match derive_network_data(&name, activation).await {
-        Ok((_, networks)) => json_response(
-            StatusCode::OK,
-            &serde_json::json!({
-                "substrate": name,
-                "activation": activation,
-                "networks": networks,
-            }),
-        ),
+        Ok((event, networks)) => {
+            let (dimension, retained_mass, delta) = match &event {
+                qp_hd::PersistedEvent::Transit(event) => (
+                    event.heritage.state.dimension().to_string(),
+                    event.heritage.state.retained_mass().to_string(),
+                    event.heritage.transition.delta.to_string(),
+                ),
+                qp_hd::PersistedEvent::Exile(event) => (
+                    event.heritage.state.dimension().to_string(),
+                    event.heritage.state.retained_mass().to_string(),
+                    event.heritage.transition.delta.to_string(),
+                ),
+            };
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "substrate": name,
+                    "activation": activation,
+                    "networks": networks,
+                    "event": {
+                        "dimension": dimension,
+                        "retained_mass": retained_mass,
+                        "delta": delta,
+                    },
+                }),
+            )
+        }
         Err(e) => e,
     }
 }
