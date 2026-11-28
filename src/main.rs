@@ -3648,6 +3648,71 @@ async fn handle_transit_wallet(name: String, req: Request<Incoming>) -> HttpResp
     json_response(StatusCode::OK, &direction_response(event_payload, Some(selection), qtm))
 }
 
+
+/// Discover persisted numeric WirePackets submission files.
+///
+/// The filesystem is authoritative for which submissions exist.
+/// The configured budget is not used to hide persisted files.
+fn discover_wirepacket_submissions(
+    directory: &FsPath,
+) -> ApiResult<Vec<u64>> {
+    let read_dir = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to read WirePackets directory: {e}"),
+            ));
+        }
+    };
+
+    let mut submissions = Vec::new();
+
+    for entry in read_dir {
+        let entry = entry.map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect WirePackets directory entry: {e}"),
+            )
+        })?;
+
+        let metadata = entry.metadata().map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unable to inspect WirePackets entry: {e}"),
+            )
+        })?;
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let Some(submission) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u64>().ok())
+        else {
+            continue;
+        };
+
+        if submission == 0 {
+            continue;
+        }
+
+        submissions.push(submission);
+    }
+
+    submissions.sort_unstable();
+    submissions.dedup();
+
+    Ok(submissions)
+}
+
+
+
 fn load_wirepackets(
     name: &str,
     activation: u64,
@@ -3658,19 +3723,7 @@ fn load_wirepackets(
     let lock = substrate_lock(name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    let substrate_path = ensure_existing_substrate(name)?;
-
-    let budget = load_network_budget(
-        &substrate_path,
-        activation,
-        network,
-    )?
-    .ok_or_else(|| {
-        error(
-            StatusCode::NOT_FOUND,
-            "no WirePackets budget configured for this activation and network",
-        )
-    })?;
+    ensure_existing_substrate(name)?;
 
     let wirepackets_dir = commands::substrate_root()
         .join(name)
@@ -3680,10 +3733,13 @@ fn load_wirepackets(
         .join(network)
         .join("wirepackets");
 
+    let submissions =
+        discover_wirepacket_submissions(&wirepackets_dir)?;
+
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
 
-    for submission in 1..=budget.max_events {
+    for submission in submissions {
         let path = commands::wirepackets_path(
             name,
             activation,
@@ -3691,19 +3747,14 @@ fn load_wirepackets(
             submission,
         );
 
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => continue,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "unable to inspect WirePackets submission {submission}: {e}"
-                    ),
-                ));
-            }
-        };
+        let metadata = std::fs::metadata(&path).map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "unable to inspect WirePackets submission {submission}: {e}"
+                ),
+            )
+        })?;
 
         let bytes = std::fs::read(&path).map_err(|e| {
             error(
@@ -3777,6 +3828,7 @@ fn handle_get_wirepackets(name: String, activation: u64, network: String) -> Htt
     }
 }
 
+
 fn handle_get_wirepackets_file(
     name: String,
     activation: u64,
@@ -3789,49 +3841,33 @@ fn handle_get_wirepackets_file(
     let lock = substrate_lock(&name);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    let substrate_path = match ensure_existing_substrate(&name) {
-        Ok(path) => path,
-        Err(e) => return e,
-    };
+    if let Err(e) = ensure_existing_substrate(&name) {
+        return e;
+    }
 
-    let budget = match load_network_budget(
-        &substrate_path,
-        activation,
-        &network,
-    ) {
-        Ok(Some(budget)) => budget,
-        Ok(None) => {
-            return error(
-                StatusCode::NOT_FOUND,
-                "no WirePackets budget configured for this activation and network",
-            );
-        }
-        Err(e) => return e,
-    };
+    let wirepackets_dir = commands::substrate_root()
+        .join(&name)
+        .join("activations")
+        .join(activation.to_string())
+        .join("network")
+        .join(&network)
+        .join("wirepackets");
+
+    let submissions =
+        match discover_wirepacket_submissions(&wirepackets_dir) {
+            Ok(submissions) => submissions,
+            Err(e) => return e,
+        };
 
     let mut combined = Vec::new();
 
-    for submission in 1..=budget.max_events {
+    for submission in submissions {
         let path = commands::wirepackets_path(
             &name,
             activation,
             &network,
             submission,
         );
-
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => continue,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "unable to inspect WirePackets submission {submission}: {e}"
-                    ),
-                );
-            }
-        };
 
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -3859,7 +3895,7 @@ fn handle_get_wirepackets_file(
         }
 
         let next_size = match (combined.len() as u64)
-            .checked_add(metadata.len())
+            .checked_add(bytes.len() as u64)
         {
             Some(size) => size,
             None => {
@@ -3885,7 +3921,7 @@ fn handle_get_wirepackets_file(
     if combined.is_empty() {
         return error(
             StatusCode::NOT_FOUND,
-            "no persisted WirePackets submissions within configured budget",
+            "no persisted WirePackets submissions found",
         );
     }
 
