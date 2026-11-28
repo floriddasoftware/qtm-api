@@ -3713,6 +3713,8 @@ fn discover_wirepacket_submissions(
 
 
 
+
+#[cfg(feature = "bit-miner")]
 fn load_wirepackets(
     name: &str,
     activation: u64,
@@ -3733,8 +3735,7 @@ fn load_wirepackets(
         .join(network)
         .join("wirepackets");
 
-    let submissions =
-        discover_wirepacket_submissions(&wirepackets_dir)?;
+    let submissions = discover_wirepacket_submissions(&wirepackets_dir)?;
 
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
@@ -3778,7 +3779,8 @@ fn load_wirepackets(
             return Err(error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
-                    "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
+                    "combined WirePackets exceeds {}-byte limit",
+                    WIREPACKETS_MAX_BYTES
                 ),
             ));
         }
@@ -3821,14 +3823,19 @@ fn load_wirepackets(
     })
 }
 
-fn handle_get_wirepackets(name: String, activation: u64, network: String) -> HttpResponse {
+#[cfg(feature = "bit-miner")]
+fn handle_get_wirepackets(
+    name: String,
+    activation: u64,
+    network: String,
+) -> HttpResponse {
     match load_wirepackets(&name, activation, &network) {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(response) => response,
     }
 }
 
-
+#[cfg(feature = "bit-miner")]
 fn handle_get_wirepackets_file(
     name: String,
     activation: u64,
@@ -3853,11 +3860,10 @@ fn handle_get_wirepackets_file(
         .join(&network)
         .join("wirepackets");
 
-    let submissions =
-        match discover_wirepacket_submissions(&wirepackets_dir) {
-            Ok(submissions) => submissions,
-            Err(e) => return e,
-        };
+    let submissions = match discover_wirepacket_submissions(&wirepackets_dir) {
+        Ok(submissions) => submissions,
+        Err(e) => return e,
+    };
 
     let mut combined = Vec::new();
 
@@ -3910,7 +3916,8 @@ fn handle_get_wirepackets_file(
             return error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
-                    "combined WirePackets exceeds {WIREPACKETS_MAX_BYTES}-byte limit"
+                    "combined WirePackets exceeds {}-byte limit",
+                    WIREPACKETS_MAX_BYTES
                 ),
             );
         }
